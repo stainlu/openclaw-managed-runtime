@@ -37,8 +37,16 @@ RUN groupadd -r openclaw && useradd -r -g openclaw -m -d /home/openclaw openclaw
 RUN mkdir -p /workspace && chown -R openclaw:openclaw /workspace
 
 # Default environment. Overridden at container runtime by the orchestrator.
+#
+# Model ID format: "bedrock/<raw-bedrock-model-id>". The "bedrock/" prefix
+# selects the provider; everything after it is passed through to the
+# amazon-bedrock extension verbatim. See
+#   /extensions/amazon-bedrock/discovery.ts
+# and
+#   /src/agents/model-selection-normalize.ts
+# for how OpenClaw parses provider/model strings.
 ENV OPENCLAW_AGENT_ID="default" \
-    OPENCLAW_MODEL="bedrock/claude-sonnet-4-6" \
+    OPENCLAW_MODEL="bedrock/anthropic.claude-sonnet-4-6" \
     OPENCLAW_TOOLS="" \
     OPENCLAW_INSTRUCTIONS="You are a helpful assistant." \
     OPENCLAW_SESSION_ID="" \

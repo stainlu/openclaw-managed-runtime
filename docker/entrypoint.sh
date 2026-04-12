@@ -10,8 +10,12 @@
 #
 #   OPENCLAW_AGENT_ID      - unique agent identifier (required)
 #   OPENCLAW_MODEL         - model reference, e.g. "bedrock/claude-sonnet-4-6" (required)
-#   OPENCLAW_TOOLS         - comma-separated skill allowlist, e.g. "web-search,file-management"
-#                            (empty string = allow whatever is bundled in the image)
+#   OPENCLAW_TOOLS         - comma-separated allowlist of skill IDs that must
+#                            exist under the OpenClaw workspace (e.g. "github,notion,slack")
+#                            Empty string = omit the allowlist, letting the agent
+#                            fall back to agents.defaults.skills. The published
+#                            openclaw npm package bundles 53 real skills — see
+#                            /skills/ in openclaw/openclaw for the actual IDs.
 #   OPENCLAW_INSTRUCTIONS  - system prompt override (optional)
 #   OPENCLAW_SESSION_ID    - session identifier for resume (optional)
 #   OPENCLAW_STATE_DIR     - persistent volume mount (default: /workspace)

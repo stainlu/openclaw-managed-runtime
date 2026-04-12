@@ -46,8 +46,7 @@ Key config generated per container:
   "agents": {
     "list": [{
       "id": "agt_xxx",
-      "model": { "primary": "bedrock/claude-sonnet-4-6" },
-      "tools": { "alsoAllow": ["web-search", "file-management"] },
+      "model": { "primary": "bedrock/anthropic.claude-sonnet-4-6" },
       "systemPromptOverride": "You are a research assistant."
     }]
   },
@@ -63,6 +62,10 @@ Key config generated per container:
 ```
 
 `chatCompletions.enabled` is critical — the OpenAI-compatible endpoint is disabled by default in OpenClaw.
+
+**Model ID format:** the `bedrock/` prefix selects the amazon-bedrock provider; the part after it is the raw Bedrock model ID (either a foundation model like `anthropic.claude-3-5-sonnet-20241022-v2:0` or an inference profile like `anthropic.claude-sonnet-4-6`). The provider's discovery flow registers models under their raw IDs, so whatever `ListFoundationModels` / `ListInferenceProfiles` returns is what you pass here.
+
+**Skill allowlist (omitted by default):** the entrypoint omits `agents.list[].tools.alsoAllow` entirely when `OPENCLAW_TOOLS` is empty, so the agent falls back to `agents.defaults.skills` (empty in our generated config → no tools wired). This is fine for pure-text MVP tasks. For tool-using agents, pass a comma-separated list of the skill IDs from the bundled OpenClaw `skills/` tree (real names include `github`, `coding-agent`, `notion`, `slack`, etc. — the project does not ship generic names like `web-search`).
 
 ### Session persistence
 

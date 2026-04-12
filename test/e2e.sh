@@ -11,7 +11,10 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
-MODEL="${OPENCLAW_TEST_MODEL:-bedrock/claude-sonnet-4-6}"
+# Bedrock model ID format: "bedrock/<raw-bedrock-model-id>". The part after
+# "bedrock/" is the model ID that OpenClaw's amazon-bedrock discovery registers
+# (see /extensions/amazon-bedrock/discovery.ts:159-168 in the openclaw repo).
+MODEL="${OPENCLAW_TEST_MODEL:-bedrock/anthropic.claude-sonnet-4-6}"
 POLL_INTERVAL_SEC=2
 MAX_POLL_SEC=300
 
@@ -22,12 +25,16 @@ curl --silent --fail "${BASE_URL}/healthz" >/dev/null || {
 }
 
 echo "[e2e] creating research agent with model ${MODEL}"
+# MVP e2e test asks a purely-textual question — no tool allowlist needed. The
+# published openclaw npm package bundles 53 real skills (github, coding-agent,
+# notion, slack, etc.) but NOT generic names like web-search or file-management,
+# so we intentionally pass an empty tools array for the first demo.
 CREATE_RESPONSE=$(curl --silent --fail \
   -X POST "${BASE_URL}/v1/agents" \
   -H 'Content-Type: application/json' \
   -d "{
     \"model\": \"${MODEL}\",
-    \"tools\": [\"web-search\", \"file-management\"],
+    \"tools\": [],
     \"instructions\": \"You are a research assistant. Answer concisely in one paragraph.\"
   }")
 AGENT_ID=$(echo "${CREATE_RESPONSE}" | jq -r '.agent_id')

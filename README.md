@@ -92,8 +92,8 @@ Then in another terminal:
 curl -X POST http://localhost:8080/v1/agents \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "bedrock/claude-sonnet-4-6",
-    "tools": ["web-search", "file-management"],
+    "model": "bedrock/anthropic.claude-sonnet-4-6",
+    "tools": [],
     "instructions": "You are a research assistant."
   }'
 # → {"agent_id":"agt_abc123"}
