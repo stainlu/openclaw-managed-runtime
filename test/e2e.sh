@@ -4,17 +4,24 @@
 #
 # Prerequisites:
 #   - docker compose up -d (orchestrator running on localhost:8080)
-#   - AWS credentials with Bedrock access in the environment (forwarded to agent containers)
+#   - Credentials for whichever provider the test model uses, exported in the
+#     host shell so docker-compose forwards them into the orchestrator, which
+#     forwards them into spawned agent containers. See docker-compose.yml for
+#     the list of supported provider env vars.
 #
 # Exits 0 on success, non-zero on failure.
 
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
-# Bedrock model ID format: "bedrock/<raw-bedrock-model-id>". The part after
-# "bedrock/" is the model ID that OpenClaw's amazon-bedrock discovery registers
-# (see /extensions/amazon-bedrock/discovery.ts:159-168 in the openclaw repo).
-MODEL="${OPENCLAW_TEST_MODEL:-bedrock/anthropic.claude-sonnet-4-6}"
+# OpenClaw model reference format: "<provider>/<model-id>". Default below is
+# moonshot/kimi-k2.5 because it validates the runtime end-to-end from anywhere
+# Moonshot supports without needing a cloud account. Override with any other
+# provider/model OpenClaw supports:
+#   OPENCLAW_TEST_MODEL=bedrock/anthropic.claude-sonnet-4-6 ./test/e2e.sh
+#   OPENCLAW_TEST_MODEL=openai/gpt-5.4 ./test/e2e.sh
+#   OPENCLAW_TEST_MODEL=google/gemini-2.5-pro ./test/e2e.sh
+MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.5}"
 POLL_INTERVAL_SEC=2
 MAX_POLL_SEC=300
 

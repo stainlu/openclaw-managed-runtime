@@ -22,10 +22,15 @@ function envInt(name: string, fallback: number): number {
 }
 
 function collectPassthroughEnv(): Record<string, string> {
-  // Forward AWS credentials and region to the spawned agent containers so the
-  // Bedrock provider picks them up via the standard credential chain. This is
-  // the MVP approach; Phase 2 will replace this with cloud secret managers.
-  const keys = [
+  // Forward provider credentials to spawned agent containers. The default list
+  // covers every major provider OpenClaw supports out of the box so the
+  // runtime is genuinely provider-agnostic: whichever provider the agent's
+  // model.primary points at will pick up its credentials via its standard
+  // env-var name. Extend via OPENCLAW_PASSTHROUGH_ENV (comma-separated) for
+  // custom providers or deploy-specific variables. Phase 2 replaces this with
+  // cloud secret managers.
+  const defaultKeys = [
+    // Amazon Bedrock (AWS credential chain — works with AWS_PROFILE too)
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
     "AWS_ACCESS_KEY_ID",
@@ -33,7 +38,27 @@ function collectPassthroughEnv(): Record<string, string> {
     "AWS_SESSION_TOKEN",
     "AWS_PROFILE",
     "AWS_BEARER_TOKEN_BEDROCK",
+    // Direct provider API keys
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "MOONSHOT_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "QWEN_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "MISTRAL_API_KEY",
+    "XAI_API_KEY",
+    "TOGETHER_API_KEY",
+    "OPENROUTER_API_KEY",
+    "FIREWORKS_API_KEY",
+    "GROQ_API_KEY",
   ];
+  const extraKeys = (process.env.OPENCLAW_PASSTHROUGH_ENV ?? "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0);
+  const keys = [...new Set([...defaultKeys, ...extraKeys])];
   const out: Record<string, string> = {};
   for (const k of keys) {
     const v = process.env[k];

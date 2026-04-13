@@ -76,12 +76,20 @@ GET    /healthz
 
 ## Quick start (local Docker)
 
-Requires: Docker, Node 22+, AWS credentials with Bedrock access in your environment.
+Requires: Docker, Node 22+, and an API key for at least one provider OpenClaw supports. The default smoke path uses Moonshot Kimi K2.5 (`moonshot/kimi-k2.5`) because it works from any country Moonshot supports without needing a cloud account. Any OpenClaw provider works — just swap the `model` field and export the matching key.
 
 ```bash
 git clone https://github.com/stainlu/openclaw-managed-runtime
 cd openclaw-managed-runtime
 pnpm install
+
+# Pick your provider (examples — you only need one).
+export MOONSHOT_API_KEY=sk-...      # moonshot/kimi-k2.5 (default)
+# export ANTHROPIC_API_KEY=sk-...   # anthropic/claude-sonnet-4-6
+# export OPENAI_API_KEY=sk-...      # openai/gpt-5.4
+# export GEMINI_API_KEY=...         # google/gemini-2.5-pro
+# export AWS_PROFILE=openclaw       # bedrock/anthropic.claude-sonnet-4-6
+
 docker compose up --build
 ```
 
@@ -92,7 +100,7 @@ Then in another terminal:
 curl -X POST http://localhost:8080/v1/agents \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "bedrock/anthropic.claude-sonnet-4-6",
+    "model": "moonshot/kimi-k2.5",
     "tools": [],
     "instructions": "You are a research assistant."
   }'

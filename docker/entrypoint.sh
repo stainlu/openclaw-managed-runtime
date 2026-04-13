@@ -9,7 +9,12 @@
 # Expected environment variables (all injected by the orchestrator at spawn time):
 #
 #   OPENCLAW_AGENT_ID      - unique agent identifier (required)
-#   OPENCLAW_MODEL         - model reference, e.g. "bedrock/claude-sonnet-4-6" (required)
+#   OPENCLAW_MODEL         - model reference, e.g. "moonshot/kimi-k2.5" (required)
+#                            Format: "<provider>/<model-id>" where <provider>
+#                            is any OpenClaw provider plugin id.
+#   OPENCLAW_PLUGIN        - provider plugin to enable in the generated config.
+#                            Must match the <provider> prefix in OPENCLAW_MODEL.
+#                            (default: parsed from OPENCLAW_MODEL)
 #   OPENCLAW_TOOLS         - comma-separated allowlist of skill IDs that must
 #                            exist under the OpenClaw workspace (e.g. "github,notion,slack")
 #                            Empty string = omit the allowlist, letting the agent
@@ -20,6 +25,10 @@
 #   OPENCLAW_SESSION_ID    - session identifier for resume (optional)
 #   OPENCLAW_STATE_DIR     - persistent volume mount (default: /workspace)
 #   OPENCLAW_GATEWAY_PORT  - HTTP port (default: 18789)
+#
+# Provider API keys (whichever one matches OPENCLAW_PLUGIN) must be present in
+# the container environment. The orchestrator forwards them via the passthrough
+# env list in src/index.ts:collectPassthroughEnv().
 
 set -euo pipefail
 
@@ -30,6 +39,18 @@ set -euo pipefail
 : "${OPENCLAW_TOOLS:=}"
 : "${OPENCLAW_INSTRUCTIONS:=}"
 : "${OPENCLAW_SESSION_ID:=}"
+
+# Derive the plugin id from OPENCLAW_MODEL if not explicitly set. Model format
+# is "<provider>/<model-id>"; the provider half maps 1:1 to an OpenClaw plugin
+# id for every first-party provider except "bedrock" which enables the
+# "amazon-bedrock" plugin.
+if [[ -z "${OPENCLAW_PLUGIN:-}" ]]; then
+  provider_prefix="${OPENCLAW_MODEL%%/*}"
+  case "${provider_prefix}" in
+    bedrock) OPENCLAW_PLUGIN="amazon-bedrock" ;;
+    *)       OPENCLAW_PLUGIN="${provider_prefix}" ;;
+  esac
+fi
 
 # Per-container auth token. The orchestrator generates this at spawn time and
 # passes it in to both secure the container and include it as a Bearer header
@@ -69,13 +90,68 @@ tools_json_fragment() {
 
 TOOLS_JSON=$(tools_json_fragment)
 
+# Some OpenClaw provider plugins auto-register their static catalog at plugin
+# load time (e.g. anthropic, openai, google). Others use
+# `defineSingleProviderPluginEntry` and only materialize their catalog into
+# `models.providers.<id>` through an interactive `openclaw models auth login`
+# flow (e.g. moonshot). For the second class, we have to emit that block
+# ourselves so the runtime model registry knows about the model. The content
+# below mirrors what `applyMoonshotConfig` / `applyMoonshotConfigCn` in
+# extensions/moonshot/onboard.ts produces. Extend PROVIDER_BLOCK_JSON below as
+# we add more providers that require this pattern.
+PROVIDER_BLOCK_JSON='{}'
+case "${OPENCLAW_PLUGIN}" in
+  moonshot)
+    PROVIDER_BLOCK_JSON='{
+      "moonshot": {
+        "baseUrl": "https://api.moonshot.ai/v1",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "kimi-k2.5",
+            "name": "Kimi K2.5",
+            "input": ["text", "image"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 262144,
+            "maxTokens": 262144
+          },
+          {
+            "id": "kimi-k2-thinking",
+            "name": "Kimi K2 Thinking",
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 262144,
+            "maxTokens": 262144
+          }
+        ]
+      }
+    }'
+    ;;
+esac
+
 # Assemble the full config with jq to avoid any string-escaping footguns.
+#
+# Three things matter beyond the obvious:
+#
+#   1. The provider plugin entry is keyed dynamically off OPENCLAW_PLUGIN so
+#      the runtime image stays provider-agnostic. Every OpenClaw provider
+#      plugin that reads its API key from an env var will Just Work.
+#
+#   2. `agents.defaults.models.<model-id>: {}` declares the model as the
+#      agent-level default. Without this block the gateway logs "Unknown
+#      model" during runtime resolution even when the plugin is loaded.
+#
+#   3. `models.providers.<plugin-id>: {...}` is required for providers that
+#      do not auto-register their catalog. Populated above via
+#      PROVIDER_BLOCK_JSON.
 jq -n \
   --arg agent_id       "${OPENCLAW_AGENT_ID}" \
   --arg model          "${OPENCLAW_MODEL}" \
   --arg instructions   "${OPENCLAW_INSTRUCTIONS}" \
+  --arg plugin         "${OPENCLAW_PLUGIN}" \
   --argjson port       "${OPENCLAW_GATEWAY_PORT}" \
   --argjson tools      "${TOOLS_JSON}" \
+  --argjson providers  "${PROVIDER_BLOCK_JSON}" \
 '
 {
   gateway: {
@@ -98,17 +174,19 @@ jq -n \
         + (if ($tools.alsoAllow // null) then { tools: $tools } else {} end)
         + (if $instructions != "" then { systemPromptOverride: $instructions } else {} end)
       )
-    ]
-  },
-  plugins: {
-    entries: {
-      "amazon-bedrock": {
-        enabled: true,
-        config: {
-          discovery: { enabled: true }
-        }
-      }
+    ],
+    defaults: {
+      model: { primary: $model },
+      models: ({ ($model): {} })
     }
+  }
+}
++ (if ($providers | length) > 0 then { models: { mode: "merge", providers: $providers } } else {} end)
++ {
+  plugins: {
+    entries: (
+      { ($plugin): { enabled: true } }
+    )
   }
 }
 ' > "${CONFIG_PATH}"

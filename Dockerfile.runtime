@@ -38,15 +38,27 @@ RUN mkdir -p /workspace && chown -R openclaw:openclaw /workspace
 
 # Default environment. Overridden at container runtime by the orchestrator.
 #
-# Model ID format: "bedrock/<raw-bedrock-model-id>". The "bedrock/" prefix
-# selects the provider; everything after it is passed through to the
-# amazon-bedrock extension verbatim. See
-#   /extensions/amazon-bedrock/discovery.ts
-# and
-#   /src/agents/model-selection-normalize.ts
-# for how OpenClaw parses provider/model strings.
+# Model ID format: "<provider>/<model-id>", where <provider> is any OpenClaw
+# provider plugin id (moonshot, openai, anthropic, bedrock, google, deepseek,
+# qwen, mistral, xai, together, openrouter, ...) and <model-id> is the catalog
+# id that provider exposes. Examples:
+#   moonshot/kimi-k2.5
+#   anthropic/claude-sonnet-4-6
+#   openai/gpt-5.4
+#   bedrock/anthropic.claude-sonnet-4-6
+#   google/gemini-2.5-pro
+# Parsing: /src/agents/model-selection-normalize.ts in openclaw/openclaw.
+#
+# OPENCLAW_PLUGIN selects which provider plugin the entrypoint enables in the
+# generated config. It must match the <provider> prefix in OPENCLAW_MODEL.
+#
+# The smoke default is moonshot/kimi-k2.5 because it works from any country
+# Moonshot supports with just a MOONSHOT_API_KEY env var, no cloud account
+# setup. Swap to any other provider by overriding both OPENCLAW_PLUGIN and
+# OPENCLAW_MODEL at `docker run -e`.
 ENV OPENCLAW_AGENT_ID="default" \
-    OPENCLAW_MODEL="bedrock/anthropic.claude-sonnet-4-6" \
+    OPENCLAW_PLUGIN="moonshot" \
+    OPENCLAW_MODEL="moonshot/kimi-k2.5" \
     OPENCLAW_TOOLS="" \
     OPENCLAW_INSTRUCTIONS="You are a helpful assistant." \
     OPENCLAW_SESSION_ID="" \
