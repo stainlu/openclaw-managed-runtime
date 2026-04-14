@@ -36,6 +36,18 @@ export type PoolConfig = {
    * which keeps the runtime layer decoupled from the orchestrator layer.
    */
   isBusy: (sessionId: string) => boolean;
+  /**
+   * Optional callback invoked AFTER a container is reaped by the idle
+   * sweeper. Intended for ephemeral session cleanup: index.ts wires this
+   * to delete the Pi JSONL and session store row when the reaped session
+   * was flagged `ephemeral` (e.g., created by a keyless POST /v1/chat/completions).
+   *
+   * Deliberately NOT called from manual `evictSession` (e.g., cancel) or
+   * `shutdown` paths — those preserve session data for inspection or
+   * graceful restart. The pool stays agnostic: it passes the sessionId
+   * and lets the caller decide what to clean up.
+   */
+  cleanupOnReap?: (sessionId: string) => Promise<void>;
 };
 
 type ActiveContainer = {
@@ -206,6 +218,19 @@ export class SessionContainerPool {
       await this.runtime.stop(entry.container.id).catch((err) => {
         console.warn(`[pool] reap stop ${entry.container.id} failed:`, err);
       });
+      // Notify the caller so it can clean up any per-session resources that
+      // should NOT outlive the container. Item 8 uses this for ephemeral
+      // session cleanup (delete Pi JSONL + SQLite row).
+      if (this.cfg.cleanupOnReap) {
+        try {
+          await this.cfg.cleanupOnReap(entry.sessionId);
+        } catch (err) {
+          console.warn(
+            `[pool] cleanupOnReap for ${entry.sessionId} failed:`,
+            err,
+          );
+        }
+      }
     }
   }
 }

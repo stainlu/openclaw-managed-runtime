@@ -44,12 +44,17 @@ class InMemoryAgentStore implements AgentStore {
 class InMemorySessionStore implements SessionStore {
   private readonly sessions = new Map<string, Session>();
 
-  create(args: { agentId: string; sessionId?: string }): Session {
+  create(args: {
+    agentId: string;
+    sessionId?: string;
+    ephemeral?: boolean;
+  }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
     const session: Session = {
       sessionId,
       agentId: args.agentId,
       status: "idle",
+      ephemeral: args.ephemeral ?? false,
       tokensIn: 0,
       tokensOut: 0,
       costUsd: 0,

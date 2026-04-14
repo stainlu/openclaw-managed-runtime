@@ -25,6 +25,7 @@ type SessionRow = {
   session_id: string;
   agent_id: string;
   status: string;
+  ephemeral: number;
   tokens_in: number;
   tokens_out: number;
   cost_usd: number;
@@ -49,6 +50,7 @@ function rowToSession(r: SessionRow): Session {
     sessionId: r.session_id,
     agentId: r.agent_id,
     status: r.status as SessionStatus,
+    ephemeral: r.ephemeral === 1,
     tokensIn: r.tokens_in,
     tokensOut: r.tokens_out,
     costUsd: r.cost_usd,
@@ -91,6 +93,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('idle', 'running', 'failed')),
+  ephemeral INTEGER NOT NULL DEFAULT 0,
   tokens_in INTEGER NOT NULL DEFAULT 0,
   tokens_out INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL NOT NULL DEFAULT 0,
@@ -173,10 +176,10 @@ class SqliteSessionStore implements SessionStore {
   constructor(private readonly db: Database.Database) {
     this.insertStmt = db.prepare(
       `INSERT INTO sessions (
-        session_id, agent_id, status, tokens_in, tokens_out, cost_usd,
+        session_id, agent_id, status, ephemeral, tokens_in, tokens_out, cost_usd,
         error, created_at, last_event_at
        ) VALUES (
-        @session_id, @agent_id, 'idle', 0, 0, 0, NULL, @created_at, NULL
+        @session_id, @agent_id, 'idle', @ephemeral, 0, 0, 0, NULL, @created_at, NULL
        )`,
     );
     this.getStmt = db.prepare(`SELECT * FROM sessions WHERE session_id = ?`);
@@ -221,18 +224,25 @@ class SqliteSessionStore implements SessionStore {
     );
   }
 
-  create(args: { agentId: string; sessionId?: string }): Session {
+  create(args: {
+    agentId: string;
+    sessionId?: string;
+    ephemeral?: boolean;
+  }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
+    const ephemeral = args.ephemeral ?? false;
     const createdAt = Date.now();
     this.insertStmt.run({
       session_id: sessionId,
       agent_id: args.agentId,
+      ephemeral: ephemeral ? 1 : 0,
       created_at: createdAt,
     });
     return {
       sessionId,
       agentId: args.agentId,
       status: "idle",
+      ephemeral,
       tokensIn: 0,
       tokensOut: 0,
       costUsd: 0,
@@ -330,6 +340,23 @@ export class SqliteStore implements Store {
     // deletes and referential integrity actually happen.
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
+
+    // Additive migrations. CREATE TABLE IF NOT EXISTS above is a no-op for
+    // existing databases, so columns added after the initial schema need
+    // an explicit ALTER. Check existence via PRAGMA table_info before
+    // running each migration so startup is idempotent.
+    const sessionsCols = this.db.pragma("table_info(sessions)") as Array<{
+      name: string;
+    }>;
+    if (!sessionsCols.some((c) => c.name === "ephemeral")) {
+      // Item 8: ephemeral sessions are auto-created by /v1/chat/completions
+      // for keyless calls and reaped with their container. Rows that pre-date
+      // Item 8 default to non-ephemeral (safe — they were never flagged for
+      // cleanup and all explicit /v1/sessions creates are non-ephemeral).
+      this.db.exec(
+        "ALTER TABLE sessions ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0",
+      );
+    }
 
     this.agents = new SqliteAgentStore(this.db);
     this.sessions = new SqliteSessionStore(this.db);

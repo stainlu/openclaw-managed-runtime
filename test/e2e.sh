@@ -439,5 +439,169 @@ echo "[e2e] backwards-compat adapter session: ${ADAPTER_SESSION_ID}"
 poll_session "${ADAPTER_SESSION_ID}" "adapter-run" >/dev/null || exit 1
 echo "[e2e] backwards-compat /run adapter still works"
 
+# ---- OpenAI-compat adapter: POST /v1/chat/completions ----------------------
+# Proves the Item 8 compatibility shim:
+#   1. Multi-turn memory via a sticky `user` session key (secret word recall).
+#   2. Emulated stream=true produces role/content/finish_reason chunks + [DONE].
+#   3. Queue+stale-detection race — while the session is already running from
+#      a prior native POST /events, a chat.completions call on the same key
+#      queues behind it and returns ITS reply, not the earlier run's reply.
+
+echo "[e2e] openai compat: multi-turn memory via sticky session key"
+CHAT_KEY="chat-smoke-$(date +%s)"
+
+CHAT_TURN1=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -H "x-openclaw-agent-id: ${AGENT_ID}" \
+  -d "$(jq -n --arg key "${CHAT_KEY}" '{
+    model: "placeholder",
+    user: $key,
+    messages: [{role: "user", content: "Remember this: my secret word is elderflower. Reply with exactly the single word: noted"}]
+  }')")
+CHAT_TURN1_CONTENT=$(echo "${CHAT_TURN1}" | jq -r '.choices[0].message.content // ""')
+echo "[e2e] openai compat turn 1 content: ${CHAT_TURN1_CONTENT}"
+
+CHAT_TURN1_ID=$(echo "${CHAT_TURN1}" | jq -r '.id // ""')
+CHAT_TURN1_OBJECT=$(echo "${CHAT_TURN1}" | jq -r '.object // ""')
+CHAT_TURN1_FINISH=$(echo "${CHAT_TURN1}" | jq -r '.choices[0].finish_reason // ""')
+if [[ "${CHAT_TURN1_OBJECT}" != "chat.completion" ]]; then
+  echo "[e2e] FAIL: chat.completions turn 1 object != chat.completion (got: ${CHAT_TURN1_OBJECT})"
+  exit 1
+fi
+if [[ "${CHAT_TURN1_FINISH}" != "stop" ]]; then
+  echo "[e2e] FAIL: chat.completions turn 1 finish_reason != stop (got: ${CHAT_TURN1_FINISH})"
+  exit 1
+fi
+if ! echo "${CHAT_TURN1_ID}" | grep -q '^chatcmpl-'; then
+  echo "[e2e] FAIL: chat.completions turn 1 id does not start with chatcmpl- (got: ${CHAT_TURN1_ID})"
+  exit 1
+fi
+echo "[e2e] openai compat turn 1 shape OK"
+
+CHAT_TURN2=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -H "x-openclaw-agent-id: ${AGENT_ID}" \
+  -d "$(jq -n --arg key "${CHAT_KEY}" '{
+    model: "placeholder",
+    user: $key,
+    messages: [{role: "user", content: "What is my secret word? Reply with only that single word, no punctuation."}]
+  }')")
+CHAT_TURN2_CONTENT=$(echo "${CHAT_TURN2}" | jq -r '.choices[0].message.content // ""')
+echo "[e2e] openai compat turn 2 content: ${CHAT_TURN2_CONTENT}"
+
+if echo "${CHAT_TURN2_CONTENT}" | grep -qi "elderflower"; then
+  echo "[e2e] openai compat multi-turn memory PASSED"
+else
+  echo "[e2e] FAIL: openai compat turn 2 did not recall 'elderflower'"
+  echo "  turn 1: ${CHAT_TURN1_CONTENT}"
+  echo "  turn 2: ${CHAT_TURN2_CONTENT}"
+  exit 1
+fi
+
+# ---- chat.completions stream=true smoke ------------------------------------
+
+echo "[e2e] openai compat: stream=true smoke"
+CHAT_STREAM_OUT=$(mktemp /tmp/openclaw-chat-stream.XXXXXX)
+curl --silent --no-buffer --max-time 180 \
+  -X POST "${BASE_URL}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -H "x-openclaw-agent-id: ${AGENT_ID}" \
+  -d "$(jq -n --arg key "${CHAT_KEY}" '{
+    model: "placeholder",
+    user: $key,
+    stream: true,
+    messages: [{role: "user", content: "Remind me the secret word one more time. Single word only."}]
+  }')" \
+  > "${CHAT_STREAM_OUT}" 2>&1
+
+if ! grep -q '"delta":{"role":"assistant"' "${CHAT_STREAM_OUT}"; then
+  echo "[e2e] FAIL: chat.completions stream missing role delta"
+  head -c 1024 "${CHAT_STREAM_OUT}"
+  rm -f "${CHAT_STREAM_OUT}"
+  exit 1
+fi
+if ! grep -q '"delta":{"content":' "${CHAT_STREAM_OUT}"; then
+  echo "[e2e] FAIL: chat.completions stream missing content delta"
+  head -c 1024 "${CHAT_STREAM_OUT}"
+  rm -f "${CHAT_STREAM_OUT}"
+  exit 1
+fi
+if ! grep -q '"finish_reason":"stop"' "${CHAT_STREAM_OUT}"; then
+  echo "[e2e] FAIL: chat.completions stream missing finish_reason=stop"
+  head -c 1024 "${CHAT_STREAM_OUT}"
+  rm -f "${CHAT_STREAM_OUT}"
+  exit 1
+fi
+if ! grep -q '\[DONE\]' "${CHAT_STREAM_OUT}"; then
+  echo "[e2e] FAIL: chat.completions stream missing [DONE] terminator"
+  head -c 1024 "${CHAT_STREAM_OUT}"
+  rm -f "${CHAT_STREAM_OUT}"
+  exit 1
+fi
+echo "[e2e] openai compat stream mode OK"
+rm -f "${CHAT_STREAM_OUT}"
+
+# ---- chat.completions queue + stale-detection race -------------------------
+# Fire a long-running native POST /events first, then immediately POST
+# /v1/chat/completions with the same session key. The chat.completions call
+# should queue behind the native run, wait for BOTH to drain, and return its
+# own reply (xylophone) — not the earlier native run's reply.
+#
+# The stale-detection snapshot inside the handler (beforeEventId) is what
+# guarantees the response reflects the chat.completions message, not the
+# native message, regardless of ordering in the JSONL.
+
+echo "[e2e] openai compat: queue+stale-detection race"
+RACE_KEY="race-$(date +%s)"
+
+# Warm the race session via chat.completions so it exists in the store.
+# Non-ephemeral because we passed a key.
+curl --silent --fail --max-time 180 \
+  -X POST "${BASE_URL}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -H "x-openclaw-agent-id: ${AGENT_ID}" \
+  -d "$(jq -n --arg key "${RACE_KEY}" '{
+    model: "placeholder",
+    user: $key,
+    messages: [{role: "user", content: "Respond with exactly the single word: warmed"}]
+  }')" >/dev/null
+
+echo "[e2e] race: posting native long-running event"
+curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions/${RACE_KEY}/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"user.message","content":"Please write a detailed multi-paragraph essay about volcanoes, at least 5 paragraphs long."}' \
+  >/dev/null &
+NATIVE_PID=$!
+
+# Give the native request a beat to flip the session to running so the
+# subsequent chat.completions call definitely hits the queue path.
+sleep 2
+
+echo "[e2e] race: posting chat.completions on same session key (should queue)"
+RACE_RESPONSE=$(curl --silent --fail --max-time 300 \
+  -X POST "${BASE_URL}/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -H "x-openclaw-agent-id: ${AGENT_ID}" \
+  -d "$(jq -n --arg key "${RACE_KEY}" '{
+    model: "placeholder",
+    user: $key,
+    messages: [{role: "user", content: "Now reply with ONLY this exact single word: xylophone"}]
+  }')")
+RACE_CONTENT=$(echo "${RACE_RESPONSE}" | jq -r '.choices[0].message.content // ""')
+echo "[e2e] race response content: ${RACE_CONTENT}"
+
+wait "${NATIVE_PID}" 2>/dev/null || true
+
+if echo "${RACE_CONTENT}" | grep -qi "xylophone"; then
+  echo "[e2e] openai compat queue+stale-detection race PASSED"
+else
+  echo "[e2e] FAIL: chat.completions race returned stale content (expected 'xylophone')"
+  echo "  got: ${RACE_CONTENT}"
+  exit 1
+fi
+
 echo "[e2e] ALL CHECKS PASSED"
 exit 0

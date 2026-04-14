@@ -76,6 +76,53 @@ GET    /v1/sessions/:sessionId # → { session_id, agent_id, status, task, outpu
 
 The orchestrator is self-documenting — `curl http://localhost:8080/` returns the full endpoint list, version, and links. You never need this section to discover the API, it's just here as a quick reference.
 
+## OpenAI SDK compatibility
+
+The runtime also exposes `POST /v1/chat/completions` with the OpenAI Chat Completions request/response shape. Existing OpenAI SDK integrations can point their `base_url` at the orchestrator and keep working.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="unused",  # not checked; per-container auth is handled inside the runtime
+    default_headers={"x-openclaw-agent-id": "agt_abc123"},
+)
+
+# One-shot (ephemeral session, auto-cleaned when its container is reaped)
+response = client.chat.completions.create(
+    model="placeholder",
+    messages=[{"role": "user", "content": "Summarize the April 2026 agent platform landscape."}],
+)
+print(response.choices[0].message.content)
+
+# Sticky session — same `user` field across calls retains history
+user_id = "my-conversation-1"
+client.chat.completions.create(
+    model="placeholder",
+    user=user_id,
+    messages=[{"role": "user", "content": "Remember: my name is Alice."}],
+)
+r = client.chat.completions.create(
+    model="placeholder",
+    user=user_id,
+    messages=[{"role": "user", "content": "What is my name?"}],
+)
+print(r.choices[0].message.content)  # "Alice"
+```
+
+**Load-bearing differences from the OpenAI API** (these are intentional, not bugs):
+
+- **`x-openclaw-agent-id` header is required.** There is no default agent. Every request names the agent template it runs against. Missing header → 400.
+- **The body `model` field is ignored.** The model comes from the agent template's `model` field (the argument to `POST /v1/agents`). To override the model for a given session, use the native `POST /v1/sessions/:id/events` endpoint with an optional `model` field — that routes through `sessions.patch` on the OpenClaw gateway control plane and persists for subsequent events.
+- **`role: "system"` messages are ignored.** Use the agent template's `instructions` field (which becomes `systemPromptOverride` inside OpenClaw) — that's the canonical system prompt for the agent.
+- **Only the last `role: "user"` message is read.** Pi's `SessionManager` owns history on sticky sessions, so you don't need to replay prior turns. For ephemeral sessions, only the final user message defines the turn.
+- **`stream: true` is emulated.** The runtime blocks until the run completes, then emits three chunks (role → content → finish) followed by `[DONE]`. Real token-by-token delta streaming is planned for a future item.
+- **Session resolution:** `x-openclaw-session-key` header or `user` body field → sticky session (reused across calls, auto-created if the key doesn't yet exist). Neither → ephemeral session with a generated id, reaped alongside its container by the idle sweeper. Client-supplied keys must match `^[a-zA-Z0-9_-]{1,128}$`.
+- **Silently ignored fields:** `temperature`, `top_p`, `max_tokens`, `n`, `logprobs`, `stop`, `tools`, `functions`, `response_format`, `seed`, `tool_choice`, and any other OpenAI request fields beyond `messages`/`stream`/`user`/`model`. The runtime returns `n=1`, doesn't translate between OpenAI function calling and agent tools (agents use their own tool ecosystem via templates), and applies no custom output formatting.
+
+**Production note:** the handler polls session status every 500 ms with a 10-minute cap. Behind load balancers or reverse proxies with idle timeouts shorter than 10 minutes, long runs may disconnect before returning. In that case, use the native `POST /v1/sessions/:id/events` pattern and subscribe to `GET /v1/sessions/:id/events?stream=true` for live progress instead of blocking on `/v1/chat/completions`.
+
 ## Quick start (local Docker)
 
 Requires: Docker, Node 22+, and an API key for at least one provider OpenClaw supports. The default smoke path uses Moonshot Kimi K2.5 (`moonshot/kimi-k2.5`) because it works from any country Moonshot supports without needing a cloud account. Any OpenClaw provider works — just swap the `model` field and export the matching key.

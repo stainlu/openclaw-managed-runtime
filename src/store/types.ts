@@ -28,7 +28,27 @@ export type RunUsage = {
 };
 
 export interface SessionStore {
-  create(args: { agentId: string; sessionId?: string }): Session;
+  /**
+   * Create a session bound to an agent.
+   *
+   * - `sessionId` (optional): client-supplied session id. Used by the
+   *   OpenAI-compat adapter (POST /v1/chat/completions) when the client
+   *   passes an `x-openclaw-session-key` header or `user` body field and
+   *   no existing session matches it. When omitted, the store generates
+   *   a fresh `ses_` id.
+   * - `ephemeral` (optional, default false): mark the session for
+   *   reap-time cleanup. The pool's idle sweeper deletes ephemeral
+   *   sessions (SQLite row + Pi JSONL) when their container is reaped,
+   *   so one-shot OpenAI-style calls don't accumulate forever. Named
+   *   sessions (POST /v1/sessions, or chat.completions with a session
+   *   key) should never be ephemeral — the client took ownership of
+   *   the key and is responsible for lifecycle.
+   */
+  create(args: {
+    agentId: string;
+    sessionId?: string;
+    ephemeral?: boolean;
+  }): Session;
   get(sessionId: string): Session | undefined;
   list(): Session[];
   delete(sessionId: string): boolean;

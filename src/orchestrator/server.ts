@@ -7,12 +7,25 @@ import { AgentRouter, RouterError } from "./router.js";
 import {
   CreateAgentRequestSchema,
   CreateSessionRequestSchema,
+  OpenAIChatCompletionRequestSchema,
   PostEventRequestSchema,
   RunAgentRequestSchema,
   type AgentConfig,
   type Event,
   type Session,
 } from "./types.js";
+
+// Regex for client-supplied session keys on POST /v1/chat/completions. The
+// key is used verbatim as the orchestrator session id AND as the directory
+// component under the host mount, so we constrain it to safe characters.
+// 128 chars is generous and still shorter than most filesystem limits.
+const SESSION_KEY_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+
+// Polling config for /v1/chat/completions blocking wait. The cap matches
+// the legacy runTimeoutMs default (10 minutes) — long enough for Moonshot's
+// occasional 429 retry cascades, short enough to bound client timeouts.
+const CHAT_COMPLETION_TIMEOUT_MS = 10 * 60_000;
+const CHAT_COMPLETION_POLL_MS = 500;
 
 export type ServerDeps = {
   agents: AgentStore;
@@ -113,6 +126,9 @@ export function buildApp(deps: ServerDeps): Hono {
           list_events: "GET /v1/sessions/:sessionId/events",
           stream_events: "GET /v1/sessions/:sessionId/events?stream=true",
           cancel: "POST /v1/sessions/:sessionId/cancel",
+        },
+        openai_compat: {
+          chat_completions: "POST /v1/chat/completions",
         },
         health: {
           liveness: "GET /healthz",
@@ -305,6 +321,353 @@ export function buildApp(deps: ServerDeps): Hono {
       .listBySession(session.agentId, session.sessionId)
       .map(eventResponse);
     return c.json({ session_id: sessionId, events, count: events.length });
+  });
+
+  // ---------- OpenAI-compat adapter ----------
+
+  // Thin compatibility shim over the session/event API. Lets existing
+  // OpenAI SDK integrations switch to the runtime by swapping their
+  // base_url. Documented behavior (see README's "OpenAI SDK compatibility"):
+  //
+  //   - `x-openclaw-agent-id` header is REQUIRED; there is no default agent.
+  //   - Body `model` field is IGNORED; the agent template's configured
+  //     model wins. For per-session model override, use native
+  //     POST /v1/sessions/:id/events with the `model` field (Item 7).
+  //   - `role: "system"` messages are IGNORED; use the agent template's
+  //     `instructions` (systemPromptOverride) instead.
+  //   - Only the trailing `role: "user"` message is read. Pi's
+  //     SessionManager owns history on sticky sessions; for ephemeral
+  //     sessions only the final user message defines the turn.
+  //   - `stream: true` is EMULATED — the handler blocks until the run
+  //     completes, then emits three chunks (role / content / finish) +
+  //     `[DONE]`. Real token-by-token delta streaming is deferred.
+  //
+  // Session resolution:
+  //   - `x-openclaw-session-key` header or body `user` field → sticky
+  //     session. Reuse if it exists and matches the agent; auto-create
+  //     with that exact key if not. Bound to the validated regex.
+  //   - Neither → ephemeral session, auto-generated id, flagged for
+  //     reap-time cleanup by the idle sweeper.
+  //
+  // Stale-detection: because the pool queues events when a session is
+  // busy, a /v1/chat/completions call on a running session may wait for
+  // both the in-flight run AND subsequent queued events to drain. The
+  // handler snapshots the newest agent.message id BEFORE calling runEvent
+  // and verifies the post-wait message is different — otherwise we'd
+  // return a stale response from an earlier turn. Guards the race flagged
+  // by the advisor.
+  app.post("/v1/chat/completions", async (c) => {
+    const agentId = c.req.header("x-openclaw-agent-id");
+    if (!agentId) {
+      return c.json(
+        {
+          error: {
+            message: "missing x-openclaw-agent-id header",
+            type: "invalid_request_error",
+          },
+        },
+        400,
+      );
+    }
+    const agent = deps.agents.get(agentId);
+    if (!agent) {
+      return c.json(
+        {
+          error: {
+            message: `agent ${agentId} not found`,
+            type: "invalid_request_error",
+          },
+        },
+        404,
+      );
+    }
+
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = OpenAIChatCompletionRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json(
+        {
+          error: {
+            message: "invalid request body",
+            type: "invalid_request_error",
+            details: parsed.error.format(),
+          },
+        },
+        400,
+      );
+    }
+    const body = parsed.data;
+
+    // Extract the newest user message with non-empty string content.
+    // Multimodal content arrays are not supported in Item 8.
+    let lastUserContent: string | undefined;
+    for (let i = body.messages.length - 1; i >= 0; i--) {
+      const m = body.messages[i];
+      if (
+        m &&
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        m.content.length > 0
+      ) {
+        lastUserContent = m.content;
+        break;
+      }
+    }
+    if (lastUserContent === undefined) {
+      return c.json(
+        {
+          error: {
+            message:
+              "no user message with non-empty string content found in messages[]",
+            type: "invalid_request_error",
+          },
+        },
+        400,
+      );
+    }
+
+    // Session resolution.
+    const headerSessionKey = c.req.header("x-openclaw-session-key");
+    const sessionKey = headerSessionKey ?? body.user;
+    let session: Session;
+    let isEphemeral = false;
+
+    if (sessionKey !== undefined && sessionKey !== "") {
+      if (!SESSION_KEY_RE.test(sessionKey)) {
+        return c.json(
+          {
+            error: {
+              message:
+                "session key format invalid — expected ^[a-zA-Z0-9_-]{1,128}$",
+              type: "invalid_request_error",
+            },
+          },
+          400,
+        );
+      }
+      const existing = deps.sessions.get(sessionKey);
+      if (existing) {
+        if (existing.agentId !== agentId) {
+          return c.json(
+            {
+              error: {
+                message: `session ${sessionKey} is bound to a different agent (${existing.agentId})`,
+                type: "invalid_request_error",
+              },
+            },
+            409,
+          );
+        }
+        session = existing;
+      } else {
+        // Client took ownership of this key; a named session is never
+        // ephemeral. If the client wants auto-cleanup they should omit
+        // the key entirely and let the handler generate one.
+        session = deps.sessions.create({
+          agentId,
+          sessionId: sessionKey,
+          ephemeral: false,
+        });
+      }
+    } else {
+      session = deps.sessions.create({ agentId, ephemeral: true });
+      isEphemeral = true;
+    }
+
+    // Ephemeral cleanup on any error path. Explicitly NOT called on the
+    // happy path — the session + its container live on in the pool and
+    // are reaped together by the idle sweeper. Best-effort throughout:
+    // a cleanup failure must not mask the original error the caller
+    // actually cares about.
+    const cleanupEphemeralOnError = (): void => {
+      if (!isEphemeral) return;
+      try {
+        deps.events.deleteBySession(agentId, session.sessionId);
+      } catch {
+        /* best-effort */
+      }
+      try {
+        deps.sessions.delete(session.sessionId);
+      } catch {
+        /* best-effort */
+      }
+    };
+
+    // Stale-detection snapshot.
+    const beforeMsg = deps.events.latestAgentMessage(agentId, session.sessionId);
+    const beforeEventId = beforeMsg?.eventId;
+
+    try {
+      await deps.router.runEvent({
+        sessionId: session.sessionId,
+        content: lastUserContent,
+      });
+    } catch (err) {
+      cleanupEphemeralOnError();
+      if (err instanceof RouterError) {
+        return c.json(
+          {
+            error: { message: err.message, type: err.code },
+          },
+          500,
+        );
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json(
+        {
+          error: { message: msg, type: "internal_error" },
+        },
+        500,
+      );
+    }
+
+    // Poll for completion. Item 7's queue-drain keeps status=running
+    // across the whole chain so this naturally waits for queued events
+    // to finish before returning.
+    const pollStart = Date.now();
+    let finalSession: Session | undefined;
+    while (Date.now() - pollStart < CHAT_COMPLETION_TIMEOUT_MS) {
+      const current = deps.sessions.get(session.sessionId);
+      if (!current) {
+        cleanupEphemeralOnError();
+        return c.json(
+          {
+            error: {
+              message: "session disappeared during run",
+              type: "internal_error",
+            },
+          },
+          500,
+        );
+      }
+      if (current.status !== "running") {
+        finalSession = current;
+        break;
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, CHAT_COMPLETION_POLL_MS),
+      );
+    }
+
+    if (!finalSession) {
+      cleanupEphemeralOnError();
+      return c.json(
+        {
+          error: {
+            message: `run timed out after ${CHAT_COMPLETION_TIMEOUT_MS}ms`,
+            type: "timeout",
+          },
+        },
+        504,
+      );
+    }
+
+    if (finalSession.status === "failed") {
+      cleanupEphemeralOnError();
+      return c.json(
+        {
+          error: {
+            message: finalSession.error ?? "session failed",
+            type: "run_failed",
+          },
+        },
+        500,
+      );
+    }
+
+    // Read post-run message and verify it's different from the snapshot.
+    const afterMsg = deps.events.latestAgentMessage(agentId, session.sessionId);
+    if (!afterMsg || afterMsg.eventId === beforeEventId) {
+      cleanupEphemeralOnError();
+      return c.json(
+        {
+          error: {
+            message: "run finished but no new agent.message was written",
+            type: "internal_error",
+          },
+        },
+        500,
+      );
+    }
+
+    // Build the response. Prefer the model actually used (from the event)
+    // over the agent template's configured model so any session-level
+    // override surfaces in the response.
+    const responseModel = afterMsg.model ?? agent.model;
+    const createdUnix = Math.floor(afterMsg.createdAt / 1000);
+    const responseId = `chatcmpl-${afterMsg.eventId}`;
+    const usage = {
+      prompt_tokens: afterMsg.tokensIn ?? 0,
+      completion_tokens: afterMsg.tokensOut ?? 0,
+      total_tokens: (afterMsg.tokensIn ?? 0) + (afterMsg.tokensOut ?? 0),
+    };
+
+    if (body.stream === true) {
+      return streamSSE(c, async (sse) => {
+        const baseChunk = {
+          id: responseId,
+          object: "chat.completion.chunk",
+          created: createdUnix,
+          model: responseModel,
+        };
+        // Role chunk.
+        await sse.writeSSE({
+          data: JSON.stringify({
+            ...baseChunk,
+            choices: [
+              {
+                index: 0,
+                delta: { role: "assistant" },
+                finish_reason: null,
+              },
+            ],
+          }),
+        });
+        // Content chunk — full content in one frame. Emulated streaming.
+        await sse.writeSSE({
+          data: JSON.stringify({
+            ...baseChunk,
+            choices: [
+              {
+                index: 0,
+                delta: { content: afterMsg.content },
+                finish_reason: null,
+              },
+            ],
+          }),
+        });
+        // Finish chunk.
+        await sse.writeSSE({
+          data: JSON.stringify({
+            ...baseChunk,
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: "stop",
+              },
+            ],
+          }),
+        });
+        // OpenAI's terminator.
+        await sse.writeSSE({ data: "[DONE]" });
+      });
+    }
+
+    return c.json({
+      id: responseId,
+      object: "chat.completion",
+      created: createdUnix,
+      model: responseModel,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: afterMsg.content },
+          finish_reason: "stop",
+        },
+      ],
+      usage,
+    });
   });
 
   // ---------- Backwards-compat /run adapter ----------

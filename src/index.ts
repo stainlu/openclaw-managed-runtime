@@ -157,12 +157,30 @@ async function main(): Promise<void> {
 
   // Per-session container pool. isBusy closes over the session store so the
   // sweeper can skip containers whose session currently has a run in flight
-  // — the pool itself has no store dependency.
+  // — the pool itself has no store dependency. cleanupOnReap closes over
+  // BOTH the store and the JSONL reader so it can tear down ephemeral
+  // sessions (auto-created by keyless POST /v1/chat/completions) along with
+  // their container. Called only on the idle-reap path; manual evictSession
+  // and shutdown paths preserve session data.
   const pool = new SessionContainerPool(runtime, {
     idleTimeoutMs,
     readyTimeoutMs,
     sweepIntervalMs,
     isBusy: (sessionId) => store.sessions.get(sessionId)?.status === "running",
+    cleanupOnReap: async (sessionId) => {
+      const session = store.sessions.get(sessionId);
+      if (!session?.ephemeral) return;
+      try {
+        eventReader.deleteBySession(session.agentId, sessionId);
+      } catch (err) {
+        console.warn(
+          `[pool cleanup] deleting JSONL for ephemeral ${sessionId} failed:`,
+          err,
+        );
+      }
+      store.sessions.delete(sessionId);
+      console.log(`[pool cleanup] reaped ephemeral session ${sessionId}`);
+    },
   });
 
   const routerCfg: RouterConfig = {

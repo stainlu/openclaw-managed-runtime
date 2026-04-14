@@ -34,6 +34,15 @@ export type Session = {
   sessionId: string;
   agentId: string;
   status: SessionStatus;
+  /**
+   * True when the session was auto-created by POST /v1/chat/completions
+   * without a client-supplied session key. The pool's idle sweeper deletes
+   * ephemeral sessions (JSONL + store row) when their container is reaped,
+   * so one-shot OpenAI-style calls don't accumulate forever. Explicitly
+   * named sessions (POST /v1/sessions, or chat.completions with a session
+   * key) are never ephemeral.
+   */
+  ephemeral: boolean;
   /** Rolling sum of agent.message event tokens since the session was created. */
   tokensIn: number;
   tokensOut: number;
@@ -108,3 +117,44 @@ export const RunAgentRequestSchema = z.object({
 });
 
 export type RunAgentRequest = z.infer<typeof RunAgentRequestSchema>;
+
+// ---------- OpenAI-compat adapter ----------
+
+// POST /v1/chat/completions accepts the OpenAI ChatCompletionRequest shape
+// as a thin compatibility shim over the session/event API. Every field we
+// don't explicitly use is deliberately ignored (.passthrough()) so
+// clients migrating from OpenAI SDKs don't need to strip anything.
+//
+// Documented ignored fields:
+//   - model: the agent template's configured model wins. To override the
+//     model, use native POST /v1/sessions/:id/events with the `model` field.
+//   - messages entries other than the trailing role=user: Pi's
+//     SessionManager owns history on sticky sessions; for ephemeral
+//     sessions only the final user message defines the turn.
+//   - role="system" messages: use the agent template's instructions
+//     (which becomes systemPromptOverride) instead.
+//   - temperature, top_p, max_tokens, n, logprobs, stop, tools, functions,
+//     response_format, seed, tool_choice, etc.: silently ignored.
+//
+// The shape is permissive at parse time; the handler validates that at
+// least one user message with non-empty string content exists after the
+// schema passes.
+export const OpenAIChatMessageSchema = z
+  .object({
+    role: z.string().min(1),
+    content: z.unknown().optional(),
+  })
+  .passthrough();
+
+export const OpenAIChatCompletionRequestSchema = z
+  .object({
+    model: z.string().optional(),
+    messages: z.array(OpenAIChatMessageSchema).min(1),
+    stream: z.boolean().optional(),
+    user: z.string().optional(),
+  })
+  .passthrough();
+
+export type OpenAIChatCompletionRequest = z.infer<
+  typeof OpenAIChatCompletionRequestSchema
+>;
