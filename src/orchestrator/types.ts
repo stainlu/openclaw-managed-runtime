@@ -8,6 +8,22 @@ export const CreateAgentRequestSchema = z.object({
   instructions: z.string().default(""),
   /** Optional stable display name for UI/logging. */
   name: z.string().optional(),
+  /**
+   * Item 12-14: list of agent IDs this agent is permitted to invoke via
+   * the in-container `call_agent` tool. Default empty = no delegation.
+   * Enforced both inside the call_agent tool (fast rejection) AND
+   * orchestrator-side on POST /v1/sessions via X-OpenClaw-Parent-Token
+   * verification (defense in depth).
+   */
+  callableAgents: z.array(z.string()).default([]),
+  /**
+   * Item 12-14: maximum recursion depth for subagent chains rooted at
+   * this agent. Default 0 = this agent cannot spawn any subagents even
+   * if callableAgents is non-empty. Each spawn decrements the parent
+   * token's remaining_depth counter; at zero the orchestrator rejects
+   * further POST /v1/sessions calls carrying that token.
+   */
+  maxSubagentDepth: z.number().int().min(0).default(0),
 });
 
 export type CreateAgentRequest = z.infer<typeof CreateAgentRequestSchema>;
@@ -19,6 +35,10 @@ export type AgentConfig = {
   instructions: string;
   name?: string;
   createdAt: number;
+  /** See CreateAgentRequestSchema.callableAgents. Always populated (empty array if none). */
+  callableAgents: string[];
+  /** See CreateAgentRequestSchema.maxSubagentDepth. Always populated (0 if not set). */
+  maxSubagentDepth: number;
 };
 
 // ---------- Session (long-lived, one per conversation) ----------
@@ -43,6 +63,17 @@ export type Session = {
    * key) are never ephemeral.
    */
   ephemeral: boolean;
+  /**
+   * Item 12-14: remaining subagent spawns allowed from this session's
+   * container via the in-container `call_agent` tool. Initialized at
+   * session creation time from either the agent template's
+   * `maxSubagentDepth` (top-level sessions) or from the parent token's
+   * `remaining_depth - 1` (child sessions, created with
+   * X-OpenClaw-Parent-Token). Persisted so that when the pool respawns a
+   * container for this session, the orchestrator mints a parent token
+   * with the correct remaining depth.
+   */
+  remainingSubagentDepth: number;
   /** Rolling sum of agent.message event tokens since the session was created. */
   tokensIn: number;
   tokensOut: number;

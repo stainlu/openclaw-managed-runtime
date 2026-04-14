@@ -21,6 +21,8 @@ class InMemoryAgentStore implements AgentStore {
       instructions: req.instructions,
       name: req.name,
       createdAt: Date.now(),
+      callableAgents: req.callableAgents,
+      maxSubagentDepth: req.maxSubagentDepth,
     };
     this.agents.set(agent.agentId, agent);
     return agent;
@@ -48,6 +50,7 @@ class InMemorySessionStore implements SessionStore {
     agentId: string;
     sessionId?: string;
     ephemeral?: boolean;
+    remainingSubagentDepth?: number;
   }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
     const session: Session = {
@@ -55,6 +58,7 @@ class InMemorySessionStore implements SessionStore {
       agentId: args.agentId,
       status: "idle",
       ephemeral: args.ephemeral ?? false,
+      remainingSubagentDepth: args.remainingSubagentDepth ?? 0,
       tokensIn: 0,
       tokensOut: 0,
       costUsd: 0,

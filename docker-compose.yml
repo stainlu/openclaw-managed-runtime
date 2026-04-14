@@ -34,6 +34,9 @@ services:
       OPENCLAW_GATEWAY_PORT: "18789"
       OPENCLAW_READY_TIMEOUT_MS: "120000"
       OPENCLAW_RUN_TIMEOUT_MS: "600000"
+      # Item 12-14: URL the in-container call_agent CLI uses to reach the
+      # orchestrator. Matches this service's container_name + port.
+      OPENCLAW_ORCHESTRATOR_URL: http://openclaw-orchestrator:8080
       # Persistent metadata store. SQLite is the default; override with
       # OPENCLAW_STORE=memory to run without persistence (tests only).
       OPENCLAW_STORE: ${OPENCLAW_STORE:-sqlite}

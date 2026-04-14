@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { type Context, Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
 import type { AgentStore, SessionStore } from "../store/types.js";
 import { AgentRouter, RouterError } from "./router.js";
@@ -32,6 +33,15 @@ export type ServerDeps = {
   sessions: SessionStore;
   events: PiJsonlEventReader;
   router: AgentRouter;
+  /**
+   * Item 12-14: parent-token minter/verifier. POST /v1/sessions verifies
+   * an optional X-OpenClaw-Parent-Token header against this minter when a
+   * call originates from an in-container `call_agent` CLI tool, enforcing
+   * the parent agent template's `callableAgents` allowlist and
+   * `maxSubagentDepth` cap. Absent header = top-level client call,
+   * allowed unconditionally (no tenant auth layer in v1).
+   */
+  tokenMinter: ParentTokenMinter;
   /** Semver from package.json, surfaced on GET /. */
   version: string;
 };
@@ -182,8 +192,50 @@ export function buildApp(deps: ServerDeps): Hono {
     if (!parsed.success) {
       return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
     }
+
+    // Item 12-14: optional X-OpenClaw-Parent-Token header. Present when
+    // the request originates from an in-container `call_agent` CLI tool.
+    // Absent = top-level client call, permitted without a token check.
+    // When present: verify the signature, check the target agentId is in
+    // the parent token's allowlist, and ensure remaining depth > 0. The
+    // new child session inherits `parent.remaining_depth - 1` as its own
+    // remainingSubagentDepth, so if the parent allowed depth N, the child
+    // will allow N-1 further spawns from its own container.
+    const parentTokenHeader = c.req.header("x-openclaw-parent-token");
+    let remainingSubagentDepthOverride: number | undefined;
+    if (parentTokenHeader) {
+      const payload = deps.tokenMinter.verify(parentTokenHeader);
+      if (!payload) {
+        return c.json(
+          { error: "invalid_parent_token", message: "parent token failed verification" },
+          403,
+        );
+      }
+      if (!payload.allowlist.includes(parsed.data.agentId)) {
+        return c.json(
+          {
+            error: "agent_not_in_allowlist",
+            message: `parent agent ${payload.parentAgentId} is not permitted to spawn ${parsed.data.agentId}`,
+          },
+          403,
+        );
+      }
+      if (payload.remainingDepth <= 0) {
+        return c.json(
+          {
+            error: "max_subagent_depth_reached",
+            message: `parent token has no remaining subagent depth (parent: ${payload.parentAgentId})`,
+          },
+          403,
+        );
+      }
+      remainingSubagentDepthOverride = payload.remainingDepth - 1;
+    }
+
     try {
-      const session = deps.router.createSession(parsed.data.agentId);
+      const session = deps.router.createSession(parsed.data.agentId, {
+        remainingSubagentDepth: remainingSubagentDepthOverride,
+      });
       return c.json(sessionResponse(session, deps.events));
     } catch (err) {
       return handleRouterError(err, c);
@@ -463,14 +515,24 @@ export function buildApp(deps: ServerDeps): Hono {
         // Client took ownership of this key; a named session is never
         // ephemeral. If the client wants auto-cleanup they should omit
         // the key entirely and let the handler generate one.
+        //
+        // Item 12-14: seed remainingSubagentDepth from the agent template.
+        // chat.completions is a client-facing endpoint (no parent token
+        // path), so the session is always a "top-level" session that gets
+        // its max delegation depth from its agent template.
         session = deps.sessions.create({
           agentId,
           sessionId: sessionKey,
           ephemeral: false,
+          remainingSubagentDepth: agent.maxSubagentDepth,
         });
       }
     } else {
-      session = deps.sessions.create({ agentId, ephemeral: true });
+      session = deps.sessions.create({
+        agentId,
+        ephemeral: true,
+        remainingSubagentDepth: agent.maxSubagentDepth,
+      });
       isEphemeral = true;
     }
 

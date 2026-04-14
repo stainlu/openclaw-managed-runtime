@@ -19,6 +19,8 @@ type AgentRow = {
   instructions: string;
   name: string | null;
   created_at: number;
+  callable_agents_json: string | null;
+  max_subagent_depth: number;
 };
 
 type SessionRow = {
@@ -26,6 +28,7 @@ type SessionRow = {
   agent_id: string;
   status: string;
   ephemeral: number;
+  remaining_subagent_depth: number;
   tokens_in: number;
   tokens_out: number;
   cost_usd: number;
@@ -42,6 +45,10 @@ function rowToAgent(r: AgentRow): AgentConfig {
     instructions: r.instructions,
     name: r.name ?? undefined,
     createdAt: r.created_at,
+    callableAgents: r.callable_agents_json
+      ? (JSON.parse(r.callable_agents_json) as string[])
+      : [],
+    maxSubagentDepth: r.max_subagent_depth,
   };
 }
 
@@ -51,6 +58,7 @@ function rowToSession(r: SessionRow): Session {
     agentId: r.agent_id,
     status: r.status as SessionStatus,
     ephemeral: r.ephemeral === 1,
+    remainingSubagentDepth: r.remaining_subagent_depth,
     tokensIn: r.tokens_in,
     tokensOut: r.tokens_out,
     costUsd: r.cost_usd,
@@ -86,7 +94,9 @@ CREATE TABLE IF NOT EXISTS agents (
   tools_json TEXT NOT NULL,
   instructions TEXT NOT NULL,
   name TEXT,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  callable_agents_json TEXT,
+  max_subagent_depth INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -94,6 +104,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   agent_id TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('idle', 'running', 'failed')),
   ephemeral INTEGER NOT NULL DEFAULT 0,
+  remaining_subagent_depth INTEGER NOT NULL DEFAULT 0,
   tokens_in INTEGER NOT NULL DEFAULT 0,
   tokens_out INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL NOT NULL DEFAULT 0,
@@ -115,8 +126,13 @@ class SqliteAgentStore implements AgentStore {
 
   constructor(private readonly db: Database.Database) {
     this.insertStmt = db.prepare(
-      `INSERT INTO agents (agent_id, model, tools_json, instructions, name, created_at)
-       VALUES (@agent_id, @model, @tools_json, @instructions, @name, @created_at)`,
+      `INSERT INTO agents (
+        agent_id, model, tools_json, instructions, name, created_at,
+        callable_agents_json, max_subagent_depth
+       ) VALUES (
+        @agent_id, @model, @tools_json, @instructions, @name, @created_at,
+        @callable_agents_json, @max_subagent_depth
+       )`,
     );
     this.getStmt = db.prepare(`SELECT * FROM agents WHERE agent_id = ?`);
     this.listStmt = db.prepare(`SELECT * FROM agents ORDER BY created_at ASC`);
@@ -131,6 +147,8 @@ class SqliteAgentStore implements AgentStore {
       instructions: req.instructions,
       name: req.name,
       createdAt: Date.now(),
+      callableAgents: req.callableAgents,
+      maxSubagentDepth: req.maxSubagentDepth,
     };
     this.insertStmt.run({
       agent_id: agent.agentId,
@@ -139,6 +157,11 @@ class SqliteAgentStore implements AgentStore {
       instructions: agent.instructions,
       name: agent.name ?? null,
       created_at: agent.createdAt,
+      callable_agents_json:
+        agent.callableAgents.length > 0
+          ? JSON.stringify(agent.callableAgents)
+          : null,
+      max_subagent_depth: agent.maxSubagentDepth,
     });
     return agent;
   }
@@ -176,10 +199,12 @@ class SqliteSessionStore implements SessionStore {
   constructor(private readonly db: Database.Database) {
     this.insertStmt = db.prepare(
       `INSERT INTO sessions (
-        session_id, agent_id, status, ephemeral, tokens_in, tokens_out, cost_usd,
+        session_id, agent_id, status, ephemeral, remaining_subagent_depth,
+        tokens_in, tokens_out, cost_usd,
         error, created_at, last_event_at
        ) VALUES (
-        @session_id, @agent_id, 'idle', @ephemeral, 0, 0, 0, NULL, @created_at, NULL
+        @session_id, @agent_id, 'idle', @ephemeral, @remaining_subagent_depth,
+        0, 0, 0, NULL, @created_at, NULL
        )`,
     );
     this.getStmt = db.prepare(`SELECT * FROM sessions WHERE session_id = ?`);
@@ -228,14 +253,17 @@ class SqliteSessionStore implements SessionStore {
     agentId: string;
     sessionId?: string;
     ephemeral?: boolean;
+    remainingSubagentDepth?: number;
   }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
     const ephemeral = args.ephemeral ?? false;
+    const remainingSubagentDepth = args.remainingSubagentDepth ?? 0;
     const createdAt = Date.now();
     this.insertStmt.run({
       session_id: sessionId,
       agent_id: args.agentId,
       ephemeral: ephemeral ? 1 : 0,
+      remaining_subagent_depth: remainingSubagentDepth,
       created_at: createdAt,
     });
     return {
@@ -243,6 +271,7 @@ class SqliteSessionStore implements SessionStore {
       agentId: args.agentId,
       status: "idle",
       ephemeral,
+      remainingSubagentDepth,
       tokensIn: 0,
       tokensOut: 0,
       costUsd: 0,
@@ -355,6 +384,29 @@ export class SqliteStore implements Store {
       // cleanup and all explicit /v1/sessions creates are non-ephemeral).
       this.db.exec(
         "ALTER TABLE sessions ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!sessionsCols.some((c) => c.name === "remaining_subagent_depth")) {
+      // Item 12-14: per-session remaining subagent depth. Rows that predate
+      // Item 12-14 default to 0 (no delegation allowed from existing
+      // sessions, which is a safe no-op for the call_agent feature).
+      this.db.exec(
+        "ALTER TABLE sessions ADD COLUMN remaining_subagent_depth INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    const agentsCols = this.db.pragma("table_info(agents)") as Array<{
+      name: string;
+    }>;
+    if (!agentsCols.some((c) => c.name === "callable_agents_json")) {
+      // Item 12-14: allowlist of agent IDs this template may invoke via
+      // call_agent. NULL means no delegation (same as an empty array).
+      this.db.exec("ALTER TABLE agents ADD COLUMN callable_agents_json TEXT");
+    }
+    if (!agentsCols.some((c) => c.name === "max_subagent_depth")) {
+      // Item 12-14: recursion cap. Default 0 = this template cannot spawn
+      // subagents even if callable_agents_json is non-empty.
+      this.db.exec(
+        "ALTER TABLE agents ADD COLUMN max_subagent_depth INTEGER NOT NULL DEFAULT 0",
       );
     }
 

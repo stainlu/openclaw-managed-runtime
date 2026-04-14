@@ -70,6 +70,16 @@ ENV OPENCLAW_AGENT_ID="default" \
 COPY docker/entrypoint.sh /usr/local/bin/openclaw-managed-entrypoint
 RUN chmod +x /usr/local/bin/openclaw-managed-entrypoint
 
+# Item 12-14: in-container CLI for delegating to another agent via the
+# orchestrator's existing HTTP API. The agent invokes it through its
+# built-in `exec` tool; the tool reads OPENCLAW_ORCHESTRATOR_URL and
+# OPENCLAW_ORCHESTRATOR_TOKEN from the container env (injected by the
+# orchestrator at spawn) to authenticate subagent session spawns.
+# The child session created by this CLI is a first-class HTTP resource
+# — observability via GET /v1/sessions/<id>/events?stream=true.
+COPY docker/call-agent.mjs /usr/local/bin/openclaw-call-agent
+RUN chmod +x /usr/local/bin/openclaw-call-agent
+
 USER openclaw
 WORKDIR /workspace
 

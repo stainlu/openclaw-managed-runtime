@@ -43,11 +43,19 @@ export interface SessionStore {
    *   sessions (POST /v1/sessions, or chat.completions with a session
    *   key) should never be ephemeral — the client took ownership of
    *   the key and is responsible for lifecycle.
+   * - `remainingSubagentDepth` (optional, default 0): how many more
+   *   levels of subagent spawning this session is allowed. For a
+   *   top-level session (no parent token), initialized from the
+   *   agent template's `maxSubagentDepth`. For a child session
+   *   (created with X-OpenClaw-Parent-Token), initialized from
+   *   `parent.remaining_depth - 1`. Persisted so container
+   *   respawn mints tokens with the correct scope.
    */
   create(args: {
     agentId: string;
     sessionId?: string;
     ephemeral?: boolean;
+    remainingSubagentDepth?: number;
   }): Session;
   get(sessionId: string): Session | undefined;
   list(): Session[];

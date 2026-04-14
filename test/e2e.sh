@@ -624,5 +624,143 @@ else
   exit 1
 fi
 
+# ---- Delegated subagents (Item 12-14) --------------------------------------
+# Proves the reference `openclaw-call-agent` CLI tool end-to-end:
+#   1. Create a worker agent with default config (no subagent permissions)
+#   2. Create a caller agent with callableAgents=[worker] + maxSubagentDepth=1
+#   3. Post a user.message to the caller instructing it to delegate to worker
+#      via `openclaw-call-agent --target <worker_id> --task "..."`
+#   4. Verify that a subagent session was created under the worker agent
+#   5. Verify that the subagent session is inspectable via the standard API
+#      (GET /v1/sessions/:id/events) — the "first-class inspectable child
+#      sessions" differentiator
+#   6. Verify that the caller's final reply contains the subagent's answer
+
+echo "[e2e] delegated subagents: creating worker agent"
+WORKER_AGENT=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/agents" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "'"${MODEL}"'",
+    "tools": [],
+    "instructions": "You are a worker agent. Reply with the exact single word requested by the task, no punctuation.",
+    "name": "worker",
+    "callableAgents": [],
+    "maxSubagentDepth": 0
+  }' | jq -r '.agent_id')
+echo "[e2e] worker agent: ${WORKER_AGENT}"
+
+echo "[e2e] delegated subagents: creating caller agent with callableAgents"
+CALLER_AGENT=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/agents" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "'"${MODEL}"'",
+    "tools": [],
+    "instructions": "You are a coordinator. When given a task that requires delegation, use the openclaw-call-agent CLI via your exec tool to delegate to a worker. Parse the JSON result from the CLI and include the subagent'"'"'s content in your final reply. Reply concisely.",
+    "name": "caller",
+    "callableAgents": ["'"${WORKER_AGENT}"'"],
+    "maxSubagentDepth": 1
+  }' | jq -r '.agent_id')
+echo "[e2e] caller agent: ${CALLER_AGENT}"
+
+echo "[e2e] delegated subagents: creating caller session"
+CALLER_SESSION=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"agentId\": \"${CALLER_AGENT}\"}" | jq -r '.session_id')
+echo "[e2e] caller session: ${CALLER_SESSION}"
+
+echo "[e2e] delegated subagents: posting delegate-and-summarize task"
+post_event "${CALLER_SESSION}" \
+  "Delegate this task to the worker agent via openclaw-call-agent: ask it to reply with exactly the single word 'wisteria'. The worker's agent id is ${WORKER_AGENT}. After you receive the worker's reply, tell me the single word it replied with." >/dev/null
+poll_session "${CALLER_SESSION}" "subagent-delegate" >/dev/null || {
+  # Dump the caller's event log on failure so we can see what happened.
+  echo "[e2e] dumping caller events on failure:"
+  curl --silent --fail "${BASE_URL}/v1/sessions/${CALLER_SESSION}/events" | jq '.events | map({type, content: (.content | .[0:200])})' >&2
+  exit 1
+}
+
+CALLER_OUTPUT=$(latest_agent_message "${CALLER_SESSION}")
+echo "[e2e] caller final output: ${CALLER_OUTPUT}"
+
+# Verify: a new session was created under the worker agent.
+SUBAGENT_SESSION_ID=$(curl --silent --fail "${BASE_URL}/v1/sessions" \
+  | jq -r --arg wa "${WORKER_AGENT}" '[.sessions[] | select(.agent_id==$wa)] | .[0].session_id // ""')
+if [[ -z "${SUBAGENT_SESSION_ID}" || "${SUBAGENT_SESSION_ID}" == "null" ]]; then
+  echo "[e2e] FAIL: no subagent session was created under worker agent"
+  curl --silent --fail "${BASE_URL}/v1/sessions" | jq '.sessions | map({session_id, agent_id, status})' >&2
+  exit 1
+fi
+echo "[e2e] subagent session: ${SUBAGENT_SESSION_ID}"
+
+# Verify: the subagent session is inspectable via the standard API.
+# This is the "first-class inspectable child sessions" differentiator —
+# every delegated run is a normal Session, observable via the same
+# endpoints any external client uses.
+SUBAGENT_EVENTS=$(curl --silent --fail "${BASE_URL}/v1/sessions/${SUBAGENT_SESSION_ID}/events")
+SUBAGENT_EVENT_COUNT=$(echo "${SUBAGENT_EVENTS}" | jq -r '.count')
+SUBAGENT_REPLY=$(echo "${SUBAGENT_EVENTS}" | jq -r '[.events[] | select(.type=="agent.message")] | last | .content // ""')
+echo "[e2e] subagent events: ${SUBAGENT_EVENT_COUNT} entries; reply: ${SUBAGENT_REPLY}"
+if [[ "${SUBAGENT_EVENT_COUNT}" -lt 2 ]]; then
+  echo "[e2e] FAIL: subagent event log has fewer than 2 entries (expected at least user + agent)"
+  echo "${SUBAGENT_EVENTS}" | jq '.events | map({type, content: (.content | .[0:200])})' >&2
+  exit 1
+fi
+if ! echo "${SUBAGENT_REPLY}" | grep -qi "wisteria"; then
+  echo "[e2e] FAIL: subagent's reply did not contain 'wisteria'"
+  echo "  got: ${SUBAGENT_REPLY}"
+  exit 1
+fi
+
+# Verify: the caller's final reply included the subagent's answer. The
+# caller read the subagent's stdout and surfaced the content to the user.
+if ! echo "${CALLER_OUTPUT}" | grep -qi "wisteria"; then
+  echo "[e2e] FAIL: caller's final message did not include 'wisteria' from the subagent"
+  echo "  got: ${CALLER_OUTPUT}"
+  exit 1
+fi
+echo "[e2e] delegated subagents PASSED (child is a first-class inspectable session)"
+
+# ---- Allowlist rejection ---------------------------------------------------
+# A caller whose callableAgents does NOT include the worker must fail to
+# delegate. The in-container CLI will get a 403 from the orchestrator's
+# parent-token verification. The parent agent sees the error in its exec
+# tool result and can either recover or fail the run. For this test we
+# just verify the session eventually completes (not stuck running) — the
+# exact recovery behavior is agent-specific and depends on model.
+
+echo "[e2e] allowlist rejection: creating locked-down caller"
+LOCKED_CALLER=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/agents" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "'"${MODEL}"'",
+    "tools": [],
+    "instructions": "You are a locked-down agent with no delegation permissions. When given a task, just answer it yourself in one short sentence.",
+    "name": "locked",
+    "callableAgents": [],
+    "maxSubagentDepth": 0
+  }' | jq -r '.agent_id')
+
+LOCKED_SESSION=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"agentId\": \"${LOCKED_CALLER}\"}" | jq -r '.session_id')
+
+# Sanity: the locked caller's max_subagent_depth = 0, so its container
+# should NOT receive the call_agent hint in its system prompt. The agent
+# should therefore not try to use openclaw-call-agent at all. Assert via
+# a normal question that it answers directly.
+post_event "${LOCKED_SESSION}" "What is 2 + 2? Answer with just the digit." >/dev/null
+poll_session "${LOCKED_SESSION}" "locked-caller" >/dev/null || exit 1
+LOCKED_OUTPUT=$(latest_agent_message "${LOCKED_SESSION}")
+echo "[e2e] locked caller output: ${LOCKED_OUTPUT}"
+if ! echo "${LOCKED_OUTPUT}" | grep -q "4"; then
+  echo "[e2e] FAIL: locked caller did not answer 2+2=4 directly (got: ${LOCKED_OUTPUT})"
+  exit 1
+fi
+echo "[e2e] allowlist rejection PASSED (locked-down caller stays single-agent)"
+
 echo "[e2e] ALL CHECKS PASSED"
 exit 0

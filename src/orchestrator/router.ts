@@ -1,5 +1,6 @@
 import type { Container, Mount, SpawnOptions } from "../runtime/container.js";
 import { GatewayWsError } from "../runtime/gateway-ws.js";
+import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { SessionContainerPool } from "../runtime/pool.js";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
 import type { AgentStore, RunUsage, SessionStore } from "../store/types.js";
@@ -19,6 +20,19 @@ export type RouterConfig = {
   passthroughEnv: Record<string, string>;
   /** Max time to wait for the agent task to complete end-to-end (ms). */
   runTimeoutMs: number;
+  /**
+   * Item 12-14: URL that the in-container `call_agent` CLI tool uses to
+   * reach back to the orchestrator's HTTP API. Usually the orchestrator's
+   * Docker service name + port (e.g. `http://openclaw-orchestrator:8080`).
+   * Injected into every spawned container as OPENCLAW_ORCHESTRATOR_URL.
+   */
+  orchestratorUrl: string;
+  /**
+   * Item 12-14: token minter for per-container parent tokens. The router
+   * mints a token scoped to each session's agent template + remaining
+   * depth at container spawn time, injected as OPENCLAW_ORCHESTRATOR_TOKEN.
+   */
+  tokenMinter: ParentTokenMinter;
 };
 
 export type RunEventArgs = {
@@ -53,13 +67,24 @@ export class AgentRouter {
    * Create a session bound to an agent. Pure metadata: no container spawn,
    * no JSONL allocation, no remote calls. The container is only spawned
    * when the first event is posted to this session via runEvent().
+   *
+   * Optional `remainingSubagentDepth` overrides the default (which is the
+   * agent template's `maxSubagentDepth`). Used by the subagent spawn path
+   * in server.ts after verifying an X-OpenClaw-Parent-Token header: the
+   * child session inherits `parent.remaining_depth - 1` instead of its
+   * own template's max depth.
    */
-  createSession(agentId: string): Session {
+  createSession(
+    agentId: string,
+    opts?: { remainingSubagentDepth?: number },
+  ): Session {
     const agent = this.agents.get(agentId);
     if (!agent) {
       throw new RouterError("agent_not_found", `agent ${agentId} does not exist`);
     }
-    return this.sessions.create({ agentId });
+    const remainingSubagentDepth =
+      opts?.remainingSubagentDepth ?? agent.maxSubagentDepth;
+    return this.sessions.create({ agentId, remainingSubagentDepth });
   }
 
   /**
@@ -192,14 +217,63 @@ export class AgentRouter {
     // Multi-tenancy is provided by the mount path (one orchestrator agent =
     // one mount = one container), not by naming. The orchestrator's agent id
     // lives in the label and mount path; inside the container it is "main".
+    // Item 12-14: mint a per-session parent token scoped to this agent
+    // template's callable_agents + the session's remaining subagent depth.
+    // The in-container `call_agent` CLI tool reads OPENCLAW_ORCHESTRATOR_URL
+    // and OPENCLAW_ORCHESTRATOR_TOKEN from the container env and uses them
+    // to make authenticated HTTP calls back to POST /v1/sessions. The
+    // orchestrator verifies the token on each call and rejects spawns that
+    // target an agent outside the allowlist or exceed the depth cap.
+    //
+    // Look up the session row to get remainingSubagentDepth (which was
+    // initialized at createSession time — either from the agent template's
+    // maxSubagentDepth for top-level sessions, or from the parent token's
+    // remaining_depth - 1 for child sessions). If the session is missing
+    // at this point something has gone very wrong, but fall back to a
+    // zero-depth token so the run can still complete without subagent
+    // capability rather than crashing.
+    const currentSession = this.sessions.get(sessionId);
+    const remainingDepth = currentSession?.remainingSubagentDepth ?? 0;
+    const parentToken = this.cfg.tokenMinter.mint({
+      parentSessionId: sessionId,
+      parentAgentId: agent.agentId,
+      allowlist: agent.callableAgents,
+      remainingDepth,
+    });
+
+    // Progressive disclosure of the call_agent capability. If this agent
+    // template permits delegation AND the session has remaining depth,
+    // append a short hint to the system prompt so the model discovers the
+    // tool exists. Full usage is still loaded on-demand via
+    // `openclaw-call-agent --help`, matching Mario's "CLI tools with
+    // READMEs" philosophy — the tool documentation is not baked into
+    // every container's context.
+    let effectiveInstructions = agent.instructions;
+    if (agent.callableAgents.length > 0 && remainingDepth > 0) {
+      const hint = [
+        "",
+        "## Delegation",
+        "You can delegate tasks to other agents via the `openclaw-call-agent` CLI.",
+        `Allowed target agents: ${agent.callableAgents.join(", ")}.`,
+        "Invoke it through your `exec` tool:",
+        '  openclaw-call-agent --target <agent_id> --task "<prompt>"',
+        "Run `openclaw-call-agent --help` for full usage. The tool returns JSON on stdout with the subagent's final reply and a `subagent_session_id` you can use to inspect the delegated run.",
+      ].join("\n");
+      effectiveInstructions = effectiveInstructions
+        ? `${effectiveInstructions}\n${hint}`
+        : hint.trimStart();
+    }
+
     const env: Record<string, string> = {
       ...this.cfg.passthroughEnv,
       OPENCLAW_AGENT_ID: "main",
       OPENCLAW_MODEL: agent.model,
       OPENCLAW_TOOLS: agent.tools.join(","),
-      OPENCLAW_INSTRUCTIONS: agent.instructions,
+      OPENCLAW_INSTRUCTIONS: effectiveInstructions,
       OPENCLAW_STATE_DIR: "/workspace",
       OPENCLAW_GATEWAY_PORT: String(this.cfg.gatewayPort),
+      OPENCLAW_ORCHESTRATOR_URL: this.cfg.orchestratorUrl,
+      OPENCLAW_ORCHESTRATOR_TOKEN: parentToken,
     };
 
     const spawnOptions: SpawnOptions = {

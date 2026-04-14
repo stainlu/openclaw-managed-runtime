@@ -5,6 +5,7 @@ import { SessionEventQueue } from "./orchestrator/event-queue.js";
 import { AgentRouter, type RouterConfig } from "./orchestrator/router.js";
 import { startServer } from "./orchestrator/server.js";
 import { DockerContainerRuntime } from "./runtime/docker.js";
+import { ParentTokenMinter } from "./runtime/parent-token.js";
 import { SessionContainerPool } from "./runtime/pool.js";
 import {
   buildStore,
@@ -105,6 +106,15 @@ function collectPassthroughEnv(): Record<string, string> {
 async function main(): Promise<void> {
   const version = readPackageVersion();
   const port = envInt("PORT", 8080);
+  // Item 12-14: the URL the in-container `call_agent` CLI uses to reach
+  // back to the orchestrator HTTP API. Defaults to the docker-compose
+  // service name + this port, which Just Works for the standard local
+  // setup. Override for non-compose deployments (k8s Service, direct
+  // docker with a different container name, etc.).
+  const orchestratorUrl = env(
+    "OPENCLAW_ORCHESTRATOR_URL",
+    `http://openclaw-orchestrator:${port}`,
+  );
   const runtimeImage = env("OPENCLAW_RUNTIME_IMAGE", "openclaw-managed-runtime/agent:latest");
   // hostStateRoot is the host-side path, needed by dockerode for bind
   // mounts on spawned agent containers. The actual Docker daemon resolves
@@ -184,6 +194,12 @@ async function main(): Promise<void> {
     },
   });
 
+  // Item 12-14: one minter per orchestrator process. Signed by an in-memory
+  // random secret generated in the constructor. Restart regenerates the
+  // secret, invalidating every outstanding token — consistent with the
+  // runtime's other "restart drops ephemeral state" invariants.
+  const tokenMinter = new ParentTokenMinter();
+
   const routerCfg: RouterConfig = {
     runtimeImage,
     hostStateRoot,
@@ -191,6 +207,8 @@ async function main(): Promise<void> {
     gatewayPort,
     passthroughEnv,
     runTimeoutMs,
+    orchestratorUrl,
+    tokenMinter,
   };
 
   const eventQueue = new SessionEventQueue();
@@ -209,6 +227,7 @@ async function main(): Promise<void> {
   console.log(`[orchestrator] docker network: ${network}`);
   console.log(`[orchestrator] host state root: ${hostStateRoot}`);
   console.log(`[orchestrator] state root (in-process): ${stateRoot}`);
+  console.log(`[orchestrator] orchestrator url (for in-container call_agent): ${orchestratorUrl}`);
   console.log(
     `[orchestrator] store: ${storeBackend}${storePath ? ` (${storePath})` : ""}`,
   );
@@ -244,6 +263,7 @@ async function main(): Promise<void> {
       sessions: store.sessions,
       events: eventReader,
       router,
+      tokenMinter,
       version,
     },
     { port },

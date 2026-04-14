@@ -92,11 +92,17 @@ GET    /healthz                           # liveness probe: { ok, version }
 **Agent templates** — reusable config specs. Creating an agent does not spawn anything.
 
 ```
-POST   /v1/agents                         # body: { model, tools, instructions, name? }
+POST   /v1/agents                         # body: { model, tools, instructions, name?,
+                                          #         callableAgents?, maxSubagentDepth? }
 GET    /v1/agents                         # list all templates
 GET    /v1/agents/:agentId                # fetch one template
 DELETE /v1/agents/:agentId
 ```
+
+`callableAgents` (default `[]`) is the delegation allowlist — other agent IDs this
+template may invoke via the in-container `openclaw-call-agent` CLI. `maxSubagentDepth`
+(default `0`) is the recursion cap. Both default to denying delegation; opt in per
+template. See [Delegated subagents](#delegated-subagents) below.
 
 **Sessions** — long-lived, multi-turn, the primary interaction API.
 
@@ -264,6 +270,133 @@ curl -N "http://localhost:8080/v1/sessions/${SESSION}/events?stream=true"
 # ...
 ```
 
+## Delegated subagents
+
+> **Every agent in OpenClaw Managed Runtime is an inspectable session. That includes subagents.**
+> Unlike Claude Managed Agents, there are no opaque delegated runs — you can subscribe to
+> `GET /v1/sessions/<any_session_id>/events?stream=true` in real time, whether the session
+> was created by a client or by another agent's `call_agent` tool call. The "black box
+> within a black box" problem doesn't exist here by architectural construction.
+
+An agent can delegate a task to another agent via the `openclaw-call-agent` CLI that ships
+in the runtime image at `/usr/local/bin/openclaw-call-agent`. The parent agent invokes it
+through its normal `exec` tool; the CLI makes authenticated HTTP calls back to the
+orchestrator's existing `POST /v1/sessions` + `POST /events` + `GET /events?stream=true`
+API. There are **no new HTTP endpoints** on the runtime — the subagent pattern rides on top
+of the primitives that every external client already uses.
+
+This follows [Mario Zechner's CLI-tools-with-README pattern](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/)
+literally: no Pi extension, no OpenClaw plugin, no built-in `call_agent` runtime endpoint.
+Just a single-file Node CLI the agent shells out to.
+
+### Enabling delegation on an agent template
+
+Two optional fields on `POST /v1/agents`:
+
+- **`callableAgents: string[]`** — allowlist of target agent IDs this template may invoke.
+  Default `[]` (no delegation).
+- **`maxSubagentDepth: number`** — how many levels of nested delegation this template's
+  sessions may root. Default `0` (delegation disabled even if `callableAgents` is non-empty).
+  Each `call_agent` invocation decrements a signed parent token's remaining depth; the
+  orchestrator rejects further spawns when it reaches zero.
+
+```bash
+# Create a worker agent (leaf — no delegation)
+curl -s -X POST http://localhost:8080/v1/agents \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "moonshot/kimi-k2.5", "tools": [], "instructions": "You are a worker.",
+       "name": "worker"}'
+# → {"agent_id": "agt_worker", ...}
+
+# Create a coordinator that may delegate to worker
+curl -s -X POST http://localhost:8080/v1/agents \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "moonshot/kimi-k2.5", "tools": [], "instructions": "You are a coordinator.
+       When a task fits the worker, delegate via openclaw-call-agent.",
+       "name": "coordinator",
+       "callableAgents": ["agt_worker"],
+       "maxSubagentDepth": 1}'
+# → {"agent_id": "agt_coordinator", ...}
+```
+
+### How the agent uses it
+
+The orchestrator detects `callableAgents.length > 0 && remainingDepth > 0` at container
+spawn and appends a short delegation hint to the agent's system prompt:
+
+> ## Delegation
+> You can delegate tasks to other agents via the `openclaw-call-agent` CLI.
+> Allowed target agents: agt_worker.
+> Invoke it through your `exec` tool:
+>   openclaw-call-agent --target <agent_id> --task "<prompt>"
+> Run `openclaw-call-agent --help` for full usage. The tool returns JSON on stdout with
+> the subagent's final reply and a `subagent_session_id` you can use to inspect the
+> delegated run.
+
+The model then invokes the CLI via its `exec` tool. The CLI blocks until the subagent's
+run completes (10-minute cap), then prints one line of JSON to stdout:
+
+```json
+{"subagent_session_id":"ses_xyz","content":"...","events_url":"http://openclaw-orchestrator:8080/v1/sessions/ses_xyz/events"}
+```
+
+The parent agent reads that stdout through its `exec` tool result and uses the `content`
+field in its own reasoning. If it wants to inspect the subagent's full run, it can curl
+the `events_url` via `exec` as well — no special privilege needed.
+
+### Observing a subagent externally
+
+A subagent session is a normal session. Every orchestrator API works on it:
+
+```bash
+# List all sessions (parents + subagents)
+curl -s http://localhost:8080/v1/sessions
+
+# Fetch the subagent's metadata (status, rolling tokens, cost)
+curl -s http://localhost:8080/v1/sessions/ses_xyz
+
+# Read the subagent's full event log
+curl -s http://localhost:8080/v1/sessions/ses_xyz/events
+
+# Tail-follow the subagent while it runs (SSE)
+curl -N http://localhost:8080/v1/sessions/ses_xyz/events?stream=true
+
+# Cancel the subagent (aborts its in-flight run via the WS control plane)
+curl -s -X POST http://localhost:8080/v1/sessions/ses_xyz/cancel
+```
+
+### Auth and safety
+
+Each container gets an orchestrator-minted parent token in `OPENCLAW_ORCHESTRATOR_TOKEN`,
+HMAC-signed by a per-process secret that regenerates on every orchestrator restart. The
+token carries:
+
+- `parentSessionId` / `parentAgentId` — who is calling
+- `allowlist` — which agent IDs may be spawned (from the parent template's `callableAgents`)
+- `remainingDepth` — how many more nesting levels are allowed (from the parent session's
+  `remainingSubagentDepth`, decremented on each spawn)
+- `expiresAt` — 24-hour TTL
+
+`POST /v1/sessions` verifies the `X-OpenClaw-Parent-Token` header when present and
+rejects (HTTP 403) if the target agent is not in the allowlist, the signature fails, the
+token is expired, or remaining depth is zero. Defense in depth: the CLI itself also
+validates args locally before the round trip, so bad inputs fail fast.
+
+The parent-token secret is in-memory only — consistent with the runtime's other
+"restart drops ephemeral state" invariants (post-restart running sessions become failed,
+queued events are lost, in-flight subagent spawns rejected until the next container
+respawn mints a fresh token).
+
+### What's NOT here
+
+- **No `POST /v1/agents/:id/call` or `POST /v1/sessions/:id/subagents` endpoint.** Existing
+  `POST /v1/sessions` + `POST /events` IS the subagent API.
+- **No Claude-Code-style description-based implicit delegation.** The model invokes the
+  tool explicitly; no routing magic.
+- **No orchestrator-side cost aggregation across subagents.** A client that wants a combined
+  view walks the `subagent_session_id` pointers in the parent's event log and sums.
+- **No recursion by default.** Opt in per agent template via `maxSubagentDepth > 0`.
+
 ## Status and roadmap
 
 This is **early development**, but the runtime is end-to-end functional and every feature below is validated against a real provider in the e2e suite. See `docs/architecture.md` for the technical design.
@@ -278,6 +411,7 @@ This is **early development**, but the runtime is end-to-end functional and ever
 - **Control plane via the gateway's WebSocket** (`src/runtime/gateway-ws.ts`) — cancel uses `sessions.abort`, per-event `model` field uses `sessions.patch`. Queue-when-busy behavior drains automatically in order.
 - **OpenAI-compat adapter** via `POST /v1/chat/completions` — sticky sessions via `user` field / `x-openclaw-session-key`, keyless calls create ephemeral sessions, reaped alongside their container.
 - **Per-turn cost accounting** from Pi's provider catalogs — cache-aware, read from `msg.usage.cost.total` in the JSONL. No static price sheet in the orchestrator.
+- **Delegated subagents as first-class inspectable sessions.** `callableAgents` + `maxSubagentDepth` on agent templates, HMAC-signed parent tokens, `openclaw-call-agent` CLI tool inside the container. Zero new HTTP endpoints; subagents spawn through the existing `POST /v1/sessions` + `POST /events` primitives. See [Delegated subagents](#delegated-subagents) above.
 
 **Next** (Items 10-11):
 
@@ -288,7 +422,7 @@ This is **early development**, but the runtime is end-to-end functional and ever
 
 **Later** (Items 12-14):
 
-- **Delegated subagents as a built-in `call_agent` tool.** Subagents are first-class `Session` rows in our store; any client can subscribe to a subagent's event stream via the same `/v1/sessions/<subagent_id>/events?stream=true` path. Zero observation blindness, full inspectability.
+- **Multi-tenant delegated subagents at scale.** The current Item 12-14 release ships per-agent-template `callableAgents` + `maxSubagentDepth` + HMAC parent tokens; "Later" work adds tenant isolation, cross-tenant quota enforcement, and tree-view UI tooling for deeply nested delegations.
 - **Enterprise features.** Multi-tenant orchestrator with auth, quotas, and per-tenant isolation. Audit logs. Policy enforcement. BYO-KMS.
 
 **Out of scope** (deliberate, never becomes milestone work):
