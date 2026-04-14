@@ -1,6 +1,5 @@
 import { serve } from "@hono/node-server";
 import { type Context, Hono } from "hono";
-import type { ContainerRuntime } from "../runtime/container.js";
 import type { AgentStore, EventStore, SessionStore } from "../store/types.js";
 import { AgentRouter, RouterError } from "./router.js";
 import {
@@ -18,7 +17,6 @@ export type ServerDeps = {
   sessions: SessionStore;
   events: EventStore;
   router: AgentRouter;
-  runtime: ContainerRuntime;
   /** Semver from package.json, surfaced on GET /. */
   version: string;
 };

@@ -118,26 +118,32 @@ latest_agent_message() {
 # ---- Turn 1: teach the agent a fact -----------------------------------------
 
 echo "[e2e] turn 1: posting user.message (remember dragonfruit)"
+TURN1_START=$(date +%s)
 TURN1_EVENT=$(post_event "${SESSION_ID}" \
   "Remember this for later: my favorite fruit is dragonfruit. Reply with exactly the single word: noted")
 TURN1_EVENT_ID=$(echo "${TURN1_EVENT}" | jq -r '.event_id')
 echo "[e2e] turn 1 user event: ${TURN1_EVENT_ID}"
 
 poll_session "${SESSION_ID}" "turn1" >/dev/null || exit 1
+TURN1_END=$(date +%s)
+TURN1_DURATION=$((TURN1_END - TURN1_START))
 TURN1_OUTPUT=$(latest_agent_message "${SESSION_ID}")
-echo "[e2e] turn 1 output: ${TURN1_OUTPUT}"
+echo "[e2e] turn 1 output: ${TURN1_OUTPUT} (duration ${TURN1_DURATION}s)"
 
 # ---- Turn 2: ask the agent to recall the fact on the SAME session -----------
 
 echo "[e2e] turn 2: posting user.message (what is my favorite fruit)"
+TURN2_START=$(date +%s)
 TURN2_EVENT=$(post_event "${SESSION_ID}" \
   "What is my favorite fruit? Reply with only the single word, no punctuation.")
 TURN2_EVENT_ID=$(echo "${TURN2_EVENT}" | jq -r '.event_id')
 echo "[e2e] turn 2 user event: ${TURN2_EVENT_ID}"
 
 poll_session "${SESSION_ID}" "turn2" >/dev/null || exit 1
+TURN2_END=$(date +%s)
+TURN2_DURATION=$((TURN2_END - TURN2_START))
 TURN2_OUTPUT=$(latest_agent_message "${SESSION_ID}")
-echo "[e2e] turn 2 output: ${TURN2_OUTPUT}"
+echo "[e2e] turn 2 output: ${TURN2_OUTPUT} (duration ${TURN2_DURATION}s)"
 
 # ---- Verify resume --------------------------------------------------------
 
@@ -217,13 +223,16 @@ fi
 echo "[e2e] post-restart agent template OK"
 
 echo "[e2e] turn 3 (post-restart): posting user.message (recall dragonfruit again)"
+TURN3_START=$(date +%s)
 TURN3_EVENT=$(post_event "${SESSION_ID}" \
   "Remind me one more time — what is my favorite fruit? Single word only.")
 TURN3_EVENT_ID=$(echo "${TURN3_EVENT}" | jq -r '.event_id')
 echo "[e2e] turn 3 user event: ${TURN3_EVENT_ID}"
 poll_session "${SESSION_ID}" "turn3" >/dev/null || exit 1
+TURN3_END=$(date +%s)
+TURN3_DURATION=$((TURN3_END - TURN3_START))
 TURN3_OUTPUT=$(latest_agent_message "${SESSION_ID}")
-echo "[e2e] turn 3 output: ${TURN3_OUTPUT}"
+echo "[e2e] turn 3 output: ${TURN3_OUTPUT} (duration ${TURN3_DURATION}s)"
 if echo "${TURN3_OUTPUT}" | grep -qi "dragonfruit"; then
   echo "[e2e] SUCCESS: post-restart turn 3 still recalls dragonfruit"
 else
@@ -231,6 +240,31 @@ else
   echo "  turn 3 output: ${TURN3_OUTPUT}"
   exit 1
 fi
+
+# ---- Pool reuse timing assertions -------------------------------------------
+# Proves Item 4 behavior: turn 2 reuses the live container from turn 1, and
+# turn 3 respawns after the restart (because the in-memory pool lost state).
+# Use deltas, not absolute thresholds — Moonshot latency is variable and a
+# hard threshold would flake. The spawn overhead is ~15s consistently, so a
+# 5s delta is comfortably above the noise floor.
+
+echo "[e2e] turn durations: t1=${TURN1_DURATION}s t2=${TURN2_DURATION}s t3=${TURN3_DURATION}s"
+
+DELTA_1_MINUS_2=$((TURN1_DURATION - TURN2_DURATION))
+if [[ ${DELTA_1_MINUS_2} -lt 5 ]]; then
+  echo "[e2e] FAIL: turn 2 not meaningfully faster than turn 1 (delta=${DELTA_1_MINUS_2}s < 5s)"
+  echo "  expected pool reuse after turn 1 to save ~15s of container spawn time"
+  exit 1
+fi
+echo "[e2e] pool reuse OK: turn 2 was ${DELTA_1_MINUS_2}s faster than turn 1"
+
+DELTA_3_MINUS_2=$((TURN3_DURATION - TURN2_DURATION))
+if [[ ${DELTA_3_MINUS_2} -lt 5 ]]; then
+  echo "[e2e] FAIL: turn 3 not meaningfully slower than turn 2 (delta=${DELTA_3_MINUS_2}s < 5s)"
+  echo "  expected the orchestrator restart to drop the in-memory pool and force a fresh spawn"
+  exit 1
+fi
+echo "[e2e] post-restart respawn OK: turn 3 was ${DELTA_3_MINUS_2}s slower than turn 2"
 
 # ---- Backwards-compat: one-shot smoke of the /run adapter -------------------
 # Proves that the thin wrapper on top of createSession + runEvent still

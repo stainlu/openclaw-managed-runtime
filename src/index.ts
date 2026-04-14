@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { AgentRouter, type RouterConfig } from "./orchestrator/router.js";
 import { startServer } from "./orchestrator/server.js";
 import { DockerContainerRuntime } from "./runtime/docker.js";
+import { SessionContainerPool } from "./runtime/pool.js";
 import { buildStore, type StoreBackend } from "./store/index.js";
 
 function readPackageVersion(): string {
@@ -104,9 +105,16 @@ async function main(): Promise<void> {
   const gatewayPort = envInt("OPENCLAW_GATEWAY_PORT", 18789);
   const readyTimeoutMs = envInt("OPENCLAW_READY_TIMEOUT_MS", 60_000);
   const runTimeoutMs = envInt("OPENCLAW_RUN_TIMEOUT_MS", 10 * 60_000);
+  const idleTimeoutMs = envInt("OPENCLAW_IDLE_TIMEOUT_MS", 10 * 60_000);
+  const sweepIntervalMs = envInt("OPENCLAW_SWEEP_INTERVAL_MS", 60_000);
 
   const runtime = new DockerContainerRuntime({ network });
   await runtime.ensureNetwork();
+
+  // Reap any containers left behind by a previous orchestrator instance.
+  // Matched by the `managed-by=openclaw-managed-runtime` label so we do not
+  // touch anything else running on the host's Docker daemon.
+  const orphanedContainers = await runtime.cleanupOrphaned();
 
   const storeBackendRaw = env("OPENCLAW_STORE", "sqlite");
   if (storeBackendRaw !== "memory" && storeBackendRaw !== "sqlite") {
@@ -130,13 +138,22 @@ async function main(): Promise<void> {
   const passthroughEnv = collectPassthroughEnv();
   const passthroughEnvKeys = Object.keys(passthroughEnv).sort();
 
+  // Per-session container pool. isBusy closes over the session store so the
+  // sweeper can skip containers whose session currently has a run in flight
+  // — the pool itself has no store dependency.
+  const pool = new SessionContainerPool(runtime, {
+    idleTimeoutMs,
+    readyTimeoutMs,
+    sweepIntervalMs,
+    isBusy: (sessionId) => store.sessions.get(sessionId)?.status === "running",
+  });
+
   const routerCfg: RouterConfig = {
     runtimeImage,
     hostStateRoot,
     network,
     gatewayPort,
     passthroughEnv,
-    readyTimeoutMs,
     runTimeoutMs,
   };
 
@@ -144,7 +161,7 @@ async function main(): Promise<void> {
     store.agents,
     store.sessions,
     store.events,
-    runtime,
+    pool,
     routerCfg,
   );
 
@@ -155,6 +172,14 @@ async function main(): Promise<void> {
   console.log(
     `[orchestrator] store: ${storeBackend}${storePath ? ` (${storePath})` : ""}`,
   );
+  console.log(
+    `[orchestrator] pool: idleTimeout=${idleTimeoutMs}ms sweepInterval=${sweepIntervalMs}ms readyTimeout=${readyTimeoutMs}ms`,
+  );
+  if (orphanedContainers > 0) {
+    console.log(
+      `[orchestrator] cleanup: reaped ${orphanedContainers} orphaned container(s) from a previous instance`,
+    );
+  }
   if (orphaned > 0) {
     console.log(
       `[orchestrator] rehydration: marked ${orphaned} running session(s) as failed after restart`,
@@ -179,20 +204,27 @@ async function main(): Promise<void> {
       sessions: store.sessions,
       events: store.events,
       router,
-      runtime,
       version,
     },
     { port },
   );
 
-  // Graceful shutdown: close the store on termination so WAL checkpoints
-  // flush cleanly. HTTP-server shutdown is not yet wired (Hono's node-server
-  // exposes `close()` but this codebase holds no reference to it yet); that
-  // is a follow-up in Item 4 alongside per-session container lifecycle.
+  // Graceful shutdown: tear down all pool-managed containers (best-effort)
+  // and close the SQLite store so WAL checkpoints flush cleanly. The HTTP
+  // server is not explicitly stopped because Hono's node-server doesn't
+  // expose a close() reference in this codebase yet — in practice the
+  // process.exit() call takes the listener down with it.
   const shutdown = (signal: string): void => {
-    console.log(`[orchestrator] received ${signal}, closing store`);
-    store.close();
-    process.exit(0);
+    console.log(`[orchestrator] received ${signal}, shutting down`);
+    (async () => {
+      try {
+        await pool.shutdown();
+      } catch (err) {
+        console.warn("[orchestrator] pool shutdown error:", err);
+      }
+      store.close();
+      process.exit(0);
+    })();
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));

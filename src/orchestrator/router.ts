@@ -1,4 +1,5 @@
-import type { ContainerRuntime, Mount } from "../runtime/container.js";
+import type { Container, Mount, SpawnOptions } from "../runtime/container.js";
+import type { SessionContainerPool } from "../runtime/pool.js";
 import type { AgentStore, EventStore, SessionStore } from "../store/types.js";
 import type { AgentConfig, Event, Session } from "./types.js";
 
@@ -13,8 +14,6 @@ export type RouterConfig = {
   gatewayPort: number;
   /** Environment variables passed through to every spawned container (AWS creds, region, etc.). */
   passthroughEnv: Record<string, string>;
-  /** Max time to wait for /readyz (ms). */
-  readyTimeoutMs: number;
   /** Max time to wait for the agent task to complete end-to-end (ms). */
   runTimeoutMs: number;
 };
@@ -24,7 +23,7 @@ export class AgentRouter {
     private readonly agents: AgentStore,
     private readonly sessions: SessionStore,
     private readonly events: EventStore,
-    private readonly runtime: ContainerRuntime,
+    private readonly pool: SessionContainerPool,
     private readonly cfg: RouterConfig,
   ) {}
 
@@ -113,8 +112,9 @@ export class AgentRouter {
   ): Promise<void> {
     // Per-orchestrator-agent mount. Gives every orchestrator agent its own
     // isolated OpenClaw workspace (sessions.json, per-session JSONLs, skills
-    // cache, models cache). The mount path is stable across container restarts
-    // for the same orchestrator agent, which is what lets session resume work.
+    // cache, models cache). The mount path is stable across container
+    // restarts for the same orchestrator agent, which is what lets session
+    // resume work.
     const hostMount: Mount = {
       hostPath: `${this.cfg.hostStateRoot}/${agent.agentId}`,
       containerPath: "/workspace",
@@ -141,7 +141,7 @@ export class AgentRouter {
       OPENCLAW_GATEWAY_PORT: String(this.cfg.gatewayPort),
     };
 
-    const container = await this.runtime.spawn({
+    const spawnOptions: SpawnOptions = {
       image: this.cfg.runtimeImage,
       env,
       mounts: [hostMount],
@@ -151,11 +151,25 @@ export class AgentRouter {
         "orchestrator-agent-id": agent.agentId,
         "orchestrator-session-id": sessionId,
       },
-    });
+    };
+
+    // Pool-backed: the first event for a session spawns a fresh container
+    // and waits for /readyz; subsequent events reuse the live container.
+    // The pool's sweeper tears down idle containers. NO finally { stop } —
+    // teardown is the pool's responsibility, not the router's.
+    let container: Container;
+    try {
+      container = await this.pool.acquireForSession({ sessionId, spawnOptions });
+    } catch (err) {
+      // Acquire failed: spawn timed out, readyz never returned, or the
+      // runtime rejected the spawn. The pool already cleaned its own state
+      // for this session (acquireForSession never records a container that
+      // didn't reach ready). Propagate so the outer catch writes
+      // agent.error.
+      throw err;
+    }
 
     try {
-      await this.runtime.waitForReady(container, this.cfg.readyTimeoutMs);
-
       const completion = await this.invokeChatCompletions({
         baseUrl: container.baseUrl,
         token: container.token,
@@ -177,10 +191,19 @@ export class AgentRouter {
         tokensOut: completion.tokensOut,
         costUsd: completion.costUsd,
       });
-    } finally {
-      await this.runtime.stop(container.id).catch(() => {
-        /* best-effort teardown */
+    } catch (err) {
+      // Invocation failed: the container's HTTP endpoint either returned
+      // non-2xx, the fetch timed out against its runTimeoutMs, or something
+      // else blew up mid-run. Assume the container is suspect and evict it
+      // so the next event for this session respawns a fresh one. Note that
+      // Moonshot-flakiness surfaces as HTTP 200 with the error message in
+      // the content field — those reach the success branch above and do
+      // NOT evict, which is the right call (the container is fine; only
+      // the upstream model is flaky).
+      await this.pool.evictSession(sessionId).catch(() => {
+        /* best-effort eviction */
       });
+      throw err;
     }
   }
 

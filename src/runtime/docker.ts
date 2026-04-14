@@ -123,6 +123,36 @@ export class DockerContainerRuntime implements ContainerRuntime {
     if (existing.some((n) => n.Name === target)) return;
     await this.docker.createNetwork({ Name: target, Driver: "bridge" });
   }
+
+  /**
+   * Force-remove every container previously spawned by this runtime, matched
+   * by the `managed-by=openclaw-managed-runtime` label. Intended for startup:
+   * if a prior orchestrator instance crashed without tearing down its live
+   * containers, those containers are still running but are no longer tracked
+   * by any process — safe to reap. Returns the number of containers reaped.
+   *
+   * Deliberately kept off the ContainerRuntime interface: orphan cleanup is a
+   * Docker-label-specific concern. Cloud backends (ECS, Cloud Run, Container
+   * Apps) have their own cleanup semantics or none at all, and forcing a
+   * shared abstraction here would over-commit the interface.
+   */
+  async cleanupOrphaned(): Promise<number> {
+    const infos = await this.docker.listContainers({
+      all: true,
+      filters: { label: ["managed-by=openclaw-managed-runtime"] },
+    });
+    let reaped = 0;
+    for (const info of infos) {
+      try {
+        await this.docker.getContainer(info.Id).remove({ force: true });
+        reaped++;
+      } catch {
+        // Best-effort — a container might already be gone or belong to a
+        // parallel cleanup. Either way, move on.
+      }
+    }
+    return reaped;
+  }
 }
 
 function randomSuffix(): string {
