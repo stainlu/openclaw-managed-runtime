@@ -123,6 +123,72 @@ export class PiJsonlEventReader {
     }
   }
 
+  /**
+   * Tail-follow the session's JSONL and yield each new Event as it appears.
+   *
+   * Phase 1 is a catch-up: every event already on disk is yielded in order.
+   * Phase 2 polls the file at `pollIntervalMs` and emits any events whose
+   * Pi id has not been seen yet. The generator terminates when:
+   *   - the caller's AbortSignal fires (client disconnected), OR
+   *   - `isSessionRunning()` returns false AND nothing new has been yielded
+   *     for `idleTimeoutMs` — a grace period so clients can still stream
+   *     across multiple turns without having to reconnect.
+   *
+   * Intentionally simple: each poll re-reads and re-parses the whole file
+   * (sessions are a few KB in practice). A byte-offset tail is a
+   * straightforward future optimization if this shows up on a profile.
+   */
+  async *follow(
+    agentId: string,
+    sessionId: string,
+    opts: {
+      signal?: AbortSignal;
+      pollIntervalMs?: number;
+      idleTimeoutMs?: number;
+      isSessionRunning?: () => boolean;
+    } = {},
+  ): AsyncGenerator<Event> {
+    const pollMs = opts.pollIntervalMs ?? 250;
+    const idleTimeoutMs = opts.idleTimeoutMs ?? 30_000;
+    const seen = new Set<string>();
+
+    // Phase 1: catch-up.
+    for (const e of this.listBySession(agentId, sessionId)) {
+      if (opts.signal?.aborted) return;
+      seen.add(e.eventId);
+      yield e;
+    }
+
+    // Phase 2: tail-follow.
+    let lastYieldAt = Date.now();
+    while (!opts.signal?.aborted) {
+      try {
+        await sleepWithAbort(pollMs, opts.signal);
+      } catch {
+        return; // signal fired
+      }
+
+      for (const e of this.listBySession(agentId, sessionId)) {
+        if (opts.signal?.aborted) return;
+        if (seen.has(e.eventId)) continue;
+        seen.add(e.eventId);
+        lastYieldAt = Date.now();
+        yield e;
+      }
+
+      // Grace-period shutdown. Only trip when the caller supplied a busy
+      // check AND the session is no longer running AND nothing new has
+      // landed for idleTimeoutMs.
+      if (
+        opts.isSessionRunning !== undefined &&
+        !opts.isSessionRunning() &&
+        Date.now() - lastYieldAt > idleTimeoutMs
+      ) {
+        return;
+      }
+    }
+  }
+
   private resolvePiSessionId(agentId: string, sessionId: string): string | undefined {
     const sessionsJsonPath = this.sessionsJsonPath(agentId);
     let raw: string;
@@ -161,6 +227,24 @@ function canonicalKey(sessionId: string): string {
   return `agent:main:${sessionId}`;
 }
 
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function mapLineToEvent(line: PiLine, sessionId: string): Event | undefined {
   // Pi writes a dozen record types (session, model_change, thinking_level,
   // custom, message, ...). Only `message` records map onto our Event model.
@@ -188,35 +272,31 @@ function mapLineToEvent(line: PiLine, sessionId: string): Event | undefined {
   if (msg.role === "assistant") {
     const text = extractText(msg.content);
 
-    if (text) {
-      return {
-        eventId,
-        sessionId,
-        type: "agent.message",
-        content: text,
-        createdAt,
-        tokensIn: msg.usage?.input,
-        tokensOut: msg.usage?.output,
-        costUsd: msg.usage?.cost?.total,
-        model: combineModel(msg.provider, msg.model),
-      };
-    }
+    // Drop every empty-content assistant message, whether it's a
+    // mid-stream retry or a final error. Pi records each retry attempt
+    // as its own line — if the turn ultimately succeeded, the next
+    // assistant line with non-empty text is the one the caller wants,
+    // and the intermediate errors are noise. If every retry failed,
+    // Pi's SessionManager never produces a text line at all; the
+    // orchestrator surfaces that outcome through session.error and
+    // session.status=failed instead of as a per-event agent.error.
+    //
+    // Consequence: the count of emitted events stays equal to the
+    // number of turns (one user + one agent per successful turn),
+    // regardless of how many internal retries Pi needed to get there.
+    if (!text) return undefined;
 
-    // Empty content. Only surface as a terminal agent.error if Pi attached
-    // an errorMessage (meaning the run actually gave up); otherwise it's
-    // retry noise from a mid-stream failure that a later attempt succeeded.
-    if (msg.stopReason === "error" && msg.errorMessage) {
-      return {
-        eventId,
-        sessionId,
-        type: "agent.error",
-        content: msg.errorMessage,
-        createdAt,
-        model: combineModel(msg.provider, msg.model),
-      };
-    }
-
-    return undefined;
+    return {
+      eventId,
+      sessionId,
+      type: "agent.message",
+      content: text,
+      createdAt,
+      tokensIn: msg.usage?.input,
+      tokensOut: msg.usage?.output,
+      costUsd: msg.usage?.cost?.total,
+      model: combineModel(msg.provider, msg.model),
+    };
   }
 
   return undefined;

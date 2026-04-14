@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
 import { type Context, Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
 import type { AgentStore, SessionStore } from "../store/types.js";
 import { AgentRouter, RouterError } from "./router.js";
@@ -110,6 +111,7 @@ export function buildApp(deps: ServerDeps): Hono {
           delete: "DELETE /v1/sessions/:sessionId",
           post_event: "POST /v1/sessions/:sessionId/events",
           list_events: "GET /v1/sessions/:sessionId/events",
+          stream_events: "GET /v1/sessions/:sessionId/events?stream=true",
         },
         health: {
           liveness: "GET /healthz",
@@ -231,6 +233,57 @@ export function buildApp(deps: ServerDeps): Hono {
     if (!session) {
       return c.json({ error: "session_not_found" }, 404);
     }
+
+    // Two modes on the same URL: snapshot or live stream.
+    //   ?stream=true  — SSE, catch up on existing events then tail-follow
+    //                   the JSONL until the client disconnects or the
+    //                   session goes idle for ~30s.
+    //   default       — one-shot JSON array of every event in order.
+    if (c.req.query("stream") === "true") {
+      return streamSSE(c, async (sse) => {
+        // Propagate client-disconnect through an AbortController so the
+        // follow generator can bail out of its poll loop.
+        const abort = new AbortController();
+        sse.onAbort(() => abort.abort());
+
+        // Heartbeats so intermediate proxies don't idle-kill the socket.
+        // Every 15s we send a dedicated "heartbeat" event type; clients
+        // that don't care can ignore it via addEventListener filtering.
+        const heartbeat = setInterval(() => {
+          if (sse.aborted || sse.closed) return;
+          sse
+            .writeSSE({
+              event: "heartbeat",
+              data: JSON.stringify({ ts: Date.now() }),
+            })
+            .catch(() => {
+              /* best-effort */
+            });
+        }, 15_000);
+
+        try {
+          for await (const event of deps.events.follow(
+            session.agentId,
+            session.sessionId,
+            {
+              signal: abort.signal,
+              isSessionRunning: () =>
+                deps.sessions.get(sessionId)?.status === "running",
+            },
+          )) {
+            if (sse.aborted || sse.closed) break;
+            await sse.writeSSE({
+              event: event.type,
+              id: event.eventId,
+              data: JSON.stringify(eventResponse(event)),
+            });
+          }
+        } finally {
+          clearInterval(heartbeat);
+        }
+      });
+    }
+
     const events = deps.events
       .listBySession(session.agentId, session.sessionId)
       .map(eventResponse);

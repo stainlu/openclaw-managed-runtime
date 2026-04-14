@@ -266,6 +266,60 @@ if [[ ${DELTA_3_MINUS_2} -lt 5 ]]; then
 fi
 echo "[e2e] post-restart respawn OK: turn 3 was ${DELTA_3_MINUS_2}s slower than turn 2"
 
+# ---- SSE smoke: live event streaming ----------------------------------------
+# Proves that GET /v1/sessions/:id/events?stream=true returns a working SSE
+# stream — catch-up yields prior events, then tail-follow picks up new ones.
+
+STREAM_OUT=$(mktemp /tmp/openclaw-stream.XXXXXX)
+echo "[e2e] SSE smoke: curl -N stream -> ${STREAM_OUT}"
+
+# Start the stream in the background. Note: no --fail — we want curl to keep
+# writing whatever bytes it gets even if the connection is later torn down.
+curl --silent --no-buffer \
+  "${BASE_URL}/v1/sessions/${SESSION_ID}/events?stream=true" \
+  > "${STREAM_OUT}" 2>&1 &
+STREAM_PID=$!
+
+# Give curl a beat to open the HTTP connection before we kick off the run.
+sleep 1
+
+echo "[e2e] SSE smoke: posting turn 4 user.message"
+post_event "${SESSION_ID}" \
+  "Tell me the fruit one last time. Single word." >/dev/null
+poll_session "${SESSION_ID}" "stream-turn" >/dev/null || {
+  kill "${STREAM_PID}" 2>/dev/null || true
+  rm -f "${STREAM_OUT}"
+  exit 1
+}
+
+# After the session flips to idle, give the SSE generator a moment to flush
+# the final agent.message out of its poll loop before we kill curl.
+sleep 2
+
+kill "${STREAM_PID}" 2>/dev/null || true
+wait "${STREAM_PID}" 2>/dev/null || true
+
+STREAM_LINES=$(wc -l < "${STREAM_OUT}" | tr -d ' ')
+STREAM_USER=$(grep -c "^event: user.message$" "${STREAM_OUT}" || true)
+STREAM_AGENT=$(grep -c "^event: agent.message$" "${STREAM_OUT}" || true)
+STREAM_HEARTBEAT=$(grep -c "^event: heartbeat$" "${STREAM_OUT}" || true)
+echo "[e2e] SSE stream captured ${STREAM_LINES} lines: ${STREAM_USER} user.message, ${STREAM_AGENT} agent.message, ${STREAM_HEARTBEAT} heartbeat"
+
+if [[ "${STREAM_USER}" -lt 1 ]]; then
+  echo "[e2e] FAIL: SSE stream did not emit any user.message events"
+  head -c 1024 "${STREAM_OUT}"
+  rm -f "${STREAM_OUT}"
+  exit 1
+fi
+if [[ "${STREAM_AGENT}" -lt 1 ]]; then
+  echo "[e2e] FAIL: SSE stream did not emit any agent.message events"
+  head -c 1024 "${STREAM_OUT}"
+  rm -f "${STREAM_OUT}"
+  exit 1
+fi
+echo "[e2e] SSE smoke OK: both user.message and agent.message streamed live"
+rm -f "${STREAM_OUT}"
+
 # ---- Backwards-compat: one-shot smoke of the /run adapter -------------------
 # Proves that the thin wrapper on top of createSession + runEvent still
 # returns an OpenAI-style { session_id, status: "running" } for legacy callers.
