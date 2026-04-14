@@ -36,45 +36,107 @@ One codebase, one Docker image, all clouds.
 
 ```
 Developer
-   │ POST /v1/agents         create an agent
-   │ POST /v1/agents/:id/run submit a task
-   │ GET  /v1/sessions/:id   fetch result
+   │ POST /v1/agents                     create reusable template
+   │ POST /v1/sessions                   open long-lived session
+   │ POST /v1/sessions/:id/events        post user message (queues if busy)
+   │ GET  /v1/sessions/:id/events        snapshot or ?stream=true live SSE
+   │ POST /v1/sessions/:id/cancel        abort the in-flight run
+   │ POST /v1/chat/completions           OpenAI SDK drop-in (thin shim)
    ▼
-Orchestrator (this repo)
+Orchestrator (this repo, Hono HTTP service)
    │
-   │ spawn()                  route()
-   ▼                          ▼
-ContainerRuntime         OpenClaw container
- (Docker/ECS/...)         - entrypoint generates openclaw.json
-                          - exposes /v1/chat/completions
-                          - runs the full agent loop (tool use, multi-turn)
-                          - persists session JSONL to mounted volume
+   ├─ Store (src/store/) — SQLite by default, persists agents + sessions
+   │                       across orchestrator restart. Events are NOT
+   │                       stored here; they live in Pi's per-session JSONL.
+   │
+   ├─ SessionContainerPool (src/runtime/pool.ts) — one container per session,
+   │                       reused across turns. First event spawns (~15 s);
+   │                       subsequent turns reuse (~100 ms overhead). Idle
+   │                       sweeper reaps after OPENCLAW_IDLE_TIMEOUT_MS and
+   │                       cleans up ephemeral sessions on the same pass.
+   │
+   ├─ GatewayWebSocketClient (src/runtime/gateway-ws.ts) — operator-role WS
+   │                       handshake per container. Used for cancel
+   │                       (sessions.abort) and per-event model override
+   │                       (sessions.patch). One WS lifetime per container.
+   │
+   ├─ PiJsonlEventReader (src/store/pi-jsonl.ts) — parses OpenClaw's
+   │                       per-session JSONL for event list, latestAgentMessage,
+   │                       and tail-follow SSE. Also the source of per-turn
+   │                       cost (msg.usage.cost.total) for the session rollup.
+   │
+   └─ AgentRouter (src/orchestrator/router.ts) — idle runEvent spawns +
+                          runs; running runEvent queues; cancel aborts via
+                          WS + drains queue. Per-turn cost is read from the
+                          JSONL after each completion.
+   │
+   │ runtime.spawn()              HTTP /v1/chat/completions + WS control
+   ▼                              ▼
+DockerContainerRuntime            OpenClaw container (one per session)
+ (src/runtime/docker.ts)           - entrypoint generates openclaw.json
+                                   - HTTP /v1/chat/completions (OpenAI-compat)
+                                   - WebSocket control plane at /
+                                   - runs the full agent loop (tool use, multi-turn)
+                                   - persists session JSONL to mounted volume
 ```
 
-One OpenClaw container per agent. Each container is effectively single-user, which gives us true isolation for free — the orchestrator creates multi-user semantics externally without touching OpenClaw core.
+One OpenClaw container per session. Each container is effectively single-user, which gives us true isolation for free — the orchestrator creates multi-user semantics externally without touching OpenClaw core. The session is durable across container restarts because Pi's `SessionManager` rebuilds the `AgentSession` from the JSONL on the host mount when a new container spawns under the same key.
 
 ## API
 
 ```
-GET    /                       # self-documenting root: version, endpoints, docs link
-GET    /healthz                # liveness probe: { ok, version }
-
-POST   /v1/agents              # body: { model, tools, instructions, name? }
-                               # → { agent_id, model, tools, instructions, name, created_at }
-
-GET    /v1/agents              # → { agents: [...], count }
-GET    /v1/agents/:agentId     # → full agent config
-DELETE /v1/agents/:agentId     # → { deleted: true }
-
-POST   /v1/agents/:agentId/run # body: { task, sessionId? }
-                               # → { session_id, agent_id, status, started_at }
-
-GET    /v1/sessions/:sessionId # → { session_id, agent_id, status, task, output,
-                               #      error, tokens: { input, output }, cost_usd,
-                               #      started_at, completed_at }
+GET    /                                  # self-documenting root: name, version, endpoint map
+GET    /healthz                           # liveness probe: { ok, version }
 ```
 
-The orchestrator is self-documenting — `curl http://localhost:8080/` returns the full endpoint list, version, and links. You never need this section to discover the API, it's just here as a quick reference.
+**Agent templates** — reusable config specs. Creating an agent does not spawn anything.
+
+```
+POST   /v1/agents                         # body: { model, tools, instructions, name? }
+GET    /v1/agents                         # list all templates
+GET    /v1/agents/:agentId                # fetch one template
+DELETE /v1/agents/:agentId
+```
+
+**Sessions** — long-lived, multi-turn, the primary interaction API.
+
+```
+POST   /v1/sessions                       # body: { agentId }
+GET    /v1/sessions                       # list all sessions
+GET    /v1/sessions/:sessionId            # metadata: status, rolling tokens, cost_usd,
+                                          #           error, created_at, last_event_at, output
+                                          #           (output = content of the latest agent.message,
+                                          #            computed from Pi's JSONL at query time)
+DELETE /v1/sessions/:sessionId            # tears down container, deletes Pi JSONL + store row
+POST   /v1/sessions/:sessionId/events     # body: { content, model?, type?: "user.message" }
+                                          #   queues behind an in-flight run if the session is busy;
+                                          #   auto-drains in-order when the current run completes;
+                                          #   optional model override applies via the WS control plane
+GET    /v1/sessions/:sessionId/events     # one-shot JSON array of every event in order
+GET    /v1/sessions/:sessionId/events?stream=true
+                                          # SSE: catch-up then tail-follow the Pi JSONL;
+                                          #   15 s heartbeats; terminates on session idle + 30 s grace
+POST   /v1/sessions/:sessionId/cancel     # aborts the in-flight run via the gateway WS control plane,
+                                          #   drains queued events, leaves the session idle
+```
+
+**OpenAI compatibility** — thin shim over the session/event API. See "OpenAI SDK compatibility" below for the contract details.
+
+```
+POST   /v1/chat/completions               # x-openclaw-agent-id header required
+                                          # body is permissive OpenAI ChatCompletionRequest;
+                                          # stream=true is emulated (three chunks + [DONE]);
+                                          # keyless calls create ephemeral sessions that are
+                                          # reaped alongside their container by the idle sweeper
+```
+
+**Backwards-compat one-shot adapter** — kept for legacy callers. Thin wrapper over `createSession` + `runEvent`.
+
+```
+POST   /v1/agents/:agentId/run            # body: { task, sessionId? }
+```
+
+The orchestrator is self-documenting — `curl http://localhost:8080/` returns the full endpoint map, version, and docs link. You never need this section to discover the API.
 
 ## OpenAI SDK compatibility
 
@@ -142,39 +204,100 @@ export MOONSHOT_API_KEY=sk-...      # moonshot/kimi-k2.5 (default)
 docker compose up --build
 ```
 
-Then in another terminal:
+Then in another terminal — the session-centric path (recommended for multi-turn):
 
 ```bash
-# Create an agent
-curl -X POST http://localhost:8080/v1/agents \
+# 1. Create a reusable agent template (config only, no containers spawned)
+AGENT=$(curl -s -X POST http://localhost:8080/v1/agents \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "moonshot/kimi-k2.5",
-    "tools": [],
-    "instructions": "You are a research assistant."
-  }'
-# → {"agent_id":"agt_abc123"}
+  -d '{"model": "moonshot/kimi-k2.5", "tools": [], "instructions": "You are a research assistant."}' \
+  | jq -r '.agent_id')
 
-# Run a task
-curl -X POST http://localhost:8080/v1/agents/agt_abc123/run \
+# 2. Open a long-lived session bound to that agent
+SESSION=$(curl -s -X POST http://localhost:8080/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d "{\"agentId\": \"${AGENT}\"}" | jq -r '.session_id')
+
+# 3. Post a user message event. The FIRST event on a session spawns a
+#    container (~15 s one-time cost); subsequent turns reuse the live
+#    container via the pool (~100 ms overhead).
+curl -s -X POST "http://localhost:8080/v1/sessions/${SESSION}/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"content": "Remember: my favorite fruit is dragonfruit."}'
+
+# 4. Poll until idle, then read the newest agent.message from the JSONL
+while :; do
+  STATUS=$(curl -s "http://localhost:8080/v1/sessions/${SESSION}" | jq -r '.status')
+  [[ "$STATUS" != "running" ]] && break
+  sleep 2
+done
+curl -s "http://localhost:8080/v1/sessions/${SESSION}/events" \
+  | jq -r '[.events[] | select(.type=="agent.message")] | last | .content'
+
+# 5. Session resume across turns is automatic — the JSONL is the source of truth
+curl -s -X POST "http://localhost:8080/v1/sessions/${SESSION}/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"content": "What is my favorite fruit?"}'
+
+# 6. Rolling tokens + cost on the session row
+curl -s "http://localhost:8080/v1/sessions/${SESSION}" | jq '{status, cost_usd, tokens}'
+```
+
+**Alternative 1 — OpenAI SDK drop-in.** Point your OpenAI SDK at `http://localhost:8080/v1` with `x-openclaw-agent-id` in `default_headers`. See the "OpenAI SDK compatibility" section above for the full contract.
+
+**Alternative 2 — Legacy one-shot adapter.** For task-centric callers, `POST /v1/agents/:agentId/run { task }` is kept as a thin wrapper over `createSession` + `runEvent`:
+
+```bash
+curl -s -X POST "http://localhost:8080/v1/agents/${AGENT}/run" \
   -H 'Content-Type: application/json' \
   -d '{"task": "Summarize the agent platform landscape as of April 2026."}'
-# → {"session_id":"ses_xyz789","status":"running"}
+# → {"session_id":"ses_xyz789","agent_id":"agt_abc123","status":"running","started_at":...}
+```
 
-# Fetch the result
-curl http://localhost:8080/v1/sessions/ses_xyz789
-# → {"status":"completed","output":"...","cost_usd":0.12,"tokens":15420}
+Live SSE streaming for any of the above:
+
+```bash
+curl -N "http://localhost:8080/v1/sessions/${SESSION}/events?stream=true"
+# event: user.message
+# id: <piEventId>
+# data: {"event_id":"...","type":"user.message","content":"..."}
+# ...
 ```
 
 ## Status and roadmap
 
-This is **early development**. See `docs/architecture.md` for the technical design.
+This is **early development**, but the runtime is end-to-end functional and every feature below is validated against a real provider in the e2e suite. See `docs/architecture.md` for the technical design.
 
-**Phase 1 (MVP, current — shipping today):** Docker-based local runtime, provider-agnostic default (ships with Moonshot Kimi K2.5 but swaps cleanly to any OpenClaw provider), in-memory agent + session registries, host-volume session storage, self-documenting API root, end-to-end validated against real inference.
+**Shipped** (Items 1-9 on `main`):
 
-**Phase 2 (next):** ECS/Fargate container backend, S3 session storage, cloud secrets (AWS Secrets Manager), Postgres-backed agent/session registries, deployment guides, per-provider cost accounting.
+- **Session-centric data model.** Reusable `Agent` templates, long-lived `Session` (status `idle|running|failed`), `Event` as the interaction primitive (`user.message` / `agent.message` / `agent.error`).
+- **SQLite-backed persistent store** (`src/store/sqlite.ts`) — survives orchestrator restart; WAL journal + CHECK constraints; post-restart rehydration marks orphaned `running` sessions as `failed`.
+- **Per-session container lifecycle with idle pool** (`src/runtime/pool.ts`) — first event spawns (~15 s), subsequent turns reuse (~100 ms), `setInterval` sweeper reaps after `OPENCLAW_IDLE_TIMEOUT_MS` (default 10 min).
+- **Event log read from OpenClaw's JSONL** (`src/store/pi-jsonl.ts`) — the orchestrator does not write events; Pi's `SessionManager` is the sole writer. Single source of truth, zero sync bugs.
+- **Live event streaming** via `GET /v1/sessions/:id/events?stream=true` — catch-up + tail-follow, 15 s heartbeats.
+- **Control plane via the gateway's WebSocket** (`src/runtime/gateway-ws.ts`) — cancel uses `sessions.abort`, per-event `model` field uses `sessions.patch`. Queue-when-busy behavior drains automatically in order.
+- **OpenAI-compat adapter** via `POST /v1/chat/completions` — sticky sessions via `user` field / `x-openclaw-session-key`, keyless calls create ephemeral sessions, reaped alongside their container.
+- **Per-turn cost accounting** from Pi's provider catalogs — cache-aware, read from `msg.usage.cost.total` in the JSONL. No static price sheet in the orchestrator.
 
-**Phase 3 (later):** GCP Cloud Run, Azure Container Apps, Aliyun ECI, Volcengine VKE backends. Multi-tenant orchestrator with auth and quotas. Enterprise features (audit logs, policy enforcement, tenant isolation).
+**Next** (Items 10-11):
+
+- **Cloud container backends.** `ContainerRuntime` adapters for AWS ECS/Fargate, GCP Cloud Run, Azure Container Apps — drop-in, no orchestrator core changes.
+- **Cloud-native session storage.** S3 / GCS / Azure Blob / Aliyun OSS / Volcengine TOS behind the same host-mount contract.
+- **Cloud secrets integration.** `SecretRef`-style pulls from AWS Secrets Manager / GCP Secret Manager / Azure Key Vault, replacing env-var passthrough.
+- **Upstream contributions** to OpenClaw: `defineSingleProviderPluginEntry` auto-register fix (eliminates the `PROVIDER_BLOCK_JSON` hack for Category B providers), and an HTTP/SSE wrapper around the Pi event bus if the orchestrator grows real-time delta forwarding.
+
+**Later** (Items 12-14):
+
+- **Delegated subagents as a built-in `call_agent` tool.** Subagents are first-class `Session` rows in our store; any client can subscribe to a subagent's event stream via the same `/v1/sessions/<subagent_id>/events?stream=true` path. Zero observation blindness, full inspectability.
+- **Enterprise features.** Multi-tenant orchestrator with auth, quotas, and per-tenant isolation. Audit logs. Policy enforcement. BYO-KMS.
+
+**Out of scope** (deliberate, never becomes milestone work):
+
+- Proprietary toolset spec — agents use Pi's typed `ToolDefinition` directly.
+- Environment as a first-class API resource — the container IS the environment.
+- Session-hour billing primitive — cloud partners bill, we don't.
+- Closed SDKs or parallel skill registries — we use ClawHub and `pi-skills`.
+- Claude Code's description-based implicit delegation — subagents are invoked explicitly via `call_agent(target, task)`.
 
 ## License
 

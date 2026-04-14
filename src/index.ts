@@ -61,8 +61,9 @@ function collectPassthroughEnv(): Record<string, string> {
   // runtime is genuinely provider-agnostic: whichever provider the agent's
   // model.primary points at will pick up its credentials via its standard
   // env-var name. Extend via OPENCLAW_PASSTHROUGH_ENV (comma-separated) for
-  // custom providers or deploy-specific variables. Phase 2 replaces this with
-  // cloud secret managers.
+  // custom providers or deploy-specific variables. A future item replaces
+  // this with cloud secret managers (AWS Secrets Manager, GCP Secret Manager,
+  // Azure Key Vault, etc.) via an upstream OpenClaw SecretRef extension.
   const defaultKeys = [
     // Amazon Bedrock (AWS credential chain — works with AWS_PROFILE too)
     "AWS_REGION",
