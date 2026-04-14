@@ -1,7 +1,5 @@
 import type { ContainerRuntime, Mount } from "../runtime/container.js";
-import type { AgentRegistry } from "./agents.js";
-import type { EventStore } from "./events.js";
-import type { SessionRegistry } from "./sessions.js";
+import type { AgentStore, EventStore, SessionStore } from "../store/types.js";
 import type { AgentConfig, Event, Session } from "./types.js";
 
 export type RouterConfig = {
@@ -23,8 +21,8 @@ export type RouterConfig = {
 
 export class AgentRouter {
   constructor(
-    private readonly agents: AgentRegistry,
-    private readonly sessions: SessionRegistry,
+    private readonly agents: AgentStore,
+    private readonly sessions: SessionStore,
     private readonly events: EventStore,
     private readonly runtime: ContainerRuntime,
     private readonly cfg: RouterConfig,

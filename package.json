@@ -24,6 +24,7 @@
     "docker:build": "pnpm docker:build-runtime && pnpm docker:build-orchestrator"
   },
   "dependencies": {
+    "better-sqlite3": "^11.3.0",
     "dockerode": "^4.0.2",
     "hono": "^4.6.0",
     "@hono/node-server": "^1.13.0",
@@ -31,10 +32,16 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
     "@types/dockerode": "^3.3.0",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
   }
 }

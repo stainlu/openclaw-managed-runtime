@@ -1,12 +1,10 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AgentRegistry } from "./orchestrator/agents.js";
-import { EventStore } from "./orchestrator/events.js";
 import { AgentRouter, type RouterConfig } from "./orchestrator/router.js";
 import { startServer } from "./orchestrator/server.js";
-import { SessionRegistry } from "./orchestrator/sessions.js";
 import { DockerContainerRuntime } from "./runtime/docker.js";
+import { buildStore, type StoreBackend } from "./store/index.js";
 
 function readPackageVersion(): string {
   // Resolve package.json relative to the compiled module location, so it works
@@ -110,9 +108,24 @@ async function main(): Promise<void> {
   const runtime = new DockerContainerRuntime({ network });
   await runtime.ensureNetwork();
 
-  const agents = new AgentRegistry();
-  const sessions = new SessionRegistry();
-  const events = new EventStore();
+  const storeBackendRaw = env("OPENCLAW_STORE", "sqlite");
+  if (storeBackendRaw !== "memory" && storeBackendRaw !== "sqlite") {
+    throw new Error(
+      `invalid OPENCLAW_STORE=${storeBackendRaw}, expected "memory" or "sqlite"`,
+    );
+  }
+  const storeBackend: StoreBackend = storeBackendRaw;
+  const storePath =
+    storeBackend === "sqlite"
+      ? env("OPENCLAW_STORE_PATH", "/var/openclaw/state/managed-runtime.db")
+      : undefined;
+  const store = buildStore({ backend: storeBackend, path: storePath });
+
+  // Post-restart rehydration: any session still marked "running" after a
+  // restart was, by definition, orphaned — its container was torn down or
+  // is no longer tracked by this process. Flip them to "failed" so the
+  // client sees a terminal state instead of a stuck session.
+  const orphaned = store.sessions.failRunningSessions("orchestrator restarted mid-run");
 
   const passthroughEnv = collectPassthroughEnv();
   const passthroughEnvKeys = Object.keys(passthroughEnv).sort();
@@ -127,12 +140,26 @@ async function main(): Promise<void> {
     runTimeoutMs,
   };
 
-  const router = new AgentRouter(agents, sessions, events, runtime, routerCfg);
+  const router = new AgentRouter(
+    store.agents,
+    store.sessions,
+    store.events,
+    runtime,
+    routerCfg,
+  );
 
   console.log(`[orchestrator] OpenClaw Managed Runtime v${version} starting`);
   console.log(`[orchestrator] runtime image: ${runtimeImage}`);
   console.log(`[orchestrator] docker network: ${network}`);
   console.log(`[orchestrator] host state root: ${hostStateRoot}`);
+  console.log(
+    `[orchestrator] store: ${storeBackend}${storePath ? ` (${storePath})` : ""}`,
+  );
+  if (orphaned > 0) {
+    console.log(
+      `[orchestrator] rehydration: marked ${orphaned} running session(s) as failed after restart`,
+    );
+  }
   console.log(
     `[orchestrator] forwarding provider env vars (${passthroughEnvKeys.length}): ${
       passthroughEnvKeys.length > 0 ? passthroughEnvKeys.join(", ") : "(none detected)"
@@ -146,7 +173,29 @@ async function main(): Promise<void> {
     );
   }
 
-  await startServer({ agents, sessions, events, router, runtime, version }, { port });
+  await startServer(
+    {
+      agents: store.agents,
+      sessions: store.sessions,
+      events: store.events,
+      router,
+      runtime,
+      version,
+    },
+    { port },
+  );
+
+  // Graceful shutdown: close the store on termination so WAL checkpoints
+  // flush cleanly. HTTP-server shutdown is not yet wired (Hono's node-server
+  // exposes `close()` but this codebase holds no reference to it yet); that
+  // is a follow-up in Item 4 alongside per-session container lifecycle.
+  const shutdown = (signal: string): void => {
+    console.log(`[orchestrator] received ${signal}, closing store`);
+    store.close();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 main().catch((err) => {

@@ -1,10 +1,8 @@
 import { serve } from "@hono/node-server";
 import { type Context, Hono } from "hono";
 import type { ContainerRuntime } from "../runtime/container.js";
-import { AgentRegistry } from "./agents.js";
-import { EventStore } from "./events.js";
+import type { AgentStore, EventStore, SessionStore } from "../store/types.js";
 import { AgentRouter, RouterError } from "./router.js";
-import { SessionRegistry } from "./sessions.js";
 import {
   CreateAgentRequestSchema,
   CreateSessionRequestSchema,
@@ -16,8 +14,8 @@ import {
 } from "./types.js";
 
 export type ServerDeps = {
-  agents: AgentRegistry;
-  sessions: SessionRegistry;
+  agents: AgentStore;
+  sessions: SessionStore;
   events: EventStore;
   router: AgentRouter;
   runtime: ContainerRuntime;

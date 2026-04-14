@@ -34,6 +34,10 @@ services:
       OPENCLAW_GATEWAY_PORT: "18789"
       OPENCLAW_READY_TIMEOUT_MS: "120000"
       OPENCLAW_RUN_TIMEOUT_MS: "600000"
+      # Persistent metadata store. SQLite is the default; override with
+      # OPENCLAW_STORE=memory to run without persistence (tests only).
+      OPENCLAW_STORE: ${OPENCLAW_STORE:-sqlite}
+      OPENCLAW_STORE_PATH: /var/openclaw/state/managed-runtime.db
       # AWS credential chain (Bedrock)
       AWS_REGION: ${AWS_REGION:-}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
@@ -62,6 +66,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data/sessions:/var/openclaw/sessions
+      # Orchestrator metadata store (SQLite file). Survives orchestrator
+      # restart so sessions, agents, and events persist. Delete the host
+      # directory to reset the runtime's memory.
+      - ./data/state:/var/openclaw/state
     networks:
       - openclaw-net
     depends_on:

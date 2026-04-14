@@ -150,6 +150,88 @@ else
   exit 1
 fi
 
+# ---- Persistence: orchestrator restart must not lose the session -----------
+# The whole point of Item 3 is that the SQLite-backed store survives a
+# process restart. Verify: restart the orchestrator, re-read the session
+# and its events, then post a third turn and confirm the agent still
+# remembers dragonfruit.
+
+wait_for_healthz() {
+  local elapsed=0
+  while [[ ${elapsed} -lt 60 ]]; do
+    if curl --silent --fail "${BASE_URL}/healthz" >/dev/null 2>&1; then
+      echo "[e2e] orchestrator healthy again (t=${elapsed}s)"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "[e2e] orchestrator did not come back after restart within 60s"
+  return 1
+}
+
+echo "[e2e] restarting orchestrator to verify persistence"
+(
+  cd "$(dirname "${BASH_SOURCE[0]}")/.." && \
+  docker compose restart orchestrator
+) >/dev/null
+wait_for_healthz || exit 1
+
+echo "[e2e] post-restart: GET /v1/sessions/${SESSION_ID}"
+RESTORED_SESSION=$(curl --silent --fail "${BASE_URL}/v1/sessions/${SESSION_ID}")
+RESTORED_STATUS=$(echo "${RESTORED_SESSION}" | jq -r '.status')
+RESTORED_OUTPUT=$(echo "${RESTORED_SESSION}" | jq -r '.output')
+RESTORED_AGENT_ID=$(echo "${RESTORED_SESSION}" | jq -r '.agent_id')
+if [[ "${RESTORED_STATUS}" != "idle" ]]; then
+  echo "[e2e] FAIL: session status after restart = ${RESTORED_STATUS}, expected idle"
+  echo "${RESTORED_SESSION}" | jq .
+  exit 1
+fi
+if [[ "${RESTORED_AGENT_ID}" != "${AGENT_ID}" ]]; then
+  echo "[e2e] FAIL: restored session agent_id = ${RESTORED_AGENT_ID}, expected ${AGENT_ID}"
+  exit 1
+fi
+if ! echo "${RESTORED_OUTPUT}" | grep -qi "dragonfruit"; then
+  echo "[e2e] FAIL: restored session.output lost dragonfruit"
+  echo "  output was: ${RESTORED_OUTPUT}"
+  exit 1
+fi
+echo "[e2e] post-restart session OK (status=${RESTORED_STATUS}, output contains dragonfruit)"
+
+echo "[e2e] post-restart: GET /v1/sessions/${SESSION_ID}/events"
+RESTORED_EVENTS=$(curl --silent --fail "${BASE_URL}/v1/sessions/${SESSION_ID}/events")
+RESTORED_EVENT_COUNT=$(echo "${RESTORED_EVENTS}" | jq -r '.count')
+if [[ "${RESTORED_EVENT_COUNT}" != "4" ]]; then
+  echo "[e2e] FAIL: expected 4 events post-restart (2 user + 2 agent.message), got ${RESTORED_EVENT_COUNT}"
+  echo "${RESTORED_EVENTS}" | jq '.events | map({type, content: (.content | .[0:60])})'
+  exit 1
+fi
+echo "[e2e] post-restart events OK (count=${RESTORED_EVENT_COUNT})"
+
+echo "[e2e] post-restart: GET /v1/agents/${AGENT_ID}"
+RESTORED_AGENT=$(curl --silent --fail "${BASE_URL}/v1/agents/${AGENT_ID}")
+if [[ "$(echo "${RESTORED_AGENT}" | jq -r '.agent_id')" != "${AGENT_ID}" ]]; then
+  echo "[e2e] FAIL: agent template lost across restart"
+  exit 1
+fi
+echo "[e2e] post-restart agent template OK"
+
+echo "[e2e] turn 3 (post-restart): posting user.message (recall dragonfruit again)"
+TURN3_EVENT=$(post_event "${SESSION_ID}" \
+  "Remind me one more time — what is my favorite fruit? Single word only.")
+TURN3_EVENT_ID=$(echo "${TURN3_EVENT}" | jq -r '.event_id')
+echo "[e2e] turn 3 user event: ${TURN3_EVENT_ID}"
+poll_session "${SESSION_ID}" "turn3" >/dev/null || exit 1
+TURN3_OUTPUT=$(latest_agent_message "${SESSION_ID}")
+echo "[e2e] turn 3 output: ${TURN3_OUTPUT}"
+if echo "${TURN3_OUTPUT}" | grep -qi "dragonfruit"; then
+  echo "[e2e] SUCCESS: post-restart turn 3 still recalls dragonfruit"
+else
+  echo "[e2e] FAIL: post-restart turn 3 lost dragonfruit"
+  echo "  turn 3 output: ${TURN3_OUTPUT}"
+  exit 1
+fi
+
 # ---- Backwards-compat: one-shot smoke of the /run adapter -------------------
 # Proves that the thin wrapper on top of createSession + runEvent still
 # returns an OpenAI-style { session_id, status: "running" } for legacy callers.
