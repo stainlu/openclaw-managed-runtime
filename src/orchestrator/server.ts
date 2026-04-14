@@ -76,7 +76,7 @@ function handleRouterError(err: unknown, c: Context): Response {
     if (err.code === "agent_not_found" || err.code === "session_not_found") {
       return c.json({ error: err.code, message: err.message }, 404);
     }
-    if (err.code === "session_busy") {
+    if (err.code === "session_busy" || err.code === "session_not_running") {
       return c.json({ error: err.code, message: err.message }, 409);
     }
     return c.json({ error: err.code, message: err.message }, 500);
@@ -112,6 +112,7 @@ export function buildApp(deps: ServerDeps): Hono {
           post_event: "POST /v1/sessions/:sessionId/events",
           list_events: "GET /v1/sessions/:sessionId/events",
           stream_events: "GET /v1/sessions/:sessionId/events?stream=true",
+          cancel: "POST /v1/sessions/:sessionId/cancel",
         },
         health: {
           liveness: "GET /healthz",
@@ -210,17 +211,33 @@ export function buildApp(deps: ServerDeps): Hono {
       return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
     }
     try {
-      const session = deps.router.runEvent({
+      const result = await deps.router.runEvent({
         sessionId,
         content: parsed.data.content,
+        model: parsed.data.model,
       });
       // The event id is Pi's — we don't know it until the JSONL is written.
       // Clients that need to correlate this response with the persisted
       // event should poll GET /v1/sessions/:sessionId/events once the
       // session flips back to idle.
       return c.json({
+        session_id: result.session.sessionId,
+        session_status: result.session.status,
+        queued: result.queued,
+      });
+    } catch (err) {
+      return handleRouterError(err, c);
+    }
+  });
+
+  app.post("/v1/sessions/:sessionId/cancel", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    try {
+      const session = await deps.router.cancel(sessionId);
+      return c.json({
         session_id: session.sessionId,
         session_status: session.status,
+        cancelled: true,
       });
     } catch (err) {
       return handleRouterError(err, c);
@@ -315,15 +332,15 @@ export function buildApp(deps: ServerDeps): Hono {
       } else {
         session = deps.router.createSession(agentId);
       }
-      const running = deps.router.runEvent({
+      const result = await deps.router.runEvent({
         sessionId: session.sessionId,
         content: parsed.data.task,
       });
       return c.json({
         session_id: session.sessionId,
         agent_id: agentId,
-        status: running.status,
-        started_at: running.lastEventAt ?? running.createdAt,
+        status: result.session.status,
+        started_at: result.session.lastEventAt ?? result.session.createdAt,
       });
     } catch (err) {
       return handleRouterError(err, c);

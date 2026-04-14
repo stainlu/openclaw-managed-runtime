@@ -320,6 +320,106 @@ fi
 echo "[e2e] SSE smoke OK: both user.message and agent.message streamed live"
 rm -f "${STREAM_OUT}"
 
+# ---- Control: cancel --------------------------------------------------------
+# Proves POST /v1/sessions/:id/cancel aborts an in-flight run via the
+# gateway WS control plane and returns the session to idle without
+# recording an error. Uses a fresh session so the assertions don't have
+# to share state with the main dragonfruit session.
+
+echo "[e2e] control test: creating dedicated session for cancel"
+CANCEL_SESSION=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"agentId\": \"${AGENT_ID}\"}" | jq -r '.session_id')
+echo "[e2e] cancel session: ${CANCEL_SESSION}"
+
+echo "[e2e] cancel: warming the session so the WS client is ready"
+post_event "${CANCEL_SESSION}" "Reply with exactly the single word: warmed" >/dev/null
+poll_session "${CANCEL_SESSION}" "cancel-warmup" >/dev/null || exit 1
+
+echo "[e2e] cancel: posting a long-running prompt"
+post_event "${CANCEL_SESSION}" \
+  "Please write a thorough multi-paragraph essay about the history of marine biology, covering at least five different sub-topics in detail." >/dev/null
+sleep 2
+
+echo "[e2e] cancel: issuing POST /cancel"
+CANCEL_RESPONSE=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions/${CANCEL_SESSION}/cancel")
+echo "[e2e] cancel response: ${CANCEL_RESPONSE}"
+CANCEL_OK=$(echo "${CANCEL_RESPONSE}" | jq -r '.cancelled')
+CANCEL_STATUS=$(echo "${CANCEL_RESPONSE}" | jq -r '.session_status')
+if [[ "${CANCEL_OK}" != "true" ]]; then
+  echo "[e2e] FAIL: cancel did not return cancelled:true"
+  exit 1
+fi
+if [[ "${CANCEL_STATUS}" != "idle" ]]; then
+  echo "[e2e] FAIL: cancel did not flip session to idle (got ${CANCEL_STATUS})"
+  exit 1
+fi
+echo "[e2e] cancel test PASSED"
+
+# ---- Control: queue when busy -----------------------------------------------
+# Proves that POSTing a second event while the session is running queues
+# the new event instead of returning 409. The session should stay running
+# until both queued runs complete; both replies should land in order in
+# the JSONL event log.
+
+echo "[e2e] control test: creating dedicated session for queue"
+QUEUE_SESSION=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"agentId\": \"${AGENT_ID}\"}" | jq -r '.session_id')
+echo "[e2e] queue session: ${QUEUE_SESSION}"
+
+echo "[e2e] queue: posting event A"
+EVENT_A=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions/${QUEUE_SESSION}/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"user.message","content":"Reply with exactly one word: alpha"}')
+A_QUEUED=$(echo "${EVENT_A}" | jq -r '.queued')
+if [[ "${A_QUEUED}" != "false" ]]; then
+  echo "[e2e] FAIL: event A unexpectedly queued (queued=${A_QUEUED})"
+  echo "${EVENT_A}" | jq .
+  exit 1
+fi
+
+echo "[e2e] queue: posting event B (should queue)"
+EVENT_B=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions/${QUEUE_SESSION}/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"user.message","content":"Reply with exactly one word: bravo"}')
+B_QUEUED=$(echo "${EVENT_B}" | jq -r '.queued')
+if [[ "${B_QUEUED}" != "true" ]]; then
+  echo "[e2e] FAIL: event B should have been queued (queued=${B_QUEUED})"
+  echo "${EVENT_B}" | jq .
+  exit 1
+fi
+echo "[e2e] queue: B was queued as expected"
+
+echo "[e2e] queue: waiting for both runs to drain"
+poll_session "${QUEUE_SESSION}" "queue-drain" >/dev/null || exit 1
+
+QUEUE_EVENTS=$(curl --silent --fail "${BASE_URL}/v1/sessions/${QUEUE_SESSION}/events")
+QUEUE_USER_COUNT=$(echo "${QUEUE_EVENTS}" | jq -r '[.events[] | select(.type=="user.message")] | length')
+QUEUE_AGENT_COUNT=$(echo "${QUEUE_EVENTS}" | jq -r '[.events[] | select(.type=="agent.message")] | length')
+echo "[e2e] queue results: ${QUEUE_USER_COUNT} user.message, ${QUEUE_AGENT_COUNT} agent.message"
+if [[ "${QUEUE_USER_COUNT}" -lt 2 || "${QUEUE_AGENT_COUNT}" -lt 2 ]]; then
+  echo "[e2e] FAIL: expected at least 2 user + 2 agent messages after queue drain"
+  echo "${QUEUE_EVENTS}" | jq '.events | map({type, content: (.content | .[0:40])})'
+  exit 1
+fi
+QUEUE_FIRST_AGENT=$(echo "${QUEUE_EVENTS}" | jq -r '[.events[] | select(.type=="agent.message")] | .[0].content // ""')
+QUEUE_SECOND_AGENT=$(echo "${QUEUE_EVENTS}" | jq -r '[.events[] | select(.type=="agent.message")] | .[1].content // ""')
+if ! echo "${QUEUE_FIRST_AGENT}" | grep -qi "alpha"; then
+  echo "[e2e] FAIL: first queued reply should mention alpha (got: ${QUEUE_FIRST_AGENT})"
+  exit 1
+fi
+if ! echo "${QUEUE_SECOND_AGENT}" | grep -qi "bravo"; then
+  echo "[e2e] FAIL: second queued reply should mention bravo (got: ${QUEUE_SECOND_AGENT})"
+  exit 1
+fi
+echo "[e2e] queue test PASSED (alpha then bravo, in order)"
+
 # ---- Backwards-compat: one-shot smoke of the /run adapter -------------------
 # Proves that the thin wrapper on top of createSession + runEvent still
 # returns an OpenAI-style { session_id, status: "running" } for legacy callers.

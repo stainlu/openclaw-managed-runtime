@@ -77,9 +77,21 @@ export type Event = {
 // Clients can only post user events. Agent events are emitted by the runtime.
 // The type field is optional with a default so trivial clients can send just
 // `{ content }` and still get the correct tagging.
+//
+// Item 7 added the optional `model` field. `interrupt: true` (Pi steer) is
+// intentionally NOT exposed yet — see the docstring on AgentRouter.runEvent
+// for the design constraint that pushed it to a follow-up. Cancel + queue
+// + model are sufficient for the first cut of control endpoints.
 export const PostEventRequestSchema = z.object({
   type: z.literal("user.message").default("user.message"),
   content: z.string().min(1, "content is required"),
+  /**
+   * Optional model override applied via WS sessions.patch before this
+   * event is processed. Pi's setModel is session-scoped, so the new
+   * model persists for this and subsequent events on this session
+   * until changed again.
+   */
+  model: z.string().min(1).optional(),
 });
 
 export type PostEventRequest = z.infer<typeof PostEventRequestSchema>;

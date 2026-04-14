@@ -166,6 +166,8 @@ class SqliteSessionStore implements SessionStore {
   private readonly beginRunStmt: Database.Statement;
   private readonly endSuccessStmt: Database.Statement;
   private readonly endFailureStmt: Database.Statement;
+  private readonly endCancelledStmt: Database.Statement;
+  private readonly addUsageStmt: Database.Statement;
   private readonly failRunningStmt: Database.Statement;
 
   constructor(private readonly db: Database.Database) {
@@ -197,6 +199,19 @@ class SqliteSessionStore implements SessionStore {
     this.endFailureStmt = db.prepare(
       `UPDATE sessions
        SET status = 'failed', error = @error, last_event_at = @now
+       WHERE session_id = @session_id`,
+    );
+    this.endCancelledStmt = db.prepare(
+      `UPDATE sessions
+       SET status = 'idle', error = NULL, last_event_at = @now
+       WHERE session_id = @session_id`,
+    );
+    this.addUsageStmt = db.prepare(
+      `UPDATE sessions
+       SET tokens_in = tokens_in + @ti,
+           tokens_out = tokens_out + @to,
+           cost_usd = cost_usd + @cost,
+           last_event_at = @now
        WHERE session_id = @session_id`,
     );
     this.failRunningStmt = db.prepare(
@@ -264,6 +279,27 @@ class SqliteSessionStore implements SessionStore {
     const info = this.endFailureStmt.run({
       session_id: sessionId,
       error,
+      now: Date.now(),
+    });
+    if (info.changes === 0) return undefined;
+    return this.get(sessionId);
+  }
+
+  endRunCancelled(sessionId: string): Session | undefined {
+    const info = this.endCancelledStmt.run({
+      session_id: sessionId,
+      now: Date.now(),
+    });
+    if (info.changes === 0) return undefined;
+    return this.get(sessionId);
+  }
+
+  addUsage(sessionId: string, usage: RunUsage): Session | undefined {
+    const info = this.addUsageStmt.run({
+      session_id: sessionId,
+      ti: usage.tokensIn,
+      to: usage.tokensOut,
+      cost: usage.costUsd,
       now: Date.now(),
     });
     if (info.changes === 0) return undefined;

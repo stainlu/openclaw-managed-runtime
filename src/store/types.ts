@@ -36,6 +36,22 @@ export interface SessionStore {
   endRunSuccess(sessionId: string, usage: RunUsage): Session | undefined;
   endRunFailure(sessionId: string, error: string): Session | undefined;
   /**
+   * Reset a running session back to "idle" without recording an error.
+   * Intended for cancellation: the operator stopped the run, but it's not
+   * a failure of the agent — clients should see a clean idle ready for
+   * the next event.
+   */
+  endRunCancelled(sessionId: string): Session | undefined;
+  /**
+   * Add usage metrics to the rollups WITHOUT changing status or error.
+   * Used by the queue-drain path: when one run completes and a queued run
+   * is about to start, we don't want to flip status to idle (which would
+   * create a brief window where polling clients could see "done" between
+   * two queued runs). addUsage rolls the metrics up and leaves status
+   * untouched so the caller can call beginRun for the next iteration.
+   */
+  addUsage(sessionId: string, usage: RunUsage): Session | undefined;
+  /**
    * Transition every session currently in "running" state to "failed" with
    * the given error. Intended for post-restart rehydration: any run that was
    * mid-flight when the orchestrator died is by definition orphaned (its

@@ -102,6 +102,25 @@ class InMemorySessionStore implements SessionStore {
     return s;
   }
 
+  endRunCancelled(sessionId: string): Session | undefined {
+    const s = this.sessions.get(sessionId);
+    if (!s) return undefined;
+    s.status = "idle";
+    s.error = null;
+    s.lastEventAt = Date.now();
+    return s;
+  }
+
+  addUsage(sessionId: string, usage: RunUsage): Session | undefined {
+    const s = this.sessions.get(sessionId);
+    if (!s) return undefined;
+    s.tokensIn += usage.tokensIn;
+    s.tokensOut += usage.tokensOut;
+    s.costUsd += usage.costUsd;
+    s.lastEventAt = Date.now();
+    return s;
+  }
+
   failRunningSessions(reason: string): number {
     let count = 0;
     for (const s of this.sessions.values()) {

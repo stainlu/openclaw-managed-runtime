@@ -136,7 +136,7 @@ esac
 
 # Assemble the full config with jq to avoid any string-escaping footguns.
 #
-# Three things matter beyond the obvious:
+# Things that matter beyond the obvious:
 #
 #   1. The provider plugin entry is keyed dynamically off OPENCLAW_PLUGIN so
 #      the runtime image stays provider-agnostic. Every OpenClaw provider
@@ -149,6 +149,13 @@ esac
 #   3. `models.providers.<plugin-id>: {...}` is required for providers that
 #      do not auto-register their catalog. Populated above via
 #      PROVIDER_BLOCK_JSON.
+#
+#   4. `gateway.controlUi.dangerouslyDisableDeviceAuth: true` lets the
+#      orchestrator's WebSocket client (Item 7) connect as
+#      client.id="openclaw-control-ui" with token auth only, skipping the
+#      Ed25519 device-signing handshake. Safe here because the gateway is
+#      bound to the openclaw-net Docker bridge and the only client that
+#      ever reaches it is the orchestrator we control.
 jq -n \
   --arg agent_id       "${OPENCLAW_AGENT_ID}" \
   --arg model          "${OPENCLAW_MODEL}" \
@@ -167,6 +174,9 @@ jq -n \
       endpoints: {
         chatCompletions: { enabled: true }
       }
+    },
+    controlUi: {
+      dangerouslyDisableDeviceAuth: true
     }
   },
   agents: {

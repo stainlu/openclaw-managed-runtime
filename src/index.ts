@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SessionEventQueue } from "./orchestrator/event-queue.js";
 import { AgentRouter, type RouterConfig } from "./orchestrator/router.js";
 import { startServer } from "./orchestrator/server.js";
 import { DockerContainerRuntime } from "./runtime/docker.js";
@@ -173,7 +174,15 @@ async function main(): Promise<void> {
     runTimeoutMs,
   };
 
-  const router = new AgentRouter(store.agents, store.sessions, pool, routerCfg);
+  const eventQueue = new SessionEventQueue();
+
+  const router = new AgentRouter(
+    store.agents,
+    store.sessions,
+    pool,
+    eventQueue,
+    routerCfg,
+  );
 
   console.log(`[orchestrator] OpenClaw Managed Runtime v${version} starting`);
   console.log(`[orchestrator] runtime image: ${runtimeImage}`);

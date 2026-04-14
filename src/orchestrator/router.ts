@@ -1,6 +1,8 @@
 import type { Container, Mount, SpawnOptions } from "../runtime/container.js";
+import { GatewayWsError } from "../runtime/gateway-ws.js";
 import type { SessionContainerPool } from "../runtime/pool.js";
-import type { AgentStore, SessionStore } from "../store/types.js";
+import type { AgentStore, RunUsage, SessionStore } from "../store/types.js";
+import type { SessionEventQueue } from "./event-queue.js";
 import type { AgentConfig, Session } from "./types.js";
 
 export type RouterConfig = {
@@ -18,18 +20,37 @@ export type RouterConfig = {
   runTimeoutMs: number;
 };
 
+export type RunEventArgs = {
+  sessionId: string;
+  content: string;
+  /**
+   * Optional model override to apply to the session before this event.
+   * Maps to a WS sessions.patch({ model }) call. Pi's setModel is
+   * session-scoped, so the new model persists for this and subsequent
+   * runs until changed again.
+   */
+  model?: string;
+};
+
+export type RunEventResult = {
+  session: Session;
+  /** True when the event was queued instead of triggering a run immediately. */
+  queued: boolean;
+};
+
 export class AgentRouter {
   constructor(
     private readonly agents: AgentStore,
     private readonly sessions: SessionStore,
     private readonly pool: SessionContainerPool,
+    private readonly queue: SessionEventQueue,
     private readonly cfg: RouterConfig,
   ) {}
 
   /**
    * Create a session bound to an agent. Pure metadata: no container spawn,
-   * no JSONL allocation, no remote calls. The container is only spawned when
-   * the first event is posted to this session via runEvent().
+   * no JSONL allocation, no remote calls. The container is only spawned
+   * when the first event is posted to this session via runEvent().
    */
   createSession(agentId: string): Session {
     const agent = this.agents.get(agentId);
@@ -40,32 +61,38 @@ export class AgentRouter {
   }
 
   /**
-   * Post a user.message to an existing session. Transitions the session to
-   * "running" and schedules a background run that spawns (or reuses) a
-   * container, proxies the task to the container's chat completions
-   * endpoint, and rolls usage up onto the session on completion.
+   * Post a user.message to an existing session. Behavior depends on
+   * session status:
    *
-   * The user message and the agent's reply are written to disk by OpenClaw's
-   * own SessionManager — the orchestrator does NOT keep a parallel event
-   * log. Clients read the event history from GET /v1/sessions/:id/events,
-   * which is served by PiJsonlEventReader.
+   *   - Session idle:
+   *       Marked running and the run is scheduled in the background. If
+   *       `model` is set, the orchestrator first patches the session's
+   *       model via the gateway WS so the run uses the new model.
    *
-   * Returns the updated Session (status=running). The HTTP caller hands it
-   * back to the client immediately; the client polls until the session
-   * flips back to idle or failed. SSE streaming is Item 6.
+   *   - Session running:
+   *       The event is enqueued onto the session's local queue. The
+   *       background task that's currently running will pop the queue on
+   *       completion and start the next iteration. The session stays in
+   *       "running" state across the full chain.
+   *
+   * Returns the session (status=running in both branches) plus a `queued`
+   * flag so the HTTP handler can report whether the event was queued.
+   *
+   * Note: Pi's "steer" semantics (interrupt the current run with a new
+   * message) are not in Item 7. Cleanly implementing it requires either
+   * a WS event subscription so the orchestrator knows when the post-steer
+   * run finishes, or per-session task tracking so the cancel-then-post
+   * sequence doesn't race the in-flight HTTP request. Both are tracked
+   * for a follow-up; for now clients that need to redirect a running
+   * session can call cancel + post a new event, accepting the small
+   * latency hit of two HTTP round trips.
    */
-  runEvent(args: { sessionId: string; content: string }): Session {
+  async runEvent(args: RunEventArgs): Promise<RunEventResult> {
     const session = this.sessions.get(args.sessionId);
     if (!session) {
       throw new RouterError(
         "session_not_found",
         `session ${args.sessionId} does not exist`,
-      );
-    }
-    if (session.status === "running") {
-      throw new RouterError(
-        "session_busy",
-        `session ${args.sessionId} is already processing an event`,
       );
     }
     const agent = this.agents.get(session.agentId);
@@ -79,23 +106,68 @@ export class AgentRouter {
       );
     }
 
-    // Mark the session running before spawning the background task. This
-    // closes the window where a racing read could observe "idle" while a run
-    // is about to begin.
+    if (session.status === "running") {
+      // Queue path: the current background task will pop this on completion.
+      this.queue.enqueue(args.sessionId, {
+        content: args.content,
+        model: args.model,
+        enqueuedAt: Date.now(),
+      });
+      return { session, queued: true };
+    }
+
+    // Idle path: start a new run.
     const runningSession = this.sessions.beginRun(args.sessionId) ?? session;
 
-    this.executeInBackground(args.sessionId, agent, args.content).catch((err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.sessions.endRunFailure(args.sessionId, msg);
-    });
+    void this.executeInBackground(args.sessionId, agent, args.content, args.model)
+      .catch((err) => this.handleBackgroundFailure(args.sessionId, err));
 
-    return runningSession;
+    return { session: runningSession, queued: false };
+  }
+
+  /**
+   * Cancel a running session. Aborts the in-flight run via the gateway WS
+   * control plane and clears any queued events for the session. Sets the
+   * session back to idle (no error recorded — cancellation is a deliberate
+   * stop, not an agent failure). Returns the updated Session.
+   */
+  async cancel(sessionId: string): Promise<Session> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new RouterError(
+        "session_not_found",
+        `session ${sessionId} does not exist`,
+      );
+    }
+    if (session.status !== "running") {
+      throw new RouterError(
+        "session_not_running",
+        `session ${sessionId} is not currently running`,
+      );
+    }
+    const wsClient = this.pool.getWsClient(sessionId);
+    if (!wsClient) {
+      throw new RouterError(
+        "no_active_container",
+        `session ${sessionId} is running but has no live container`,
+      );
+    }
+    const canonicalKey = `agent:main:${sessionId}`;
+    try {
+      await wsClient.abort(canonicalKey);
+    } catch (err) {
+      throw wrapWsError(err, "cancel_failed");
+    }
+    // Drain queued events so the auto-drain on success doesn't auto-restart.
+    this.queue.clear(sessionId);
+    return this.sessions.endRunCancelled(sessionId) ?? session;
   }
 
   private async executeInBackground(
     sessionId: string,
     agent: AgentConfig,
     content: string,
+    modelOverride?: string,
   ): Promise<void> {
     // Per-orchestrator-agent mount. Gives every orchestrator agent its own
     // isolated OpenClaw workspace (sessions.json, per-session JSONLs, skills
@@ -140,54 +212,108 @@ export class AgentRouter {
       },
     };
 
-    // Pool-backed: the first event for a session spawns a fresh container
-    // and waits for /readyz; subsequent events reuse the live container.
-    // The pool's sweeper tears down idle containers. NO finally { stop } —
-    // teardown is the pool's responsibility, not the router's.
+    // Pool-backed: the first event for a session spawns a fresh container,
+    // waits for /readyz, and runs the WS handshake; subsequent events
+    // reuse the live container and live WS client. NO finally { stop } —
+    // teardown is the pool's responsibility.
     let container: Container;
     try {
       container = await this.pool.acquireForSession({ sessionId, spawnOptions });
     } catch (err) {
-      // Acquire failed: spawn timed out, readyz never returned, or the
-      // runtime rejected the spawn. The pool already cleaned its own state
-      // for this session (acquireForSession never records a container that
-      // didn't reach ready). Propagate so the outer catch writes
-      // agent.error.
       throw err;
     }
 
-    try {
-      const completion = await this.invokeChatCompletions({
-        baseUrl: container.baseUrl,
-        token: container.token,
-        content,
-        sessionKey: sessionId,
-      });
-
-      // No explicit event appends here. OpenClaw's SessionManager has
-      // already written user.message and agent.message to the JSONL on
-      // disk as a side effect of the chat completions call. Our only job
-      // is to update the session metadata (status + usage rollup) so
-      // clients see a consistent status change.
-      this.sessions.endRunSuccess(sessionId, {
-        tokensIn: completion.tokensIn,
-        tokensOut: completion.tokensOut,
-        costUsd: completion.costUsd,
-      });
-    } catch (err) {
-      // Invocation failed: the container's HTTP endpoint either returned
-      // non-2xx, the fetch timed out against its runTimeoutMs, or something
-      // else blew up mid-run. Assume the container is suspect and evict it
-      // so the next event for this session respawns a fresh one. Note that
-      // Moonshot-flakiness surfaces as HTTP 200 with the error message in
-      // the content field — those reach the success branch above and do
-      // NOT evict, which is the right call (the container is fine; only
-      // the upstream model is flaky).
-      await this.pool.evictSession(sessionId).catch(() => {
-        /* best-effort eviction */
-      });
-      throw err;
+    // Per-event model override. Apply via WS patch BEFORE the chat
+    // completions call. The WS handshake completed during acquire so a
+    // client must be present here; if it's missing, treat as an
+    // infrastructure failure and evict.
+    if (modelOverride) {
+      const wsClient = this.pool.getWsClient(sessionId);
+      if (!wsClient) {
+        await this.pool.evictSession(sessionId).catch(() => {
+          /* best-effort */
+        });
+        throw new RouterError(
+          "no_active_container",
+          `session ${sessionId} has no WS client for model patch`,
+        );
+      }
+      const canonicalKey = `agent:main:${sessionId}`;
+      try {
+        await wsClient.patch(canonicalKey, { model: modelOverride });
+      } catch (err) {
+        await this.pool.evictSession(sessionId).catch(() => {
+          /* best-effort */
+        });
+        throw wrapWsError(err, "patch_failed");
+      }
     }
+
+    // Run the completion. On failure, do NOT evict here — the failure
+    // handler decides whether to evict based on whether the session was
+    // also cancelled in flight.
+    const completion = await this.invokeChatCompletions({
+      baseUrl: container.baseUrl,
+      token: container.token,
+      content,
+      sessionKey: sessionId,
+    });
+    const usage: RunUsage = {
+      tokensIn: completion.tokensIn,
+      tokensOut: completion.tokensOut,
+      costUsd: completion.costUsd,
+    };
+
+    // Drain the queue, if any. When the queue has more, roll up usage
+    // without flipping to idle and recursively process the next entry —
+    // the session stays "running" through the whole chain so polling
+    // clients never observe a brief idle window between queued runs.
+    const next = this.queue.shift(sessionId);
+    if (next) {
+      this.sessions.addUsage(sessionId, usage);
+      void this.executeInBackground(sessionId, agent, next.content, next.model)
+        .catch((err) => this.handleBackgroundFailure(sessionId, err));
+      return;
+    }
+
+    this.sessions.endRunSuccess(sessionId, usage);
+  }
+
+  /**
+   * Centralized failure handling for background tasks. Called from the
+   * outer .catch of every executeInBackground invocation (idle path and
+   * queue-drain recursive path). The guard against status != running is
+   * the one piece that makes cancel correct: when cancel runs first, it
+   * sets status=idle, then the in-flight chat completions request errors
+   * out via the WS abort, and that error surfaces here as a "failure" we
+   * must NOT record over the cancel's idle state.
+   *
+   * Eviction policy: only evict when the failure was a real run failure
+   * (status was still running at catch time). If status is already idle,
+   * the failure is a side-effect of an external cancel and the container
+   * is still healthy — leave it in the pool.
+   */
+  private handleBackgroundFailure(sessionId: string, err: unknown): void {
+    const current = this.sessions.get(sessionId);
+    if (current?.status !== "running") {
+      // Session was cancelled or otherwise transitioned. The error is the
+      // cancellation propagating through the in-flight HTTP request.
+      // Don't evict, don't fail.
+      return;
+    }
+    // Drop any queued events: they were enqueued expecting a healthy
+    // session, and we're about to fail it.
+    const dropped = this.queue.clear(sessionId);
+    if (dropped > 0) {
+      console.warn(
+        `[router] dropped ${dropped} queued event(s) for failed session ${sessionId}`,
+      );
+    }
+    void this.pool.evictSession(sessionId).catch(() => {
+      /* best-effort */
+    });
+    const msg = err instanceof Error ? err.message : String(err);
+    this.sessions.endRunFailure(sessionId, msg);
   }
 
   private async invokeChatCompletions(args: {
@@ -266,7 +392,11 @@ export type RouterErrorCode =
   | "agent_not_found"
   | "session_not_found"
   | "session_busy"
-  | "chat_completions_failed";
+  | "session_not_running"
+  | "no_active_container"
+  | "chat_completions_failed"
+  | "cancel_failed"
+  | "patch_failed";
 
 export class RouterError extends Error {
   constructor(
@@ -276,4 +406,12 @@ export class RouterError extends Error {
     super(message);
     this.name = "RouterError";
   }
+}
+
+function wrapWsError(err: unknown, fallbackCode: RouterErrorCode): RouterError {
+  if (err instanceof GatewayWsError) {
+    return new RouterError(fallbackCode, `${err.code}: ${err.message}`);
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return new RouterError(fallbackCode, msg);
 }

@@ -1,4 +1,5 @@
 import type { Container, ContainerRuntime, SpawnOptions } from "./container.js";
+import { GatewayWebSocketClient, GatewayWsError } from "./gateway-ws.js";
 
 // Per-session container lifecycle pool.
 //
@@ -9,6 +10,12 @@ import type { Container, ContainerRuntime, SpawnOptions } from "./container.js";
 // unused for longer than the configured threshold; the next event for that
 // session respawns a fresh container and OpenClaw's SessionManager rebuilds
 // the Pi AgentSession from the JSONL on the host mount.
+//
+// Item 7 added a GatewayWebSocketClient to each live container. After the
+// HTTP /readyz check succeeds, the pool also opens a WebSocket to the
+// gateway's control plane and runs the operator handshake. The router uses
+// that WS client to issue cancel / steer / patch operations against the
+// running session; the WS lifetime mirrors the container lifetime.
 //
 // The pool is in-memory only. On orchestrator restart the pool is empty;
 // any containers that outlived the prior process are reaped at startup by
@@ -34,6 +41,8 @@ export type PoolConfig = {
 type ActiveContainer = {
   sessionId: string;
   container: Container;
+  /** Operator-role WS client for control-plane calls (abort/steer/patch). */
+  wsClient: GatewayWebSocketClient;
   spawnedAt: number;
   lastUsedAt: number;
 };
@@ -83,14 +92,54 @@ export class SessionContainerPool {
       });
       throw err;
     }
+
+    // After /readyz succeeds, run the WS handshake. If THAT fails, the
+    // container is fine but Item 7 control ops would be broken — we still
+    // tear the container down so the next event respawns cleanly with a
+    // working WS client.
+    const wsClient = new GatewayWebSocketClient({
+      baseUrl: container.baseUrl,
+      token: container.token,
+      clientName: "openclaw-managed-runtime",
+    });
+    try {
+      await wsClient.connect();
+    } catch (err) {
+      await wsClient.close().catch(() => {
+        /* best-effort */
+      });
+      await this.runtime.stop(container.id).catch(() => {
+        /* best-effort */
+      });
+      const code = err instanceof GatewayWsError ? err.code : "ws_connect_failed";
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new GatewayWsError(code, `gateway ws handshake failed: ${msg}`);
+    }
+
     const now = Date.now();
     this.active.set(args.sessionId, {
       sessionId: args.sessionId,
       container,
+      wsClient,
       spawnedAt: now,
       lastUsedAt: now,
     });
     return container;
+  }
+
+  /**
+   * Get the operator-role WS client for an active session, if one exists.
+   * Returns undefined when the session has no live container in the pool
+   * (e.g., it was reaped by the idle sweeper or was never acquired).
+   */
+  getWsClient(sessionId: string): GatewayWebSocketClient | undefined {
+    return this.active.get(sessionId)?.wsClient;
+  }
+
+  /** Touch the lastUsedAt timestamp for a session so the sweeper doesn't reap it. */
+  touchSession(sessionId: string): void {
+    const entry = this.active.get(sessionId);
+    if (entry) entry.lastUsedAt = Date.now();
   }
 
   /**
@@ -102,6 +151,9 @@ export class SessionContainerPool {
     const entry = this.active.get(sessionId);
     if (!entry) return;
     this.active.delete(sessionId);
+    await entry.wsClient.close().catch(() => {
+      /* best-effort */
+    });
     await this.runtime.stop(entry.container.id).catch((err) => {
       console.warn(`[pool] stop ${entry.container.id} failed:`, err);
     });
@@ -127,6 +179,7 @@ export class SessionContainerPool {
     }
     const entries = Array.from(this.active.values());
     this.active.clear();
+    await Promise.allSettled(entries.map((e) => e.wsClient.close()));
     await Promise.allSettled(entries.map((e) => this.runtime.stop(e.container.id)));
   }
 
@@ -147,6 +200,9 @@ export class SessionContainerPool {
       console.log(
         `[pool] reaping idle container for session ${entry.sessionId} (idle ${idleSec}s)`,
       );
+      await entry.wsClient.close().catch(() => {
+        /* best-effort */
+      });
       await this.runtime.stop(entry.container.id).catch((err) => {
         console.warn(`[pool] reap stop ${entry.container.id} failed:`, err);
       });
