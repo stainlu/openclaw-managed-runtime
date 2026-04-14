@@ -50,7 +50,11 @@ export class AgentRouter {
     });
 
     // Fire-and-track: the HTTP caller polls GET /v1/sessions/:id for completion.
-    this.executeInBackground(session.sessionId, agent, args.task, args.resumeSessionId).catch(
+    // Session continuity across runs is carried by session.sessionId; when the
+    // caller supplied a `resumeSessionId`, sessions.create() reused that id, so
+    // the same value now flows through as session.sessionId and is passed to
+    // the container as the x-openclaw-session-key header below.
+    this.executeInBackground(session.sessionId, agent, args.task).catch(
       (err) => {
         const msg = err instanceof Error ? err.message : String(err);
         this.sessions.update(session.sessionId, {
@@ -68,24 +72,37 @@ export class AgentRouter {
     sessionId: string,
     agent: { agentId: string; model: string; tools: string[]; instructions: string },
     task: string,
-    resumeSessionId: string | undefined,
   ): Promise<void> {
     this.sessions.markStatus(sessionId, "running");
 
+    // Per-orchestrator-agent mount. Gives every orchestrator agent its own
+    // isolated OpenClaw workspace (sessions.json, per-session JSONLs, skills
+    // cache, models cache). The mount path is stable across container restarts
+    // for the same orchestrator agent, which is what lets session resume work.
     const hostMount: Mount = {
       hostPath: `${this.cfg.hostStateRoot}/${agent.agentId}`,
       containerPath: "/workspace",
     };
 
+    // Inside the container, OpenClaw always sees itself as agent "main".
+    // That is OpenClaw's DEFAULT_AGENT_ID — aligning with it means:
+    //   1. The session store lives at agents/main/sessions/sessions.json,
+    //      which is where OpenClaw's session-key resolver and orphan-key
+    //      migration both look by default.
+    //   2. The canonical session key form `agent:main:<stable-key>` matches
+    //      OpenClaw's buildAgentMainSessionKey output, so startup migrations
+    //      don't wipe our mappings as "orphaned."
+    // Multi-tenancy is provided by the mount path (one orchestrator agent =
+    // one mount = one container), not by naming. The orchestrator's agent id
+    // lives in the label and mount path; inside the container it is "main".
     const env: Record<string, string> = {
       ...this.cfg.passthroughEnv,
-      OPENCLAW_AGENT_ID: agent.agentId,
+      OPENCLAW_AGENT_ID: "main",
       OPENCLAW_MODEL: agent.model,
       OPENCLAW_TOOLS: agent.tools.join(","),
       OPENCLAW_INSTRUCTIONS: agent.instructions,
       OPENCLAW_STATE_DIR: "/workspace",
       OPENCLAW_GATEWAY_PORT: String(this.cfg.gatewayPort),
-      ...(resumeSessionId ? { OPENCLAW_SESSION_ID: resumeSessionId } : {}),
     };
 
     const container = await this.runtime.spawn({
@@ -95,8 +112,8 @@ export class AgentRouter {
       containerPort: this.cfg.gatewayPort,
       network: this.cfg.network,
       labels: {
-        "agent-id": agent.agentId,
-        "session-id": sessionId,
+        "orchestrator-agent-id": agent.agentId,
+        "orchestrator-session-id": sessionId,
       },
     });
 
@@ -106,7 +123,6 @@ export class AgentRouter {
       const completion = await this.invokeChatCompletions({
         baseUrl: container.baseUrl,
         token: container.token,
-        agentId: agent.agentId,
         task,
         sessionKey: sessionId,
       });
@@ -129,7 +145,6 @@ export class AgentRouter {
   private async invokeChatCompletions(args: {
     baseUrl: string;
     token: string;
-    agentId: string;
     task: string;
     sessionKey: string;
   }): Promise<{ output: string; tokensIn: number; tokensOut: number; costUsd: number }> {
@@ -139,8 +154,22 @@ export class AgentRouter {
     // a routing hint, not the inference model. The actual model used is picked
     // from the selected agent's config (agents.list[].model.primary). See
     // /src/gateway/http-utils.ts:resolveAgentIdFromModel for the pattern.
+    //
+    // Session continuity: we send the session key in OpenClaw's canonical
+    // `agent:<agentId>:<stable-key>` form so that OpenClaw's startup
+    // orphan-key migration (src/infra/state-migrations.ts:1000) treats it as
+    // already-canonicalized and does not rewrite it between turns. Sending a
+    // bare key like `ses_xxx` causes the migration to canonicalize on the
+    // next restart, producing a duplicate key in the store and losing
+    // continuity — we verified this empirically in the two-turn smoke test.
+    //
+    // The container's internal agent id is always "main" (see executeInBackground
+    // above) because that is OpenClaw's DEFAULT_AGENT_ID; per-orchestrator-agent
+    // isolation is provided by the bind mount, not by agent naming inside the
+    // container.
+    const canonicalSessionKey = `agent:main:${args.sessionKey}`;
     const body = {
-      model: `openclaw/${args.agentId}`,
+      model: "openclaw/main",
       user: args.sessionKey,
       messages: [{ role: "user", content: args.task }],
       stream: false,
@@ -151,7 +180,8 @@ export class AgentRouter {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${args.token}`,
-        "x-openclaw-agent-id": args.agentId,
+        "x-openclaw-agent-id": "main",
+        "x-openclaw-session-key": canonicalSessionKey,
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(this.cfg.runTimeoutMs),

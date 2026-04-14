@@ -44,7 +44,6 @@ Environment the entrypoint reads:
 | `OPENCLAW_PLUGIN` | provider plugin id to enable | derived from `OPENCLAW_MODEL` |
 | `OPENCLAW_TOOLS` | comma-separated OpenClaw skill ids (empty = no allowlist) | `""` |
 | `OPENCLAW_INSTRUCTIONS` | system prompt override | `"You are a helpful assistant."` |
-| `OPENCLAW_SESSION_ID` | resume a specific session if set | `""` |
 | `OPENCLAW_STATE_DIR` | persistent volume mount path | `/workspace` |
 | `OPENCLAW_GATEWAY_PORT` | HTTP port for the gateway | `18789` |
 | `OPENCLAW_GATEWAY_TOKEN` | shared-secret bearer token (auto-generated if unset) | random 32-byte hex |
@@ -120,11 +119,18 @@ OpenClaw provider plugins fall into two categories, and the entrypoint handles e
 
 For Category B providers the entrypoint writes a hardcoded `models.providers.<id>` block that mirrors what the interactive flow would produce. Extend `PROVIDER_BLOCK_JSON` in `docker/entrypoint.sh` when adding more Category B providers (DeepSeek and Qwen are likely candidates). A clean upstream fix is to make `defineSingleProviderPluginEntry` auto-register its default catalog — that is a follow-up contribution to OpenClaw proper, not something the runtime blocks on.
 
-### Session persistence
+### Session persistence and continuity
 
-Each container bind-mounts `/workspace` from a host path derived from the agent id: `<hostStateRoot>/<agentId>`. OpenClaw's existing session machinery writes JSONL at `/workspace/agents/<agentId>/sessions/<sessionId>.jsonl`. When a container is torn down the session files persist on the host volume. When a new run request comes in for the same agent (or with a specific session id for resume), a new container is spawned with the same mount and OpenClaw's session manager reloads the session automatically.
+Each container bind-mounts `/workspace` from a host path derived from the agent id: `<hostStateRoot>/<agentId>`. OpenClaw's session machinery (which wraps Pi's `SessionManager`) writes JSONL under `/workspace/agents/<agentId>/sessions/<sessionId>.jsonl`. When a container is torn down the session files persist on the host volume.
 
-For the MVP this is a local volume. Phase 2 replaces it with S3 / GCS / Azure Blob / Aliyun OSS / Volcengine TOS via an upstream `SessionStorage` abstraction on OpenClaw.
+Session continuity across container restarts is carried in the HTTP call, not in env vars. The orchestrator sets **both** of these on every internal `/v1/chat/completions` request:
+
+- `x-openclaw-session-key: <session_id>` header
+- `user: <session_id>` field in the request body
+
+OpenClaw's gateway picks the key up via `resolveSessionKey` in `src/gateway/http-utils.ts` (upstream openclaw repo) and maps it to a persistent session on disk. When the new container starts up and receives a request under a session key that already has a JSONL file, Pi's `SessionManager.open()` loads the prior events and constructs the `AgentSession` with full historical context. The embedded Pi runner (`src/agents/pi-embedded-runner/run/attempt.ts`) then invokes the model with the reconstructed context, so the agent sees the full conversation history, not just the latest user message.
+
+For the MVP the JSONL files live on a local Docker volume. Phase 2 replaces it with S3 / GCS / Azure Blob / Aliyun OSS / Volcengine TOS via an upstream `SessionStorage` abstraction on OpenClaw.
 
 ## Request flow
 

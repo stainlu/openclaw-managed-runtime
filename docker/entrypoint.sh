@@ -22,9 +22,15 @@
 #                            openclaw npm package bundles 53 real skills — see
 #                            /skills/ in openclaw/openclaw for the actual IDs.
 #   OPENCLAW_INSTRUCTIONS  - system prompt override (optional)
-#   OPENCLAW_SESSION_ID    - session identifier for resume (optional)
 #   OPENCLAW_STATE_DIR     - persistent volume mount (default: /workspace)
 #   OPENCLAW_GATEWAY_PORT  - HTTP port (default: 18789)
+#
+# Session continuity is NOT carried in env vars. OpenClaw derives a stable
+# session key from either the `x-openclaw-session-key` HTTP header or the
+# OpenAI `user` field (see src/gateway/http-utils.ts:resolveSessionKey in the
+# upstream openclaw repo). The orchestrator sets both on every internal call.
+# The per-agent bind mount at OPENCLAW_STATE_DIR gives Pi's SessionManager a
+# stable filesystem where it can find prior session JSONLs and resume them.
 #
 # Provider API keys (whichever one matches OPENCLAW_PLUGIN) must be present in
 # the container environment. The orchestrator forwards them via the passthrough
@@ -38,7 +44,6 @@ set -euo pipefail
 : "${OPENCLAW_GATEWAY_PORT:=18789}"
 : "${OPENCLAW_TOOLS:=}"
 : "${OPENCLAW_INSTRUCTIONS:=}"
-: "${OPENCLAW_SESSION_ID:=}"
 
 # Derive the plugin id from OPENCLAW_MODEL if not explicitly set. Model format
 # is "<provider>/<model-id>"; the provider half maps 1:1 to an OpenClaw plugin
@@ -198,15 +203,7 @@ cat "${CONFIG_PATH}"
 export OPENCLAW_CONFIG_PATH="${CONFIG_PATH}"
 export OPENCLAW_STATE_DIR="${STATE_DIR}"
 
-# If resuming a session, stash the session ID where the orchestrator's health
-# check or post-start logic can pick it up. The OpenClaw SessionManager loads
-# sessions by ID from the workspace directory automatically when the agent is
-# addressed with that session key.
-if [[ -n "${OPENCLAW_SESSION_ID}" ]]; then
-  echo "[entrypoint] session resume requested: ${OPENCLAW_SESSION_ID}"
-fi
-
-echo "[entrypoint] starting gateway on port ${OPENCLAW_GATEWAY_PORT} (bind=lan, auth=none)"
+echo "[entrypoint] starting gateway on port ${OPENCLAW_GATEWAY_PORT} (bind=lan, auth=token)"
 exec openclaw gateway run \
   --port "${OPENCLAW_GATEWAY_PORT}" \
   --bind lan \
