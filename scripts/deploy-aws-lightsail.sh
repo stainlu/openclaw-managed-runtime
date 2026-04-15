@@ -305,11 +305,10 @@ done
 if [[ "${SUCCESS}" -eq 1 ]]; then
     log "Deploy complete"
     printf "    Orchestrator:      %s\n" "${ORCH_URL}"
-    printf "    Monthly cost:      ~$24 (medium_3_0 bundle: 2 vCPU / 4 GB / 80 GB / 4 TB egress)\n"
+    printf "    Monthly cost:      ~\$24 (medium_3_0 bundle: 2 vCPU / 4 GB / 80 GB / 4 TB egress)\n"
     printf "                       Override LIGHTSAIL_BUNDLE_ID=small_3_0 for \$12/mo (2 GB)\n"
     printf "    Destroy with:      ./scripts/deploy-aws-lightsail.sh --destroy\n"
     printf "    SSH (port 22):     ssh ubuntu@%s\n" "${SERVER_IPV4}"
-    printf "    SSH (port 222):    ssh -p 222 ubuntu@%s   # use this if your ISP blocks port 22 to cloud IPs\n" "${SERVER_IPV4}"
     printf "    Tail bootstrap:    ssh ubuntu@%s 'sudo tail -f /var/log/openclaw-bootstrap.log'\n" "${SERVER_IPV4}"
 else
     err "Orchestrator did not become reachable at ${ORCH_URL}/healthz after 10 minutes."

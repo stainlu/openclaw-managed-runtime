@@ -288,8 +288,8 @@ This is the "open and cheap" proof point for the runtime. Same code, same archit
 |---|---|---|---|---|
 | **Hetzner Cloud CAX11** (ARM) | Item 10a | 2 / 4 GB / 40 GB | **€3.99 net / €4.35 gross** | ✅ Shipped — [deploy guide](./docs/deploying-on-hetzner.md) |
 | Hetzner Cloud CX23 (x86) | Item 10a (alt) | 2 / 4 GB / 40 GB | €4.99 net / €5.44 gross | ✅ Shipped — same guide, override `HCLOUD_SERVER_TYPE=cx23` |
-| **AWS Lightsail 2 GB** | Item 10b | 2 / 2 GB / 60 GB | **$10** | 🔜 Next |
-| AWS Lightsail 4 GB | Item 10b (alt) | 2 / 4 GB / 80 GB | $20 | 🔜 Next |
+| **AWS Lightsail `medium_3_0`** | Item 10b | 2 / 4 GB / 80 GB | **$24** | ✅ Shipped — [deploy guide](./docs/deploying-on-aws-lightsail.md) |
+| AWS Lightsail `small_3_0` (alt) | Item 10b (alt) | 2 / 2 GB / 60 GB | $12 | ✅ Shipped — same guide, override `LIGHTSAIL_BUNDLE_ID=small_3_0` |
 | Google Cloud Compute Engine e2-medium | Item 10c | 2 / 4 GB / 10 GB | ~$25 | 🔜 Later |
 | Azure B2s VM | Item 10d | 2 / 4 GB / 64 GB | ~$30 | 🔜 Later |
 | DigitalOcean Basic Droplet | Item 10e | 2 / 2 GB / 60 GB | $12 | 🔜 Later |
@@ -297,13 +297,26 @@ This is the "open and cheap" proof point for the runtime. Same code, same archit
 | Serverless (Cloud Run, Fargate, Cloudflare Containers) | Item 10f+ | — | — | 🔜 Partnership-driven, not core |
 | **Claude Managed Agents (baseline)** | closed | — | **$0.08/hr + tokens** | closed-source |
 
-**Hetzner CAX11 — verified live, 2026-04-15**: first turn (cold container spawn) **78 seconds**, subsequent turns via session pool reuse **4 seconds** (74s saved), correct agent replies on `moonshot/kimi-k2.5`. One CAX11 holds roughly 5–7 concurrent active agent containers at ~458 MiB each. At €3.99/mo for the VPS + Moonshot token pass-through, per-active-turn compute cost is a fraction of a cent. For an idle-heavy chat workload (5 minutes of active model time per hour), Hetzner is **~11× cheaper per session-hour** than Claude Managed Agents, and the savings scale linearly with concurrency.
+**Live-measured numbers, 2026-04-15 and 2026-04-16:**
 
-**Architectural note** — every backend above the "serverless" row runs the **same** `DockerContainerRuntime` unchanged. The cloud strategy is "any Linux VPS with Docker," not "native integration with each cloud's proprietary container product." Serverless container products (Cloud Run, Fargate, Cloudflare Containers, Azure Container Apps) are Item 10f+ and only ship if a specific partner requires them — their architectures force a rewrite of the orchestrator's storage layer for no user-visible benefit at our stateful-session-pool workload shape. See [`docs/cloud-backends.md`](./docs/cloud-backends.md) for the full decision record.
+| Metric | Hetzner CAX11 | AWS Lightsail `medium_3_0` |
+|---|---|---|
+| End-to-end deploy time | ~4 min (pre-GHCR), ~1-2 min projected with pre-built images | **295 s** (~5 min, pre-built images from GHCR) |
+| Turn 1 (cold container spawn) | **78 s** | **294 s** |
+| Turn 2 (session pool reuse) | **4 s** | **5 s** |
+| Concurrent active sessions | ~5-7 | ~5-7 |
+| Per-turn compute cost | <€0.001 | <$0.01 |
+| Architecture | Docker + `DockerContainerRuntime` | Docker + `DockerContainerRuntime` (identical) |
 
-> **Run on a €4 Hetzner VPS, on a $10 AWS Lightsail instance, on a GCP e2-medium, on a free Oracle Cloud A1, or on any Linux box with Docker. Open. Cheap. Yours.**
+**Architectural notes:**
+- **Pre-built images**. Both the orchestrator image (`ghcr.io/stainlu/openclaw-managed-runtime-orchestrator`) and the agent runtime image (`ghcr.io/stainlu/openclaw-managed-runtime-agent`) are published to GHCR as public, multi-arch (linux/amd64 + linux/arm64) packages by `.github/workflows/publish-images.yaml` on every push to `main`. Deploy scripts run `docker compose pull && docker compose up -d`, never rebuild on the target VM. This cut Lightsail deploy time from ~12 min (build-from-source) to ~5 min, and avoids depleting CPU burst credits on burstable-disk backends.
+- **Every VPS backend runs the same `DockerContainerRuntime` unchanged.** The cloud strategy is "any Linux VPS with Docker," not "native integration with each cloud's proprietary container product." Serverless container products (Cloud Run, Fargate, Cloudflare Containers, Azure Container Apps) are Item 10f+ and only ship if a specific partner requires them — their architectures force a rewrite of the orchestrator's storage layer for no user-visible benefit at our stateful-session-pool workload shape. See [`docs/cloud-backends.md`](./docs/cloud-backends.md) for the full decision record.
+- **Hetzner first-turn is ~4× faster than Lightsail first-turn** (78 s vs 294 s) because Hetzner's CX22/CAX11 use dedicated vCPU + local NVMe, while Lightsail's `medium_3_0` uses shared burstable vCPU + EBS-equivalent SSD. The orchestrator's `OPENCLAW_READY_TIMEOUT_MS` is set to 600 s (10 min) to give burstable-disk backends enough grace. Pool-reuse turns are identical on both clouds (~4-5 s).
+- **Lightsail costs ~5-6× more than Hetzner for equivalent specs** ($24/mo vs €3.99/mo). The AWS brand, native Bedrock proximity, and AWS Marketplace listing are the reasons you'd pick Lightsail over Hetzner; if you just want the cheapest VPS, use Hetzner or Oracle Cloud (free tier).
 
-*10a is shipped and live-measured. 10b–10e numbers above are published pricing from each provider; each ships with its own deploy script and a measured benchmark row when the adapter lands.*
+> **Run on a €4 Hetzner VPS, on a $24 AWS Lightsail instance, on a GCP e2-medium, on a free Oracle Cloud A1, or on any Linux box with Docker. Open. Cheap. Yours.**
+
+*10a and 10b are both shipped and live-measured with pre-built images from GHCR. 10c–10e numbers above are published provider pricing; each ships with its own deploy script + live benchmark when the adapter lands.*
 
 ## Delegated subagents
 
@@ -447,14 +460,15 @@ This is **early development**, but the runtime is end-to-end functional and ever
 - **OpenAI-compat adapter** (Item 8) via `POST /v1/chat/completions` — sticky sessions via `user` field / `x-openclaw-session-key`, keyless calls create ephemeral sessions, reaped alongside their container.
 - **Per-turn cost accounting** (Item 9) from Pi's provider catalogs — cache-aware, read from `msg.usage.cost.total` in the JSONL. No static price sheet in the orchestrator.
 - **Delegated subagents as first-class inspectable sessions** (Items 12-14). `callableAgents` + `maxSubagentDepth` on agent templates, HMAC-signed parent tokens, `openclaw-call-agent` CLI tool inside the container. Zero new HTTP endpoints; subagents spawn through the existing `POST /v1/sessions` + `POST /events` primitives. See [Delegated subagents](#delegated-subagents) above.
-- **Hetzner Cloud deploy path** (Item 10a). `scripts/deploy-hetzner.sh` + `docs/deploying-on-hetzner.md`. One command takes zero → live runtime on a **€3.99/month Hetzner CAX11** (ARM Ampere) or **€4.99/month CX23** (Intel x86) in ~6 minutes. Reuses the existing `DockerContainerRuntime` end-to-end. Verified live on 2026-04-15: 78 s cold turn, 4 s pool-reuse turn, correct agent replies on `moonshot/kimi-k2.5`. The "open and cheap" proof point. See [Cheapest production deployment](#cheapest-production-deployment--399month-on-hetzner) above.
+- **Hetzner Cloud deploy path** (Item 10a). `scripts/deploy-hetzner.sh` + `docs/deploying-on-hetzner.md`. One command takes zero → live runtime on a **€3.99/month Hetzner CAX11** (ARM Ampere) or **€4.99/month CX23** (Intel x86) in ~4 minutes (build-from-source baseline; pre-built images cut this further). Reuses the existing `DockerContainerRuntime` end-to-end. Verified live on 2026-04-15: 78 s cold turn, 4 s pool-reuse turn, correct agent replies on `moonshot/kimi-k2.5`.
+- **AWS Lightsail deploy path** (Item 10b). `scripts/deploy-aws-lightsail.sh` + `docs/deploying-on-aws-lightsail.md`. Same architecture as Item 10a, different CLI (`aws lightsail create-instances`). Pure-shell user-data because Lightsail prepends its own `#!/bin/sh` boot script and cloud-config YAML is silently ignored. Verified live on 2026-04-16 with pre-built images from GHCR: ~5 min end-to-end deploy, 294 s cold turn, 5 s pool-reuse turn, correct replies on `moonshot/kimi-k2.5`. AWS partnership hook with direct Bedrock proximity.
+- **Pre-built multi-arch images on GHCR** (Item 10 supporting infrastructure). `.github/workflows/publish-images.yaml` builds `Dockerfile.orchestrator` and `Dockerfile.runtime` on every push to `main` and publishes them to `ghcr.io/stainlu/openclaw-managed-runtime-{orchestrator,agent}:latest` as public, multi-arch (linux/amd64 + linux/arm64) packages. Every deploy script pulls these instead of building from source on the target VM. On Lightsail this cut deploy time from ~12 min to ~5 min; on Hetzner from ~4 min to a projected ~1-2 min.
 
 **Next** (Items 10b-11):
 
 After a deep research pass into Google Cloud Run and AWS Fargate on 2026-04-15, we pivoted away from "one serverless-container backend per cloud" and toward **multi-provider cheap VPSes reusing the existing `DockerContainerRuntime` unchanged**. Every major cloud has a Hetzner-equivalent "cheap VPS with Docker" product; shipping one ~300-line deploy script per provider is strictly simpler and more user-friendly than building a separate orchestrator adapter for each cloud's proprietary container runtime. See [`docs/cloud-backends.md`](./docs/cloud-backends.md) for the full architectural decision record.
 
-- **Item 10b — AWS Lightsail** (next up). Mirror of the Hetzner deploy shape using `aws lightsail create-instances`. Same `DockerContainerRuntime`, same e2e path, different CLI. Targets the $5-$10/month Lightsail tiers as the cheapest credible AWS deploy.
-- **Item 10c — Google Cloud Compute Engine.** Targets `e2-small` / `e2-medium` via `gcloud compute instances create`. Same pattern. GCP free-tier `e2-micro` as the zero-cost option for specific regions.
+- **Item 10c — Google Cloud Compute Engine** (next up). Targets `e2-small` / `e2-medium` via `gcloud compute instances create`. Same pattern as Hetzner and Lightsail: pull GHCR images, no build-on-server. GCP free-tier `e2-micro` as the zero-cost option for specific regions.
 - **Item 10d — Azure Virtual Machines.** Targets `B2s` via `az vm create`. Same pattern. Azure partnership hook.
 - **Item 10e — DigitalOcean / Linode / Vultr / Oracle Cloud free tier / Alibaba Cloud.** One deploy script per provider, all at ~$4-13/month, plus Oracle's Always-Free 4-vCPU / 24-GB tier for $0 forever. Maximum "open to any cloud."
 - **Item 10f+ — Optional serverless integrations** (Cloud Run, Fargate, Cloudflare Containers, Azure Container Apps). Only built if a specific partner requires "native serverless" listing in their marketplace. Architecturally the wrong tool for our stateful-session-pool workload (Cloud Run's 10 s SIGTERM window + gcsfuse semantics, Fargate's 30-45 s cold start + S3 sync requirement), so these are deliberately deprioritized rather than ignored.

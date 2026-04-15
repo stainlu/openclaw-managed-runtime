@@ -155,6 +155,22 @@ curl -s "$ORCH/v1/sessions/$SESSION/events" \
   | jq -r '[.events[]|select(.type=="agent.message")]|last|.content'
 ```
 
+## Measured performance (live on 2026-04-16)
+
+| Metric | `medium_3_0` bundle | Hetzner CAX11 (comparison) |
+|---|---|---|
+| **End-to-end deploy time** (fresh instance → /healthz OK) | **~5 min** | ~4 min |
+| **Turn 1 cold spawn** (agent container + Pi SessionManager boot) | **294 s** (~5 min) | **78 s** |
+| **Turn 2 pool reuse** (session already spawned) | **5 s** | **4 s** |
+| RAM per agent container | ~458 MiB | ~458 MiB |
+| Concurrent active agent sessions | ~5-7 | ~5-7 |
+
+**Why Lightsail's first-turn is ~4× slower than Hetzner's.** `medium_3_0` runs on a shared-burstable vCPU with EBS-backed storage (~5-15 ms per I/O operation). Pi's `SessionManager` reads provider catalogs, skill manifests, and auth config from disk during boot — on Hetzner CAX11's local NVMe this completes in ~60 seconds; on Lightsail's burstable SSD it takes 3-5 minutes. Subsequent turns reuse the already-booted container from the orchestrator's session pool and complete in 4-5 seconds on both backends.
+
+**The deploy uses pre-built images from GHCR** — `ghcr.io/stainlu/openclaw-managed-runtime-{orchestrator,agent}:latest`, published by `.github/workflows/publish-images.yaml` on every push to `main`. Deploy time dropped from ~12 min (earlier build-from-source baseline) to ~5 min because `npm install -g openclaw@2026.4.11` (6.5 min of the original 12) no longer runs on the target VM. CPU burst credits also stay full for the first turn, shortening cold-spawn time as a side effect.
+
+**The orchestrator's `OPENCLAW_READY_TIMEOUT_MS` is set to 600 seconds (10 minutes)** on every deploy specifically to accommodate Lightsail's slow first-turn. Hetzner never hits the old 120-second timeout, so the bump is free there; Lightsail needed it to avoid failing the first turn and forcing an immediate respawn.
+
 ## Cost breakdown
 
 The Lightsail bundle cost is fixed per month regardless of how many sessions you run — you pay the same $24/month whether the instance serves 0 sessions or 500. What scales is the LLM token cost, which is billed directly by your provider (Moonshot, Anthropic, OpenAI, etc.) and is identical across every backend.
