@@ -220,8 +220,12 @@ write_files:
       OPENCLAW_TEST_MODEL=${DEFAULT_TEST_MODEL}
       ENVFILE
 
-      # --- Bring up the stack ---
-      docker compose up -d --build
+      # --- Pull pre-built images from GHCR (published by .github/workflows/
+      # publish-images.yaml on every push to main) and bring up the stack.
+      # Skipping --build cuts deploy time from ~4 min to ~1-2 min on Hetzner
+      # CAX11 and from ~12 min to ~3 min on Lightsail medium_3_0. ---
+      docker compose pull
+      docker compose up -d
 
       # --- Health-check loop (up to 10 min) ---
       for i in \$(seq 1 120); do

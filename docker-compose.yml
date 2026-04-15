@@ -19,17 +19,26 @@
 
 services:
   orchestrator:
+    # Production: images are pre-built by .github/workflows/publish-images.yaml
+    # on every push to main and published to GHCR as public packages. Deploy
+    # scripts run `docker compose pull && docker compose up -d` to skip the
+    # build step entirely — cuts Lightsail deploy time from ~12 min to ~3 min.
+    #
+    # Local dev: run `docker compose up --build` and compose will rebuild
+    # both images from the Dockerfiles below, tagging them with the same
+    # GHCR names. You do NOT need GHCR credentials for local builds; the
+    # image tag just happens to point at a public registry path.
+    image: ghcr.io/stainlu/openclaw-managed-runtime-orchestrator:latest
     build:
       context: .
       dockerfile: Dockerfile.orchestrator
-    image: openclaw-managed-runtime/orchestrator:latest
     container_name: openclaw-orchestrator
     ports:
       - "8080:8080"
     environment:
       PORT: "8080"
       OPENCLAW_DOCKER_NETWORK: openclaw-net
-      OPENCLAW_RUNTIME_IMAGE: openclaw-managed-runtime/agent:latest
+      OPENCLAW_RUNTIME_IMAGE: ghcr.io/stainlu/openclaw-managed-runtime-agent:latest
       OPENCLAW_HOST_STATE_ROOT: ${PWD}/data/sessions
       OPENCLAW_GATEWAY_PORT: "18789"
       OPENCLAW_READY_TIMEOUT_MS: "120000"
@@ -78,15 +87,17 @@ services:
     depends_on:
       - ensure-agent-image
 
-  # Build the agent runtime image as a compose-managed target so `docker compose
-  # up --build` produces both images in one command.
+  # Pulls the agent runtime image so it's available locally when the
+  # orchestrator (via dockerode) spawns per-session containers from it.
+  # For production deploys this is a pure pull; for local dev the `build:`
+  # block below rebuilds from Dockerfile.runtime when `docker compose up
+  # --build` is used. The service itself runs `true` and exits immediately —
+  # compose still pulls/builds the image and tags it for later use.
   ensure-agent-image:
+    image: ghcr.io/stainlu/openclaw-managed-runtime-agent:latest
     build:
       context: .
       dockerfile: Dockerfile.runtime
-    image: openclaw-managed-runtime/agent:latest
-    # This service is only for building the image, not for running. It exits
-    # immediately; compose still tags the image.
     command: ["true"]
     restart: "no"
 

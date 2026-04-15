@@ -222,8 +222,10 @@ mkdir -p data/sessions data/state
 # --- Write .env via printf (no nested heredoc) ---
 printf '%s=%s\\nOPENCLAW_TEST_MODEL=%s\\n' '${PROVIDER_KEY_NAME}' '${PROVIDER_KEY_VALUE}' '${DEFAULT_TEST_MODEL}' > .env
 
-# --- Bring up the stack (the deploy script polls /healthz from outside) ---
-docker compose up -d --build
+# --- Pull pre-built images from GHCR and bring up the stack. Skipping
+# --build cuts Lightsail deploy time from ~12 min to ~3 min. ---
+docker compose pull
+docker compose up -d
 echo "user-data bootstrap complete" > /var/log/openclaw-ready.log
 USERDATA
 )"
