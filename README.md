@@ -284,21 +284,26 @@ This is the "open and cheap" proof point for the runtime. Same code, same archit
 
 ### Backend cost comparison
 
-| Backend | Per-session compute cost | Base monthly cost | Status |
-|---|---|---|---|
-| **Hetzner CAX11** (ARM, this runtime, 10a) | **~€0.0001 / active turn** | **€3.99 net / €4.35 gross** | ✅ Shipped — [deploy guide](./docs/deploying-on-hetzner.md) |
-| Hetzner CX23 (Intel x86, alternative) | ~€0.0001 / active turn | €4.99 net / €5.44 gross | ✅ Shipped — same deploy guide, override `HCLOUD_SERVER_TYPE=cx23` |
-| Google Cloud Run (10b) | ~$0.009 / active turn | $0 | 🔜 Next |
-| AWS Fargate (10c) | ~$0.035 / hour always-on | $0 | 🔜 Later |
-| Azure Container Apps (10d) | Similar to Cloud Run | $0 | 🔜 Later |
-| Cloudflare Containers (10f, lowest priority) | ~$0.005 / active turn | $5 Workers Paid | 🔜 Later (proxy-worker + R2 path, deferred) |
-| **Claude Managed Agents (baseline)** | **$0.08 / hour + tokens** | n/a | closed-source |
+| Backend | Tier | vCPU / RAM / SSD | Base monthly | Status |
+|---|---|---|---|---|
+| **Hetzner Cloud CAX11** (ARM) | Item 10a | 2 / 4 GB / 40 GB | **€3.99 net / €4.35 gross** | ✅ Shipped — [deploy guide](./docs/deploying-on-hetzner.md) |
+| Hetzner Cloud CX23 (x86) | Item 10a (alt) | 2 / 4 GB / 40 GB | €4.99 net / €5.44 gross | ✅ Shipped — same guide, override `HCLOUD_SERVER_TYPE=cx23` |
+| **AWS Lightsail 2 GB** | Item 10b | 2 / 2 GB / 60 GB | **$10** | 🔜 Next |
+| AWS Lightsail 4 GB | Item 10b (alt) | 2 / 4 GB / 80 GB | $20 | 🔜 Next |
+| Google Cloud Compute Engine e2-medium | Item 10c | 2 / 4 GB / 10 GB | ~$25 | 🔜 Later |
+| Azure B2s VM | Item 10d | 2 / 4 GB / 64 GB | ~$30 | 🔜 Later |
+| DigitalOcean Basic Droplet | Item 10e | 2 / 2 GB / 60 GB | $12 | 🔜 Later |
+| Oracle Cloud Always Free (A1) | Item 10e | 4 / 24 GB / 200 GB | **$0 forever** | 🔜 Later |
+| Serverless (Cloud Run, Fargate, Cloudflare Containers) | Item 10f+ | — | — | 🔜 Partnership-driven, not core |
+| **Claude Managed Agents (baseline)** | closed | — | **$0.08/hr + tokens** | closed-source |
 
-**Hetzner CAX11 — verified live, April 15 2026**: first turn (cold container spawn) **78 seconds**, subsequent turns via session pool reuse **4 seconds** (74s saved), correct agent replies on `moonshot/kimi-k2.5`, permission fix landed in commit `075b7c0` for Linux bind mounts. One CAX11 (2 vCPU / 4 GB RAM / 40 GB SSD, ARM Ampere) holds roughly 5-7 concurrent active agent containers at ~458 MiB each. At €3.99/mo for the VPS + Moonshot token pass-through, per-active-turn compute cost is a fraction of a cent. For an idle-heavy chat workload (5 minutes of active model time per hour), Hetzner is **~11x cheaper per session-hour** than Claude Managed Agents, and the savings scale linearly with concurrency.
+**Hetzner CAX11 — verified live, 2026-04-15**: first turn (cold container spawn) **78 seconds**, subsequent turns via session pool reuse **4 seconds** (74s saved), correct agent replies on `moonshot/kimi-k2.5`. One CAX11 holds roughly 5–7 concurrent active agent containers at ~458 MiB each. At €3.99/mo for the VPS + Moonshot token pass-through, per-active-turn compute cost is a fraction of a cent. For an idle-heavy chat workload (5 minutes of active model time per hour), Hetzner is **~11× cheaper per session-hour** than Claude Managed Agents, and the savings scale linearly with concurrency.
 
-> **Run on a €4 Hetzner VPS, on Google Cloud Run, on AWS Fargate, on Azure Container Apps — or on any Linux box with Docker. Open. Cheap. Yours.**
+**Architectural note** — every backend above the "serverless" row runs the **same** `DockerContainerRuntime` unchanged. The cloud strategy is "any Linux VPS with Docker," not "native integration with each cloud's proprietary container product." Serverless container products (Cloud Run, Fargate, Cloudflare Containers, Azure Container Apps) are Item 10f+ and only ship if a specific partner requires them — their architectures force a rewrite of the orchestrator's storage layer for no user-visible benefit at our stateful-session-pool workload shape. See [`docs/cloud-backends.md`](./docs/cloud-backends.md) for the full decision record.
 
-*10a is shipped and live-measured against a real Hetzner CAX11 on 2026-04-15. 10b-10f numbers above are published pricing from each backend's docs and will be replaced with measured per-session costs as each adapter ships.*
+> **Run on a €4 Hetzner VPS, on a $10 AWS Lightsail instance, on a GCP e2-medium, on a free Oracle Cloud A1, or on any Linux box with Docker. Open. Cheap. Yours.**
+
+*10a is shipped and live-measured. 10b–10e numbers above are published pricing from each provider; each ships with its own deploy script and a measured benchmark row when the adapter lands.*
 
 ## Delegated subagents
 
@@ -446,12 +451,14 @@ This is **early development**, but the runtime is end-to-end functional and ever
 
 **Next** (Items 10b-11):
 
-- **Item 10b — Google Cloud Run adapter.** New `CloudRunContainerRuntime` using `@google-cloud/run` SDK, plus a GCS-backed session-state path. Architecturally nearly drop-in with the existing `DockerContainerRuntime`: Cloud Run has a standard HTTP container-deploy API and stable HTTPS endpoints, so our orchestrator can drive the full lifecycle without an intermediate proxy. Scale-to-zero request-based billing (~$0.009 per 5-minute active turn). First GCP partnership hook.
-- **Item 10c — AWS Fargate adapter.** Fargate tasks per agent + EFS (in-VPC) or S3 (cross-VPC) for session state. AWS partnership hook with Bedrock model access. Always-on shared-vCPU pricing ~$0.035/hour.
-- **Item 10d — Azure Container Apps adapter.** Consumption-plan scale-to-zero + Azure Blob for session state. Azure partnership hook.
-- **Item 10e — Fly.io, Render, Railway, Bedrock AgentCore, etc.** Additional adapters as partnership conversations open up. None require orchestrator core changes — `ContainerRuntime` interface already does the right thing.
-- **Item 10f — Cloudflare Containers adapter** (demoted to lowest priority, was 10b). Cloudflare Containers are Durable-Object-wrapped, not externally-controllable: our orchestrator cannot drive lifecycles directly and needs a proxy Worker + DO + R2 sync path we build and maintain. Several days of work vs a clean drop-in for the three standard-HTTP-container backends above. Will revisit once those land. The "first managed agent runtime on Cloudflare Containers" news hook is still on the table, just not ahead of shipping value for the mainstream cloud stack.
-- **Item 11 — upstream OpenClaw contributions.** `defineSingleProviderPluginEntry` auto-register fix (eliminates the `PROVIDER_BLOCK_JSON` hack for Category B providers), and an HTTP/SSE wrapper around the Pi event bus for real delta streaming in chat.completions. Run in parallel with 10b/c/d/e/f.
+After a deep research pass into Google Cloud Run and AWS Fargate on 2026-04-15, we pivoted away from "one serverless-container backend per cloud" and toward **multi-provider cheap VPSes reusing the existing `DockerContainerRuntime` unchanged**. Every major cloud has a Hetzner-equivalent "cheap VPS with Docker" product; shipping one ~300-line deploy script per provider is strictly simpler and more user-friendly than building a separate orchestrator adapter for each cloud's proprietary container runtime. See [`docs/cloud-backends.md`](./docs/cloud-backends.md) for the full architectural decision record.
+
+- **Item 10b — AWS Lightsail** (next up). Mirror of the Hetzner deploy shape using `aws lightsail create-instances`. Same `DockerContainerRuntime`, same e2e path, different CLI. Targets the $5-$10/month Lightsail tiers as the cheapest credible AWS deploy.
+- **Item 10c — Google Cloud Compute Engine.** Targets `e2-small` / `e2-medium` via `gcloud compute instances create`. Same pattern. GCP free-tier `e2-micro` as the zero-cost option for specific regions.
+- **Item 10d — Azure Virtual Machines.** Targets `B2s` via `az vm create`. Same pattern. Azure partnership hook.
+- **Item 10e — DigitalOcean / Linode / Vultr / Oracle Cloud free tier / Alibaba Cloud.** One deploy script per provider, all at ~$4-13/month, plus Oracle's Always-Free 4-vCPU / 24-GB tier for $0 forever. Maximum "open to any cloud."
+- **Item 10f+ — Optional serverless integrations** (Cloud Run, Fargate, Cloudflare Containers, Azure Container Apps). Only built if a specific partner requires "native serverless" listing in their marketplace. Architecturally the wrong tool for our stateful-session-pool workload (Cloud Run's 10 s SIGTERM window + gcsfuse semantics, Fargate's 30-45 s cold start + S3 sync requirement), so these are deliberately deprioritized rather than ignored.
+- **Item 11 — upstream OpenClaw contributions.** `defineSingleProviderPluginEntry` auto-register fix (eliminates the `PROVIDER_BLOCK_JSON` hack for Category B providers), and an HTTP/SSE wrapper around the Pi event bus for real delta streaming in chat.completions. Run in parallel with 10b/c/d/e.
 
 **Later** (post-milestone enhancements):
 

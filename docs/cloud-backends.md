@@ -1,10 +1,15 @@
-# Cloud backends — research, architecture audit, and refactor plan
+# Cloud backends — architectural decision record (ADR)
 
 **Date:** 2026-04-15
-**Scope:** Item 10b (Google Cloud Run) and Item 10c (AWS Fargate)
-**Status:** Research complete. Refactor plan proposed. Implementation not started.
+**Status:** ⚠️ **SUPERSEDED** — see "Decision" section at the bottom of this document. The implementation plan proposed here (new `SessionFileStore` / `WorkspaceProvisioner` interfaces, Cloud Run adapter, Fargate adapter) was **rejected** in favor of a far simpler multi-provider VPS strategy that uses the existing `DockerContainerRuntime` unchanged.
 
-This document is the single source of truth for the second and third cloud backends. It consolidates the findings from two deep research passes (one for Cloud Run, one for Fargate), audits the Docker-specific assumptions in the current codebase, and proposes the abstractions we need before writing a single line of adapter code. Per the PM's direction, we refactor first, implement second — no ad-hoc shortcuts that leak backend specifics into the router or the event reader.
+This document is preserved as an **architectural decision record**. The research findings are intact as evidence behind the decision we ultimately made. **Do not use sections 5–11 as an implementation plan.** Use them to understand why we considered and rejected Cloud Run / Fargate as core backends.
+
+**If you are trying to add a new cloud deploy target**, skip to the **Decision** section and see `scripts/deploy-hetzner.sh` as the pattern.
+
+---
+
+This document originally consolidated two deep research passes (Cloud Run, Fargate) into a proposed refactor plan with new interfaces and two new cloud adapters. Sections 2–4 contain the raw research. Sections 5–11 describe the rejected plan. The real decision is in §13.
 
 ---
 
@@ -677,3 +682,90 @@ Both research briefs were explicit about which numbers are secondary-sourced or 
 - `src/store/pi-jsonl.ts` — `PiJsonlEventReader` (filesystem-coupled, refactor target)
 - `src/orchestrator/router.ts` — `AgentRouter` (mount construction + UID chown, refactor target)
 - `src/index.ts` — orchestrator wiring, refactor target for the backend factory
+
+---
+
+## 13. Decision (2026-04-15, evening)
+
+**The refactor proposed in sections 5–7 was rejected. We will NOT build `SessionFileStore`, `WorkspaceProvisioner`, a Cloud Run adapter, or a Fargate adapter as core backends.** Instead, OpenClaw Managed Runtime targets **multi-provider cheap VPSes** as its cloud story, reusing the existing `DockerContainerRuntime` unchanged.
+
+### Why the refactor was the wrong answer
+
+The PM pushed back with one question: *"is there a similar product like Hetzner within AWS/GCP/Azure?"* The honest answer is **yes, on every cloud**. Every major cloud has a "cheap VPS with Docker" product. The research in this document got pulled toward Cloud Run and Fargate because those are the most visible "modern managed container" products — but they're **the wrong tool for our specific workload**:
+
+- **Our workload is stateful per-session agent containers with an idle pool**, not stateless HTTP microservices behind a load balancer.
+- **Our scaling story is vertical** (bigger VPS, or a small cluster of VPSes behind a load balancer when we need multi-tenant). Not auto-scale-to-zero for a single logical service.
+- **Our isolation story is per-container** (one container = one session = one user workspace). Not shared-process multi-tenancy.
+
+Cloud Run is designed for the opposite of every one of those characteristics. Fargate is closer but still forces S3 sync for session state because the orchestrator can't share a filesystem with the task. Both force architectural changes to the core runtime code. Neither buys us anything our users actually need.
+
+**The Hetzner CAX11 proof point from Item 10a already showed the right pattern:** cheap VPS + Docker + one deploy script + the existing `DockerContainerRuntime` working unchanged. The correct cloud strategy is to replicate that pattern across every cloud, not to build a different architecture for each cloud.
+
+### The cheap-VPS-with-Docker landscape (April 2026)
+
+Every cloud has a Hetzner equivalent, and the existing `DockerContainerRuntime` works identically on all of them:
+
+| Provider | Product | vCPU | RAM | SSD | Monthly (USD/EUR) |
+|---|---|---|---|---|---|
+| **Hetzner** (current) | Cloud CAX11 (ARM) | 2 | 4 GB | 40 GB | **€3.99** |
+| **Oracle Cloud** | Always Free Tier (A1) | 4 | 24 GB | 200 GB | **$0 forever** |
+| **DigitalOcean** | Basic Droplet | 1 | 1 GB | 25 GB | **$4** |
+| **DigitalOcean** | Basic Droplet | 2 | 2 GB | 60 GB | **$12** |
+| **Vultr** | Cloud Compute | 1 | 1 GB | 25 GB | **$6** |
+| **Linode/Akamai** | Nanode 1GB | 1 | 1 GB | 25 GB | **$5** |
+| **AWS** | Lightsail 1 GB | 2 | 1 GB | 40 GB | **$5** |
+| **AWS** | Lightsail 2 GB | 2 | 2 GB | 60 GB | **$10** |
+| **AWS** | Lightsail 4 GB | 2 | 4 GB | 80 GB | **$20** |
+| **AWS** | EC2 t4g.small (ARM) | 2 | 2 GB | EBS extra | ~$12 |
+| **GCP** | Compute Engine e2-micro | 0.25-2 burst | 1 GB | 30 GB | **$0-6** (free tier in us regions) |
+| **GCP** | Compute Engine e2-small | 0.5-2 burst | 2 GB | — | ~$13 |
+| **GCP** | Compute Engine e2-medium | 1-2 burst | 4 GB | — | ~$25 |
+| **Azure** | B1s VM | 1 | 1 GB | 64 GB | ~$7 |
+| **Azure** | B2s VM | 2 | 4 GB | 64 GB | ~$30 |
+| **Alibaba Cloud** | ECS burstable | 1 | 1 GB | 40 GB | ~$4 |
+
+All of these run Linux + Docker. All of them can be provisioned via a simple cloud CLI + cloud-init / user-data / startup-script pattern. **The existing `scripts/deploy-hetzner.sh` is the reference shape; every new cloud gets a ~300-line sibling script using that cloud's native CLI.**
+
+### New Item 10 sequence
+
+| Item | Target | Status |
+|---|---|---|
+| **10a** | Hetzner Cloud CAX11 / CX23 | ✅ Shipped (2026-04-15, commit `a639911`) |
+| **10b** | AWS Lightsail | 🔜 Next |
+| **10c** | Google Cloud Compute Engine | 🔜 Later |
+| **10d** | Azure Virtual Machines | 🔜 Later |
+| **10e** | DigitalOcean / Linode / Vultr / Oracle Cloud | 🔜 Later (any one or all) |
+| **10f+** | Cloud Run / Fargate / Cloudflare Containers | 🔜 Partnership-driven only, not core |
+
+Each sub-item is a ~300-line deploy script + ~200-line deploy guide + a README cost-comparison row with live-measured numbers. No orchestrator core changes. No new interfaces. No refactor.
+
+### What the Cloud Run / Fargate research is still useful for
+
+1. **If a specific cloud partner asks for native serverless integration** (AWS Marketplace requires Fargate, GCP Marketplace requires Cloud Run, etc.), we have a thorough record of the tradeoffs and a refactor plan we can execute. It's a **future option under the "10f+" bucket**, not the default path.
+2. **As an architectural decision record.** The research proves we evaluated the "modern managed container" products honestly and chose the simpler path deliberately. That matters for design reviews and future contributors who wonder why we didn't go serverless.
+3. **The gotchas and pricing tables** remain accurate sources for anyone evaluating those products for a different workload.
+
+### What we are NOT giving up
+
+- **"Multi-cloud support."** We support MORE clouds with VPSes than we would with Cloud Run + Fargate alone.
+- **"Scale-to-zero."** One small VPS ($4-13/mo) is cheaper than the baseline cost of almost any serverless product at our traffic levels, and the user can `stop` the VPS when idle if they really need zero cost.
+- **"Cheap deploys."** Every VPS option above is cheaper than the serverless per-session math for sustained use.
+- **Production-grade architecture.** The VPS pattern is what countless indie hackers and small SaaS products use to run production workloads; it's not a toy.
+
+### What we ARE deliberately giving up
+
+- **"First managed agent runtime on Cloud Run / Fargate / Cloudflare Containers"** marketing hooks. Minor. We can still make each of those work as a future partnership integration when it matters.
+- **Auto-scale without operator intervention.** If traffic exceeds a single VPS's capacity, the operator adds another VPS or upsizes. Single-tenant scope, this is fine.
+- **"Native serverless" vibes.** Our target audience is "I want to run my own managed agent runtime cheaply on whatever cloud I already have." That audience wants a VPS, not a Cloud Run service.
+
+### Action items flowing from this decision
+
+1. ✅ Mark this document as a superseded ADR (done, see the header).
+2. Update the plan file's Item 10 sub-tasks to the new VPS sequence.
+3. Update README's Status/Next section to list the new sub-items.
+4. Update the README's backend cost comparison table to preview the multi-VPS lineup.
+5. Ship Item 10b as AWS Lightsail deploy script + guide + live benchmark.
+6. Future items 10c–10e follow the same pattern.
+7. Cloud Run / Fargate / Cloudflare Containers / Container Apps become Item 10f+ — partnership-driven, bottom of the priority stack.
+
+**The research in sections 2–11 remains useful; the implementation plan in those sections does not. If you need to make a decision here, read sections 2, 3, and 13 only.**
