@@ -1,3 +1,5 @@
+import { chownSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import type { Container, Mount, SpawnOptions } from "../runtime/container.js";
 import { GatewayWsError } from "../runtime/gateway-ws.js";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
@@ -6,6 +8,17 @@ import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
 import type { AgentStore, RunUsage, SessionStore } from "../store/types.js";
 import type { SessionEventQueue } from "./event-queue.js";
 import type { AgentConfig, Session } from "./types.js";
+
+// UID of the non-root `openclaw` user inside the agent runtime image,
+// created by `useradd -r` in Dockerfile.runtime. Docker daemon on Linux
+// creates bind-mount source directories as root:root, which the openclaw
+// user inside the container cannot write to (`/workspace/openclaw.json:
+// Permission denied`). Docker Desktop on macOS uses virtiofs UID remapping
+// and sidesteps this, but Linux bind mounts preserve host UIDs literally.
+// Fix: before spawning the container, pre-create the session workspace
+// directory on the orchestrator's in-process mount view and chown it to
+// this UID. On macOS the chown is a harmless no-op.
+const AGENT_CONTAINER_UID = 999;
 
 export type RouterConfig = {
   /** Image reference for the OpenClaw agent container. */
@@ -205,6 +218,25 @@ export class AgentRouter {
       hostPath: `${this.cfg.hostStateRoot}/${agent.agentId}`,
       containerPath: "/workspace",
     };
+
+    // Pre-create the workspace directory on the orchestrator's in-process
+    // view of the same mount, and chown to the non-root UID that runs
+    // inside the agent container. Without this, Docker daemon on Linux
+    // creates the bind-mount source dir as root:root, and the agent
+    // container's openclaw user (UID 999) can't write openclaw.json there.
+    // See the AGENT_CONTAINER_UID comment for the full rationale.
+    const inProcessWorkspace = join(this.events.stateRoot, agent.agentId);
+    mkdirSync(inProcessWorkspace, { recursive: true, mode: 0o755 });
+    try {
+      chownSync(inProcessWorkspace, AGENT_CONTAINER_UID, AGENT_CONTAINER_UID);
+    } catch (err) {
+      // chown fails on Docker Desktop for Mac (virtiofs ignores UID changes)
+      // and in any userns-remapped environment. That's OK — the original
+      // permission problem only exists on plain Linux bind mounts.
+      console.warn(
+        `[router] chown(${inProcessWorkspace}, ${AGENT_CONTAINER_UID}) failed (non-fatal on Mac/userns): ${String(err)}`,
+      );
+    }
 
     // Inside the container, OpenClaw always sees itself as agent "main".
     // That is OpenClaw's DEFAULT_AGENT_ID — aligning with it means:

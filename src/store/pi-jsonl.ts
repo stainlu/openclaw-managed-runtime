@@ -58,7 +58,7 @@ type SessionsJsonEntry = {
 type SessionsJson = Record<string, SessionsJsonEntry>;
 
 export class PiJsonlEventReader {
-  constructor(private readonly stateRoot: string) {}
+  constructor(public readonly stateRoot: string) {}
 
   listBySession(agentId: string, sessionId: string): Event[] {
     const piSessionId = this.resolvePiSessionId(agentId, sessionId);
