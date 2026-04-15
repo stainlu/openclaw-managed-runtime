@@ -41,7 +41,14 @@ services:
       OPENCLAW_RUNTIME_IMAGE: ghcr.io/stainlu/openclaw-managed-runtime-agent:latest
       OPENCLAW_HOST_STATE_ROOT: ${PWD}/data/sessions
       OPENCLAW_GATEWAY_PORT: "18789"
-      OPENCLAW_READY_TIMEOUT_MS: "120000"
+      # 10 min container-ready timeout. Hetzner CAX11 fully boots Pi's
+      # SessionManager in ~60 s so this is unused there. Lightsail medium_3_0
+      # on burstable disk can take 3-5 min for the first cold spawn after
+      # deploy, and the orchestrator's container-ready wait was timing out
+      # at 120 s, failing turn 1 and forcing turn 2 to respawn (combined
+      # ~12 min user-visible latency before the first answer). This
+      # upper-bounds the grace period rather than tuning per-backend.
+      OPENCLAW_READY_TIMEOUT_MS: "600000"
       OPENCLAW_RUN_TIMEOUT_MS: "600000"
       # Item 12-14: URL the in-container call_agent CLI uses to reach the
       # orchestrator. Matches this service's container_name + port.
