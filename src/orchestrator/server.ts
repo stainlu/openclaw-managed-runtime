@@ -1,6 +1,15 @@
+import { randomBytes } from "node:crypto";
 import { serve } from "@hono/node-server";
-import { type Context, Hono } from "hono";
+import { type Context, Hono, type MiddlewareHandler } from "hono";
 import { streamSSE } from "hono/streaming";
+import { addContext, getLogger, withContext } from "../log.js";
+import {
+  agentsCreatedTotal,
+  httpRequestDurationSeconds,
+  httpRequestsTotal,
+  registry as metricsRegistry,
+  sessionEventsTotal,
+} from "../metrics.js";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
 import type { AgentStore, EnvironmentStore, SessionStore } from "../store/types.js";
@@ -18,6 +27,46 @@ import {
   type Event,
   type Session,
 } from "./types.js";
+
+const log = getLogger("server");
+
+function generateRequestId(): string {
+  return `req_${randomBytes(8).toString("hex")}`;
+}
+
+/**
+ * Per-request context middleware. Reads or generates an `x-request-id`,
+ * echoes it on the response, and wraps the downstream handlers in an
+ * AsyncLocalStorage scope so every log line picks it up automatically.
+ * Also records the request duration + status histogram for /metrics.
+ */
+const observabilityMiddleware: MiddlewareHandler = async (c, next) => {
+  const requestId = c.req.header("x-request-id") ?? generateRequestId();
+  c.res.headers.set("x-request-id", requestId);
+
+  // routePath prefers the matched pattern (e.g. "/v1/sessions/:sessionId"),
+  // falling back to the raw path when no route matched. Keeps label
+  // cardinality bounded — we never put user-supplied ids into metrics.
+  const routePath = c.req.routePath || c.req.path;
+  const endTimer = httpRequestDurationSeconds.startTimer({
+    method: c.req.method,
+    route: routePath,
+  });
+
+  await withContext({ requestId }, async () => {
+    try {
+      await next();
+    } finally {
+      const status = String(c.res.status);
+      endTimer();
+      httpRequestsTotal.inc({
+        method: c.req.method,
+        route: routePath,
+        status,
+      });
+    }
+  });
+};
 
 // Regex for client-supplied session keys on POST /v1/chat/completions. The
 // key is used verbatim as the orchestrator session id AND as the directory
@@ -140,6 +189,18 @@ function handleRouterError(err: unknown, c: Context): Response {
 export function buildApp(deps: ServerDeps): Hono {
   const app = new Hono();
 
+  // Register the observability middleware first so every downstream
+  // handler (including SSE streams) runs inside the request-id scope
+  // and contributes to http_requests_total / http_request_duration_seconds.
+  app.use("*", observabilityMiddleware);
+
+  // Prometheus scrape endpoint. Not auth-gated (matches /healthz) —
+  // operators firewall :8080 if the metrics should not be public.
+  app.get("/metrics", async (c) => {
+    c.header("Content-Type", metricsRegistry.contentType);
+    return c.body(await metricsRegistry.metrics());
+  });
+
   // Self-documenting root. A developer landing on the orchestrator gets the
   // full endpoint map without needing to read docs first.
   app.get("/", (c) =>
@@ -180,6 +241,7 @@ export function buildApp(deps: ServerDeps): Hono {
         },
         health: {
           liveness: "GET /healthz",
+          metrics: "GET /metrics",
         },
       },
     }),
@@ -196,10 +258,12 @@ export function buildApp(deps: ServerDeps): Hono {
       return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
     }
     const agent = deps.agents.create(parsed.data);
+    agentsCreatedTotal.inc();
+    addContext({ agentId: agent.agentId });
     // Pre-warm a container for this agent so the first session's cold-start
     // is eliminated. Fire-and-forget — failure is non-fatal.
     void deps.router.warmForAgent(agent.agentId).catch((err) => {
-      console.warn(`[server] warm-for-agent ${agent.agentId} failed (non-fatal):`, err);
+      log.warn({ err, agent_id: agent.agentId }, "warm-for-agent failed (non-fatal)");
     });
     return c.json(agentResponse(agent));
   });
@@ -368,8 +432,9 @@ export function buildApp(deps: ServerDeps): Hono {
       // Proactive warm-up: start booting the container in the background
       // so it's ready (or nearly ready) by the time the first event arrives.
       // Fire-and-forget — failure is non-fatal; the first event cold-spawns.
+      addContext({ agentId: parsed.data.agentId, sessionId: session.sessionId });
       void deps.router.warmSession(session.sessionId).catch((err) => {
-        console.warn(`[server] background warm-up for ${session.sessionId} failed (non-fatal):`, err);
+        log.warn({ err, session_id: session.sessionId }, "background warm-up failed (non-fatal)");
       });
       return c.json(sessionResponse(session, deps.events));
     } catch (err) {
@@ -414,6 +479,8 @@ export function buildApp(deps: ServerDeps): Hono {
       return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
     }
     const event = parsed.data;
+    addContext({ sessionId });
+    sessionEventsTotal.inc({ type: event.type });
 
     // Tool confirmation flow — resolves a pending approval gate inside
     // the container when the agent template has always_ask policy.
@@ -1005,5 +1072,5 @@ export type ListenOptions = {
 export async function startServer(deps: ServerDeps, opts: ListenOptions): Promise<void> {
   const app = buildApp(deps);
   serve({ fetch: app.fetch, port: opts.port });
-  console.log(`[orchestrator] listening on http://0.0.0.0:${opts.port}`);
+  log.info({ port: opts.port, url: `http://0.0.0.0:${opts.port}` }, "orchestrator listening");
 }

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getLogger, rootLogger } from "./log.js";
 import { SessionEventQueue } from "./orchestrator/event-queue.js";
 import { AgentRouter, type RouterConfig } from "./orchestrator/router.js";
 import { startServer } from "./orchestrator/server.js";
@@ -12,6 +13,8 @@ import {
   PiJsonlEventReader,
   type StoreBackend,
 } from "./store/index.js";
+
+const log = getLogger("index");
 
 function readPackageVersion(): string {
   // Resolve package.json relative to the compiled module location, so it works
@@ -212,13 +215,13 @@ async function main(): Promise<void> {
       try {
         eventReader.deleteBySession(session.agentId, sessionId);
       } catch (err) {
-        console.warn(
-          `[pool cleanup] deleting JSONL for ephemeral ${sessionId} failed:`,
-          err,
+        log.warn(
+          { err, session_id: sessionId },
+          "deleting JSONL for ephemeral session failed",
         );
       }
       store.sessions.delete(sessionId);
-      console.log(`[pool cleanup] reaped ephemeral session ${sessionId}`);
+      log.info({ session_id: sessionId }, "reaped ephemeral session");
     },
   });
 
@@ -251,38 +254,32 @@ async function main(): Promise<void> {
     routerCfg,
   );
 
-  console.log(`[orchestrator] OpenClaw Managed Agents v${version} starting`);
-  console.log(`[orchestrator] runtime image: ${runtimeImage}`);
-  console.log(`[orchestrator] docker network: ${network}`);
-  console.log(`[orchestrator] host state root: ${hostStateRoot}`);
-  console.log(`[orchestrator] state root (in-process): ${stateRoot}`);
-  console.log(`[orchestrator] orchestrator url (for in-container call_agent): ${orchestratorUrl}`);
-  console.log(
-    `[orchestrator] store: ${storeBackend}${storePath ? ` (${storePath})` : ""}`,
-  );
-  console.log(
-    `[orchestrator] pool: idleTimeout=${idleTimeoutMs}ms sweepInterval=${sweepIntervalMs}ms readyTimeout=${readyTimeoutMs}ms warmMax=${maxWarmContainers} warmIdleTimeout=${warmIdleTimeoutMs}ms`,
-  );
-  if (orphanedContainers > 0) {
-    console.log(
-      `[orchestrator] cleanup: reaped ${orphanedContainers} orphaned container(s) from a previous instance`,
-    );
-  }
-  if (orphaned > 0) {
-    console.log(
-      `[orchestrator] rehydration: marked ${orphaned} running session(s) as failed after restart`,
-    );
-  }
-  console.log(
-    `[orchestrator] forwarding provider env vars (${passthroughEnvKeys.length}): ${
-      passthroughEnvKeys.length > 0 ? passthroughEnvKeys.join(", ") : "(none detected)"
-    }`,
+  log.info(
+    {
+      version,
+      runtime_image: runtimeImage,
+      docker_network: network,
+      host_state_root: hostStateRoot,
+      state_root: stateRoot,
+      orchestrator_url: orchestratorUrl,
+      store: storeBackend,
+      store_path: storePath,
+      pool: {
+        idle_timeout_ms: idleTimeoutMs,
+        sweep_interval_ms: sweepIntervalMs,
+        ready_timeout_ms: readyTimeoutMs,
+        warm_max: maxWarmContainers,
+        warm_idle_timeout_ms: warmIdleTimeoutMs,
+      },
+      orphaned_containers_reaped: orphanedContainers,
+      orphaned_sessions_failed: orphaned,
+      passthrough_env_keys: passthroughEnvKeys,
+    },
+    `OpenClaw Managed Agents v${version} starting`,
   );
   if (passthroughEnvKeys.length === 0) {
-    console.log(
-      "[orchestrator] WARNING: no provider API keys detected in the host env. " +
-        "Export at least one (e.g. MOONSHOT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, " +
-        "GEMINI_API_KEY) before spawning agents, or runs will fail.",
+    log.warn(
+      "no provider API keys detected in the host env. Export at least one (e.g. MOONSHOT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY) before spawning agents, or runs will fail.",
     );
   }
 
@@ -305,12 +302,12 @@ async function main(): Promise<void> {
   // expose a close() reference in this codebase yet — in practice the
   // process.exit() call takes the listener down with it.
   const shutdown = (signal: string): void => {
-    console.log(`[orchestrator] received ${signal}, shutting down`);
+    log.info({ signal }, "shutting down");
     (async () => {
       try {
         await pool.shutdown();
       } catch (err) {
-        console.warn("[orchestrator] pool shutdown error:", err);
+        log.warn({ err }, "pool shutdown error");
       }
       store.close();
       process.exit(0);
@@ -321,6 +318,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error("[orchestrator] fatal:", err);
+  rootLogger.fatal({ err }, "orchestrator failed to start");
   process.exit(1);
 });

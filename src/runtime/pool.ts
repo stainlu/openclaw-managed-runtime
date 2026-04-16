@@ -1,5 +1,14 @@
+import { getLogger } from "../log.js";
+import {
+  poolAcquireTotal,
+  poolActiveContainers,
+  poolSpawnDurationSeconds,
+  poolWarmContainers,
+} from "../metrics.js";
 import type { Container, ContainerRuntime, SpawnOptions } from "./container.js";
 import { GatewayWebSocketClient, GatewayWsError } from "./gateway-ws.js";
+
+const log = getLogger("pool");
 
 // Per-session container lifecycle pool.
 //
@@ -98,7 +107,7 @@ export class SessionContainerPool {
   ) {
     this.sweeperHandle = setInterval(() => {
       void this.reapIdle().catch((err) => {
-        console.warn("[pool] reapIdle error:", err);
+        log.warn({ err }, "reapIdle error");
       });
     }, cfg.sweepIntervalMs);
     // Don't keep the event loop alive just for the sweeper — if nothing else
@@ -147,7 +156,8 @@ export class SessionContainerPool {
       spawnOptions,
       spawnedAt: Date.now(),
     });
-    console.log(`[pool] pre-warmed container for agent ${agentId}`);
+    poolWarmContainers.set(this.warm.size);
+    log.info({ agent_id: agentId }, "pre-warmed container for agent");
   }
 
   /**
@@ -164,6 +174,7 @@ export class SessionContainerPool {
     const existing = this.active.get(args.sessionId);
     if (existing) {
       existing.lastUsedAt = Date.now();
+      poolAcquireTotal.labels({ source: "active" }).inc();
       return existing.container;
     }
 
@@ -172,6 +183,7 @@ export class SessionContainerPool {
       const warmEntry = this.warm.get(args.agentId);
       if (warmEntry) {
         this.warm.delete(args.agentId);
+        poolWarmContainers.set(this.warm.size);
         const now = Date.now();
         this.active.set(args.sessionId, {
           sessionId: args.sessionId,
@@ -180,12 +192,15 @@ export class SessionContainerPool {
           spawnedAt: warmEntry.spawnedAt,
           lastUsedAt: now,
         });
-        console.log(
-          `[pool] claimed pre-warmed container for session ${args.sessionId} (agent ${args.agentId})`,
+        poolActiveContainers.set(this.active.size);
+        poolAcquireTotal.labels({ source: "warm" }).inc();
+        log.info(
+          { session_id: args.sessionId, agent_id: args.agentId },
+          "claimed pre-warmed container",
         );
         // Replenish the warm pool in the background.
         void this.warmForAgent(args.agentId, warmEntry.spawnOptions).catch((err) => {
-          console.warn(`[pool] warm-pool replenish failed for agent ${args.agentId}:`, err);
+          log.warn({ err, agent_id: args.agentId }, "warm-pool replenish failed");
         });
         return warmEntry.container;
       }
@@ -210,6 +225,7 @@ export class SessionContainerPool {
     sessionId: string;
     spawnOptions: SpawnOptions;
   }): Promise<Container> {
+    const spawnEnd = poolSpawnDurationSeconds.startTimer();
     const container = await this.runtime.spawn(args.spawnOptions);
     try {
       await this.runtime.waitForReady(container, this.cfg.readyTimeoutMs);
@@ -247,6 +263,9 @@ export class SessionContainerPool {
       spawnedAt: now,
       lastUsedAt: now,
     });
+    poolActiveContainers.set(this.active.size);
+    poolAcquireTotal.labels({ source: "spawn" }).inc();
+    spawnEnd();
     return container;
   }
 
@@ -274,11 +293,12 @@ export class SessionContainerPool {
     const entry = this.active.get(sessionId);
     if (!entry) return;
     this.active.delete(sessionId);
+    poolActiveContainers.set(this.active.size);
     await entry.wsClient.close().catch(() => {
       /* best-effort */
     });
     await this.runtime.stop(entry.container.id).catch((err) => {
-      console.warn(`[pool] stop ${entry.container.id} failed:`, err);
+      log.warn({ err, container_id: entry.container.id }, "pool stop failed");
     });
   }
 
@@ -323,15 +343,17 @@ export class SessionContainerPool {
       // lock, which is Item 7 scope (control endpoints) at the earliest.
       if (this.cfg.isBusy(entry.sessionId)) continue;
       this.active.delete(entry.sessionId);
+      poolActiveContainers.set(this.active.size);
       const idleSec = Math.round((now - entry.lastUsedAt) / 1000);
-      console.log(
-        `[pool] reaping idle container for session ${entry.sessionId} (idle ${idleSec}s)`,
+      log.info(
+        { session_id: entry.sessionId, idle_seconds: idleSec },
+        "reaping idle container",
       );
       await entry.wsClient.close().catch(() => {
         /* best-effort */
       });
       await this.runtime.stop(entry.container.id).catch((err) => {
-        console.warn(`[pool] reap stop ${entry.container.id} failed:`, err);
+        log.warn({ err, container_id: entry.container.id }, "reap stop failed");
       });
       // Notify the caller so it can clean up any per-session resources that
       // should NOT outlive the container. Item 8 uses this for ephemeral
@@ -340,9 +362,9 @@ export class SessionContainerPool {
         try {
           await this.cfg.cleanupOnReap(entry.sessionId);
         } catch (err) {
-          console.warn(
-            `[pool] cleanupOnReap for ${entry.sessionId} failed:`,
-            err,
+          log.warn(
+            { err, session_id: entry.sessionId },
+            "cleanupOnReap failed",
           );
         }
       }
@@ -380,15 +402,20 @@ export class SessionContainerPool {
     reason: "idle" | "cap-exceeded",
   ): Promise<void> {
     this.warm.delete(entry.agentId);
+    poolWarmContainers.set(this.warm.size);
     const ageSec = Math.round((Date.now() - entry.spawnedAt) / 1000);
-    console.log(
-      `[pool] reaping warm container for agent ${entry.agentId} (${reason}, age ${ageSec}s)`,
+    log.info(
+      { agent_id: entry.agentId, reason, age_seconds: ageSec },
+      "reaping warm container",
     );
     await entry.wsClient.close().catch(() => {
       /* best-effort */
     });
     await this.runtime.stop(entry.container.id).catch((err) => {
-      console.warn(`[pool] warm reap stop ${entry.container.id} failed:`, err);
+      log.warn(
+        { err, container_id: entry.container.id },
+        "warm reap stop failed",
+      );
     });
   }
 }

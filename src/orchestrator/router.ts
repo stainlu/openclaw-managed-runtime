@@ -1,5 +1,10 @@
 import { chownSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { addContext, getLogger, withCapturedContext } from "../log.js";
+import {
+  sessionRunDurationSeconds,
+  sessionRunFailuresTotal,
+} from "../metrics.js";
 import type { Container, Mount, SpawnOptions } from "../runtime/container.js";
 import { GatewayWsError } from "../runtime/gateway-ws.js";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
@@ -8,6 +13,8 @@ import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
 import type { AgentStore, EnvironmentStore, RunUsage, SessionStore } from "../store/types.js";
 import type { SessionEventQueue } from "./event-queue.js";
 import type { AgentConfig, Session } from "./types.js";
+
+const log = getLogger("router");
 
 // UID of the non-root `openclaw` user inside the agent runtime image,
 // created by `useradd -r` in Dockerfile.runtime. Docker daemon on Linux
@@ -136,12 +143,12 @@ export class AgentRouter {
   async warmSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
-      console.warn(`[router] warmSession: session ${sessionId} not found, skipping warm-up`);
+      log.warn({ session_id: sessionId }, "warmSession: session not found, skipping warm-up");
       return;
     }
     const agent = this.agents.get(session.agentId);
     if (!agent) {
-      console.warn(`[router] warmSession: agent ${session.agentId} not found, skipping warm-up`);
+      log.warn({ session_id: sessionId, agent_id: session.agentId }, "warmSession: agent not found, skipping warm-up");
       return;
     }
     const spawnOptions = this.buildSpawnOptions(sessionId, agent, session);
@@ -236,9 +243,18 @@ export class AgentRouter {
 
     // Idle path: start a new run.
     const runningSession = this.sessions.beginRun(args.sessionId) ?? session;
+    addContext({ sessionId: args.sessionId, agentId: agent.agentId });
 
-    void this.executeInBackground(args.sessionId, agent, args.content, args.model)
-      .catch((err) => this.handleBackgroundFailure(args.sessionId, err));
+    // Capture the current context (request-id + session/agent) so that the
+    // fire-and-forget background task's logs carry the same identifiers
+    // as the HTTP handler that kicked it off.
+    const runInBackground = withCapturedContext(() =>
+      this.executeInBackground(args.sessionId, agent, args.content, args.model),
+    );
+    const handleFailure = withCapturedContext((err: unknown) =>
+      this.handleBackgroundFailure(args.sessionId, err),
+    );
+    void runInBackground().catch(handleFailure);
 
     return { session: runningSession, queued: false };
   }
@@ -439,7 +455,10 @@ export class AgentRouter {
           const list = this.pendingApprovals.get(sessionId) ?? [];
           list.push({ approvalId, sessionId, toolName, description, arrivedAt: Date.now() });
           this.pendingApprovals.set(sessionId, list);
-          console.log(`[router] approval request for session ${sessionId}: tool=${toolName} id=${approvalId}`);
+          log.info(
+            { session_id: sessionId, tool_name: toolName, approval_id: approvalId },
+            "tool approval requested",
+          );
         });
       }
     }
@@ -472,13 +491,16 @@ export class AgentRouter {
 
     // Run the completion. On failure, do NOT evict here — the failure
     // handler decides whether to evict based on whether the session was
-    // also cancelled in flight.
+    // also cancelled in flight. Time the whole invocation so /metrics
+    // exposes session_run_duration_seconds as a histogram.
+    const runEnd = sessionRunDurationSeconds.startTimer();
     const completion = await this.invokeChatCompletions({
       baseUrl: container.baseUrl,
       token: container.token,
       content,
       sessionKey: sessionId,
     });
+    runEnd();
 
     // Item 9 — cost accounting. Pi's provider plugins compute the
     // authoritative per-turn cost from their catalogs (cache-aware: a
@@ -542,14 +564,17 @@ export class AgentRouter {
     const dropped = this.queue.clear(sessionId);
     this.pendingApprovals.delete(sessionId);
     if (dropped > 0) {
-      console.warn(
-        `[router] dropped ${dropped} queued event(s) for failed session ${sessionId}`,
+      log.warn(
+        { session_id: sessionId, dropped_events: dropped },
+        "dropped queued events for failed session",
       );
     }
     void this.pool.evictSession(sessionId).catch(() => {
       /* best-effort */
     });
     const msg = err instanceof Error ? err.message : String(err);
+    sessionRunFailuresTotal.inc();
+    log.error({ session_id: sessionId, err }, "session run failed");
     this.sessions.endRunFailure(sessionId, msg);
   }
 

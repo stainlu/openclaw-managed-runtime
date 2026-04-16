@@ -187,6 +187,8 @@ The SSE stream emits an initial status event on connect and checks for status tr
 
 **Persistent state.** SQLite (WAL mode) for agent templates, environments, and session metadata. Pi's JSONL files for the event log. Both survive orchestrator restarts. Pre-built multi-arch images (amd64 + arm64) published to GHCR on every push to `main`.
 
+**Observability.** Structured pino logs in JSON (production) or pretty TTY (dev); every log line carries `request_id`, `agent_id`, `session_id` automatically via AsyncLocalStorage. Prometheus metrics at `GET /metrics` — HTTP counters + duration histograms, pool active/warm gauges, spawn + run duration histograms, per-source pool-acquire counters. See [docs/architecture.md#observability](./docs/architecture.md#observability).
+
 ## Deploy
 
 Three one-command deploy scripts, each using the same `DockerContainerRuntime` and the same multi-arch GHCR images.

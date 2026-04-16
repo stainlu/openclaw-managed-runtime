@@ -574,6 +574,49 @@ Future upstream contributions (nice-to-have, not blocking):
 - **Real-time delta forwarding** — an HTTP/SSE wrapper around Pi's `AgentSessionEvent` bus would let `GET /v1/sessions/:id/events?stream=true` and `POST /v1/chat/completions stream=true` forward token-by-token deltas instead of polling the JSONL.
 - **`sessions.compact` and `sessions.navigateTree`** exposed over the gateway WS control plane — currently there's no WS handler for compact or branch, which is why the runtime's control surface stops at cancel + steer + send + patch.
 
+## Observability
+
+Structured logs, per-request correlation, and Prometheus metrics. No tracing yet — open for a future item.
+
+### Logs (`src/log.ts`)
+
+- [pino](https://getpino.io) with JSON output in production (`NODE_ENV=production`) and pretty-printed TTY in dev. Log level via `OPENCLAW_LOG_LEVEL` (default `info`).
+- Every line carries `service: "openclaw-managed-agents"`, `module: "<router|pool|server|index>"`, `level`, `time`, and `msg`. When relevant, `request_id`, `agent_id`, `session_id` are automatically mixed in from the active AsyncLocalStorage scope — callers never thread those by hand.
+- `getLogger(module)` — child logger per file. `rootLogger` — unscoped, used for fatal-at-startup lines only.
+- `withContext({requestId, agentId?, sessionId?}, fn)` — run `fn` (and every awaited descendant) under a scope where the given fields appear on every log line. The server middleware wraps every request in one; the router adds session/agent ids via `addContext({sessionId, agentId})` once the handler resolves them.
+- `withCapturedContext(fn)` — capture the current scope into a closure so a fire-and-forget continuation (`void promise.catch()`, `setTimeout`) keeps the same `request_id` when it eventually runs. Used in `router.runEvent` to carry request id through the background `executeInBackground` task, so a client trace stays one request id end-to-end.
+
+### Request id
+
+Every HTTP response includes an `x-request-id` header. If the client supplies one, it's honored; otherwise the server generates `req_<8-byte-hex>`. The same id threads into every log line for that request via AsyncLocalStorage. Clients correlating across multiple orchestrator logs (e.g., in `docker compose logs openclaw-orchestrator | jq 'select(.request_id == "req_xxx")'`) get a single request's full story without extra instrumentation.
+
+### Metrics (`src/metrics.ts`, `GET /metrics`)
+
+Prometheus text format at `GET /metrics` (no auth gate — same as `/healthz`, operators firewall the port if metrics should not be public). Served from a process-wide [`prom-client`](https://github.com/siimon/prom-client) `Registry` with `collectDefaultMetrics` attached, so Node process metrics (CPU seconds, RSS, heap usage, event-loop lag) land for free.
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `http_requests_total` | counter | `method`, `route`, `status` | Server middleware, every request |
+| `http_request_duration_seconds` | histogram | `method`, `route` | Same middleware |
+| `pool_active_containers` | gauge | — | Mutations of `SessionContainerPool.active` |
+| `pool_warm_containers` | gauge | — | Mutations of `SessionContainerPool.warm` |
+| `pool_acquire_total` | counter | `source=active\|warm\|spawn` | `acquireForSession` — one of the three branches it took |
+| `pool_spawn_duration_seconds` | histogram | — | `doSpawn` (runtime.spawn + waitForReady + WS handshake) |
+| `session_run_duration_seconds` | histogram | — | `router.executeInBackground` around `invokeChatCompletions` |
+| `session_run_failures_total` | counter | — | `handleBackgroundFailure` |
+| `agents_created_total` | counter | — | `POST /v1/agents` |
+| `session_events_total` | counter | `type=user.message\|user.tool_confirmation` | `POST /v1/sessions/:id/events` |
+
+Label cardinality is deliberately bounded: `route` is the matched Hono pattern (`/v1/sessions/:sessionId`), never the raw URL, so user-supplied ids don't explode the series count.
+
+### Scraping
+
+```bash
+curl -s http://<orchestrator>:8080/metrics | head
+```
+
+The output is standard Prometheus text format with version `0.0.4`. Any Prometheus server, Grafana Agent, VictoriaMetrics, or OpenTelemetry Collector with a Prometheus receiver can scrape it.
+
 ## Testing
 
 The project has two layers of tests that serve different purposes.
@@ -583,6 +626,8 @@ The project has two layers of tests that serve different purposes.
 - `src/runtime/parent-token.test.ts` — HMAC round-trip, rejection of tampered / expired / malformed / wrong-secret tokens, allowlist + depth edge cases.
 - `src/orchestrator/event-queue.test.ts` — FIFO order, per-session isolation, clear semantics.
 - `src/store/pi-jsonl.test.ts` — JSONL fixture files in a tmp dir; asserts user/assistant/tool/toolResult parsing, empty-content assistant message drop (Pi auto-retry noise), malformed-line recovery, `latestAgentMessage` reverse scan, `deleteBySession` removal of both JSONL and `sessions.json` entry.
+- `src/log.test.ts` — AsyncLocalStorage context: `withContext` propagation, `addContext` mutation semantics, parallel-scope isolation, `withCapturedContext` deferred-execution binding, nested-scope shadowing.
+- `src/metrics.test.ts` — Prometheus registry: expected metric names present, default Node.js process metrics attached, `service` label set, counter/gauge/histogram render correctly to the scrape endpoint.
 
 Run via `pnpm test`. Adding a new test module is just dropping a `*.test.ts` file alongside the source; vitest discovers it automatically.
 
