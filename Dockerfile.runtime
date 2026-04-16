@@ -86,9 +86,11 @@ RUN chmod +x /usr/local/bin/openclaw-call-agent
 # template has `permissionPolicy: { type: "always_ask" }`. The plugin
 # registers a before_tool_call hook that returns requireApproval for
 # matching tools, pausing the agent until the orchestrator resolves it.
-RUN mkdir -p /home/openclaw/.config/openclaw/extensions/confirm-tools
-COPY docker/confirm-tools-plugin/ /home/openclaw/.config/openclaw/extensions/confirm-tools/
-RUN chown -R openclaw:openclaw /home/openclaw/.config
+# The plugin files are staged here at build time. The entrypoint copies
+# them to /workspace/extensions/ (the actual discovery path, which is
+# $OPENCLAW_STATE_DIR/extensions/) at startup, after the bind mount is
+# in place and owned by the openclaw user.
+COPY docker/confirm-tools-plugin/ /opt/openclaw-plugins/confirm-tools/
 
 USER openclaw
 WORKDIR /workspace

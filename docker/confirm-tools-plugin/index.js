@@ -9,7 +9,7 @@
 // This plugin is installed by the Dockerfile at build time and conditionally
 // enabled by the entrypoint when the agent template has `always_ask` policy.
 
-import { definePluginEntry } from "openclaw/plugin-sdk";
+import { definePluginEntry } from "openclaw/plugin-sdk/core";
 
 const raw = (process.env.OPENCLAW_CONFIRM_TOOLS || "").trim();
 const confirmAll = raw === "__ALL__";

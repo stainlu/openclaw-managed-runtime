@@ -233,6 +233,17 @@ cat "${CONFIG_PATH}"
 export OPENCLAW_CONFIG_PATH="${CONFIG_PATH}"
 export OPENCLAW_STATE_DIR="${STATE_DIR}"
 
+# Item 19: copy the confirm-tools plugin into the workspace extensions dir.
+# OpenClaw discovers plugins from $OPENCLAW_STATE_DIR/extensions/ (resolveConfigDir
+# returns OPENCLAW_STATE_DIR when set). The plugin files are staged at build
+# time under /opt/openclaw-plugins/ and copied here at startup so they land
+# inside the bind-mounted workspace.
+if [ -n "${OPENCLAW_CONFIRM_TOOLS:-}" ] && [ -d /opt/openclaw-plugins/confirm-tools ]; then
+  echo "[entrypoint] installing confirm-tools plugin to ${STATE_DIR}/extensions/"
+  mkdir -p "${STATE_DIR}/extensions/confirm-tools"
+  cp -r /opt/openclaw-plugins/confirm-tools/* "${STATE_DIR}/extensions/confirm-tools/"
+fi
+
 # Item 15: install environment packages if OPENCLAW_PACKAGES_JSON is set.
 # The JSON has optional keys: pip, apt, npm (each an array of package specs).
 # Runs BEFORE the gateway boots so packages are available when the agent starts.
