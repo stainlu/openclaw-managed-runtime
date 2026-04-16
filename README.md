@@ -2,6 +2,8 @@
 
 The open alternative to Claude Managed Agents. Run autonomous AI agents via API — any model, any cloud, open source.
 
+Built on [OpenClaw](https://github.com/openclaw/openclaw), the most popular open-source AI agent framework.
+
 ## Why this exists
 
 Anthropic's [Claude Managed Agents](https://www.anthropic.com/engineering/managed-agents) is Claude-only, Anthropic-hosted, and charges $0.08/session-hour on top of tokens. OpenClaw Managed Agents is the open counter: same architectural pattern (stateless orchestrator + per-session container + append-only event log), but you pick the model, you pick the cloud, and there's no platform tax.
@@ -14,6 +16,11 @@ Anthropic's [Claude Managed Agents](https://www.anthropic.com/engineering/manage
 | Platform tax | $0.08/session-hour | None |
 | Data | Anthropic's infrastructure | Your disk, your VPC, your control |
 | Multi-agent | Research preview (gated) | GA — inspectable child sessions, allowlists, depth caps |
+| Permission policy | `always_allow` + `always_ask` | `always_allow` + `deny` + `always_ask` |
+| Subagent observability | Opaque (tool result only) | First-class — every child session is inspectable via the same API |
+| Event types | 12+ types | 10 types + synthetic session status events |
+| Agent versioning | Immutable history | Immutable history + optimistic concurrency + archive |
+| SDK | 7 languages + CLI | OpenAI drop-in (any language with an OpenAI SDK) |
 
 ## Quick start
 
@@ -77,10 +84,10 @@ Four primitives, matching Claude Managed Agents' model:
 
 | Concept | What it is | API |
 |---|---|---|
-| **Agent** | Reusable config: model, instructions, tools, delegation rules. Versioned — updates create immutable history. | `POST/GET/PATCH/DELETE /v1/agents` |
+| **Agent** | Reusable config: model, instructions, tools, permission policy, delegation rules. Versioned — updates create immutable history. | `POST/GET/PATCH/DELETE /v1/agents` |
 | **Environment** | Container config: packages (pip/apt/npm), networking. Composed with agents at session time. | `POST/GET/DELETE /v1/environments` |
 | **Session** | A running agent in an environment. Long-lived, multi-turn, one container per session. | `POST/GET/DELETE /v1/sessions` |
-| **Event** | Messages in and out of a session. SSE streaming. Queue-on-busy. | `POST/GET /v1/sessions/:id/events` |
+| **Event** | Messages, tool calls, thinking blocks, status changes in and out of a session. SSE streaming. | `POST/GET /v1/sessions/:id/events` |
 
 ## API reference
 
@@ -89,14 +96,21 @@ The orchestrator is self-documenting — `curl http://localhost:8080/` returns t
 **Agents** (versioned, archivable)
 
 ```
-POST   /v1/agents                         # { model, instructions, tools?, name?, callableAgents?, maxSubagentDepth? }
+POST   /v1/agents                         # create
+       body: { model, instructions, tools?, name?,
+               permissionPolicy?, callableAgents?, maxSubagentDepth? }
 GET    /v1/agents                         # list all
 GET    /v1/agents/:id                     # get latest version
-PATCH  /v1/agents/:id                     # { version, ...fields } — bumps version, 409 on conflict
+PATCH  /v1/agents/:id                     # update — { version, ...fields }, 409 on conflict
 GET    /v1/agents/:id/versions            # immutable version history
-POST   /v1/agents/:id/archive             # soft-delete; blocks new sessions, existing ones continue
-DELETE /v1/agents/:id                     # hard-delete with all versions
+POST   /v1/agents/:id/archive             # soft-delete; blocks new sessions
+DELETE /v1/agents/:id                     # hard-delete
 ```
+
+Permission policy options for `permissionPolicy`:
+- `{"type":"always_allow"}` (default) — all tools execute automatically
+- `{"type":"deny","tools":["bash","write"]}` — specified tools are blocked entirely
+- `{"type":"always_ask","tools":["bash"]}` — specified tools pause for client confirmation via `user.tool_confirmation`
 
 **Environments** (container configuration)
 
@@ -114,11 +128,15 @@ POST   /v1/sessions                       # { agentId, environmentId? }
 GET    /v1/sessions                       # list all
 GET    /v1/sessions/:id                   # status, output, rolling tokens, cost_usd
 DELETE /v1/sessions/:id                   # tears down container + data
-POST   /v1/sessions/:id/events            # { content, model? } — queues if busy, auto-drains
+POST   /v1/sessions/:id/events            # send message or tool confirmation (see below)
 GET    /v1/sessions/:id/events            # full event history
 GET    /v1/sessions/:id/events?stream=true  # SSE: catch-up + live tail-follow
 POST   /v1/sessions/:id/cancel            # abort in-flight run
 ```
+
+POST events accepts two event types:
+- `{"content":"...","model":"..."}` — user message (triggers agent loop, optional model override)
+- `{"type":"user.tool_confirmation","toolUseId":"...","result":"allow"}` — resolve a pending tool confirmation
 
 **OpenAI compatibility**
 
@@ -126,23 +144,48 @@ POST   /v1/sessions/:id/cancel            # abort in-flight run
 POST   /v1/chat/completions              # OpenAI SDK drop-in (x-openclaw-agent-id header required)
 ```
 
+## Event types
+
+Events from `GET /v1/sessions/:id/events` and the SSE stream:
+
+| Type | Source | Description |
+|---|---|---|
+| `user.message` | JSONL | Client message posted via POST /events |
+| `agent.message` | JSONL | Agent's text response with tokens, cost, model |
+| `agent.tool_use` | JSONL | Tool invocation: name, arguments, call ID |
+| `agent.tool_result` | JSONL | Tool execution result (content, isError) |
+| `agent.thinking` | JSONL | Thinking blocks (when model supports extended thinking) |
+| `agent.tool_confirmation_request` | Orchestrator | Tool paused for client approval (`always_ask` policy) |
+| `session.model_change` | JSONL | Model switched mid-session |
+| `session.thinking_level_change` | JSONL | Thinking mode toggled |
+| `session.compaction` | JSONL | Context compaction summary |
+| `session.status_idle` | SSE only | Session transitioned to idle |
+| `session.status_running` | SSE only | Session transitioned to running |
+| `session.status_failed` | SSE only | Session transitioned to failed |
+
+The SSE stream emits an initial status event on connect and checks for status transitions on every yielded event and every 15-second heartbeat.
+
 ## Key features
 
 **Agent versioning.** Every update creates an immutable version. Optimistic concurrency via `version` field on PATCH. List the full history. Archive agents without losing data.
 
+**Permission policy.** Three modes: `always_allow` (default), `deny` (block specific tools entirely), and `always_ask` (pause for client confirmation before executing specific tools). The `always_ask` flow uses OpenClaw's `before_tool_call` plugin hook with `requireApproval` — the agent blocks, the orchestrator surfaces a confirmation request via SSE, and the client resolves it via `user.tool_confirmation`.
+
 **Environments.** Declare packages (`pip`, `apt`, `npm`) and networking policy per environment. Compose any agent with any environment at session creation. Packages install inside the container before the agent boots.
 
-**Session pool.** One Docker container per session, reused across turns. First turn pays the container startup (~40s); subsequent turns reuse the warm container (~4s). Proactive warm-up starts the container at session-create time, not at first-event time.
+**Pre-warmed container pool.** When an agent is created, a container boots in the background. The first session on that agent claims the pre-warmed container instead of cold-spawning. After claiming, the pool replenishes automatically. Idle containers are reaped after 10 minutes. Pool reuse measured at 4s vs 78s cold-start.
 
-**Delegated subagents.** An agent can delegate tasks to other agents via the `openclaw-call-agent` CLI. Children are first-class sessions — fully inspectable through the same API. Allowlists, depth caps, and HMAC-signed tokens enforce who can call whom.
+**Delegated subagents.** An agent can delegate tasks to other agents via the `openclaw-call-agent` CLI. Children are first-class sessions — fully inspectable through the same API. Allowlists, depth caps, and HMAC-signed tokens enforce who can call whom. Unlike Claude Managed Agents, subagent transcripts are not hidden behind an opaque tool result.
 
-**SSE streaming.** `GET /v1/sessions/:id/events?stream=true` catches up on past events then tail-follows new ones in real time. 15-second heartbeats keep proxies alive.
+**Rich event stream.** 10 event types from the JSONL (messages, tool calls, tool results, thinking blocks, model changes, compaction summaries) plus synthetic session status events in the SSE stream. `GET /v1/sessions/:id/events?stream=true` catches up on past events then tail-follows new ones in real time.
 
 **Cancel + queue.** Cancel aborts the in-flight run via the WebSocket control plane. Events posted to a busy session queue automatically and drain in order.
 
 **Per-turn cost.** Each session tracks rolling `tokens_in`, `tokens_out`, and `cost_usd` from the provider's own billing data — cache-aware, not a static price sheet.
 
-**OpenAI SDK drop-in.** Point any OpenAI SDK at `http://<host>:8080/v1` with an `x-openclaw-agent-id` header. Sticky sessions via the `user` field.
+**OpenAI SDK drop-in.** Point any OpenAI SDK at `http://<host>:8080/v1` with an `x-openclaw-agent-id` header. Sticky sessions via the `user` field. Emulated streaming (`stream: true`).
+
+**Persistent state.** SQLite (WAL mode) for agent templates, environments, and session metadata. Pi's JSONL files for the event log. Both survive orchestrator restarts. Pre-built multi-arch images (amd64 + arm64) published to GHCR on every push to `main`.
 
 ## Deploy
 
@@ -151,7 +194,7 @@ Two one-command deploy scripts, verified on real infrastructure with measured nu
 ### Hetzner Cloud (from $4/month)
 
 ```bash
-export HCLOUD_TOKEN=<your-token>          # console.hetzner.cloud → Security → API Tokens
+export HCLOUD_TOKEN=<your-token>          # console.hetzner.cloud -> Security -> API Tokens
 export MOONSHOT_API_KEY=sk-...            # or any provider key
 ./scripts/deploy-hetzner.sh
 ```
@@ -187,20 +230,40 @@ Developer
    | HTTP API (Hono)
    v
 Orchestrator
-   |
-   |-- AgentStore + EnvironmentStore + SessionStore (SQLite)
-   |-- SessionContainerPool (one Docker container per session)
-   |-- GatewayWebSocketClient (cancel, model override)
+   |-- AgentStore + EnvironmentStore + SessionStore (SQLite, WAL)
+   |-- SessionContainerPool (per-session active + per-agent pre-warmed)
+   |-- GatewayWebSocketClient (cancel, model override, tool confirmation)
    |-- PiJsonlEventReader (event log, cost, SSE)
+   |-- ParentTokenMinter (HMAC-SHA256 subagent auth)
    |
    v
 OpenClaw containers (one per session)
-   - Full agent loop (tool use, multi-turn)
+   - Full agent loop (tool use, multi-turn, thinking)
    - Pi SessionManager (append-only JSONL)
    - Session resume from JSONL across container restarts
+   - confirm-tools plugin (always_ask policy enforcement)
+   - call-agent CLI (delegated subagent spawning)
 ```
 
 The orchestrator is stateless — all durable state lives in SQLite (agents, environments, sessions) and Pi's JSONL files (events). Pre-built multi-arch images (amd64 + arm64) are published to GHCR on every push to `main`.
+
+## Test status
+
+28 end-to-end checks, all passing against real Moonshot Kimi K2.5:
+
+- Session-centric resume (multi-turn memory across turns)
+- Cost accounting from provider billing data
+- SQLite persistence across orchestrator restart
+- Container pool reuse (41s faster than cold-start)
+- SSE live event streaming
+- Cancel via WebSocket control plane
+- Event queue with ordered drain
+- OpenAI SDK compatibility (shape, multi-turn memory, streaming, queue race)
+- Delegated subagents (inspectable child sessions)
+- Rich event stream (tool_use + tool_result events)
+- Subagent allowlist rejection
+- Agent versioning (create, update, no-op detection, conflict rejection, archive)
+- Environment abstraction (CRUD, session binding, deletion rejection, backward compat)
 
 ## Relationship to OpenClaw
 
