@@ -1,4 +1,4 @@
-# OpenClaw Managed Runtime — orchestrator image
+# OpenClaw Managed Agents — orchestrator image
 #
 # Thin Node service that exposes the managed-agent API and spawns one
 # Dockerfile.runtime container per agent.
@@ -35,7 +35,7 @@ COPY --from=builder /app/dist ./dist
 ENV NODE_ENV=production \
     PORT=8080 \
     OPENCLAW_DOCKER_NETWORK=openclaw-net \
-    OPENCLAW_RUNTIME_IMAGE=openclaw-managed-runtime/agent:latest \
+    OPENCLAW_RUNTIME_IMAGE=openclaw-managed-agents/agent:latest \
     OPENCLAW_HOST_STATE_ROOT=/var/openclaw/sessions \
     OPENCLAW_GATEWAY_PORT=18789
 

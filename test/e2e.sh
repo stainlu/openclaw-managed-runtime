@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end verification for OpenClaw Managed Runtime (session-centric API).
+# End-to-end verification for OpenClaw Managed Agents (session-centric API).
 #
 # Flow:
 #   1. Create an agent template.

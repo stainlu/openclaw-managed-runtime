@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-managed-runtime",
+  "name": "openclaw-managed-agents",
   "version": "0.1.0-dev",
   "description": "The open alternative to Claude Managed Agents — an API-first managed agent runtime on top of OpenClaw.",
   "license": "MIT",
@@ -7,7 +7,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "openclaw-managed-runtime": "dist/index.js"
+    "openclaw-managed-agents": "dist/index.js"
   },
   "engines": {
     "node": ">=22.14.0"
@@ -19,8 +19,8 @@
     "test": "vitest run",
     "test:e2e": "bash test/e2e.sh",
     "lint": "tsc --noEmit -p tsconfig.json",
-    "docker:build-runtime": "docker build -f Dockerfile.runtime -t openclaw-managed-runtime/agent:latest .",
-    "docker:build-orchestrator": "docker build -f Dockerfile.orchestrator -t openclaw-managed-runtime/orchestrator:latest .",
+    "docker:build-runtime": "docker build -f Dockerfile.runtime -t openclaw-managed-agents/agent:latest .",
+    "docker:build-orchestrator": "docker build -f Dockerfile.orchestrator -t openclaw-managed-agents/orchestrator:latest .",
     "docker:build": "pnpm docker:build-runtime && pnpm docker:build-orchestrator"
   },
   "dependencies": {

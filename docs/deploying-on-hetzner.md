@@ -1,6 +1,6 @@
 # Deploying on Hetzner Cloud
 
-Run a full OpenClaw Managed Runtime on a **€3.99/month** Hetzner CAX11 (ARM Ampere) — the cheapest credible production backend for the runtime. One command, about 6 minutes end-to-end from zero.
+Run a full OpenClaw Managed Agents on a **€3.99/month** Hetzner CAX11 (ARM Ampere) — the cheapest credible production backend for the runtime. One command, about 6 minutes end-to-end from zero.
 
 This is the **Item 10a proof point** for the runtime's "open and cheap" positioning: the same code you run locally also runs on a €4 VPS in a German datacenter, handling real agent sessions with real provider APIs. No AWS account. No session-hour tax. No vendor lock-in.
 
@@ -18,7 +18,7 @@ This is the **Item 10a proof point** for the runtime's "open and cheap" position
 
 **Why CAX11 specifically**: it is Hetzner's absolute cheapest production-grade shared-vCPU tier. ARM Ampere cores are the same cores that power AWS Graviton and Oracle A1 — modern, power-efficient, and tuned for server workloads. On equal specs (2 vCPU / 4 GB / 40 GB), CAX11 at €3.99/mo net is **~20% cheaper than the Intel-x86 CX23 at €4.99/mo net**, and 50% cheaper than CPX11 at €6.99/mo. Scale up the same ARM line to **CAX21** (4 vCPU / 8 GB, ~€8/mo), **CAX31** (8 vCPU / 16 GB, ~€16/mo), or **CAX41** (16 vCPU / 32 GB, ~€30/mo) if you need more concurrency — same deploy script, just override `HCLOUD_SERVER_TYPE`.
 
-**ARM compatibility**: OpenClaw Managed Runtime ships multi-arch Docker images. Node 22, better-sqlite3, OpenClaw core, and Pi all build cleanly on ARM64 Linux. If you prefer Intel x86, override `HCLOUD_SERVER_TYPE=cx23` (€4.99/mo net) — same specs, same image build path, slightly more expensive.
+**ARM compatibility**: OpenClaw Managed Agents ships multi-arch Docker images. Node 22, better-sqlite3, OpenClaw core, and Pi all build cleanly on ARM64 Linux. If you prefer Intel x86, override `HCLOUD_SERVER_TYPE=cx23` (€4.99/mo net) — same specs, same image build path, slightly more expensive.
 
 ## Prerequisites
 
@@ -70,13 +70,13 @@ This is the **Item 10a proof point** for the runtime's "open and cheap" position
 ## Quick deploy
 
 ```bash
-cd openclaw-managed-runtime
+cd openclaw-managed-agents
 
 # One-command deploy. Idempotent — re-running reuses the existing server.
 ./scripts/deploy-hetzner.sh
 
 # Optional flags (environment variables):
-#   HCLOUD_SERVER_NAME=openclaw-managed-runtime    # default; change to run multiple deploys
+#   HCLOUD_SERVER_NAME=openclaw-managed-agents    # default; change to run multiple deploys
 #   HCLOUD_LOCATION=nbg1                           # nbg1 | fsn1 | hel1 | ash | hil
 #   HCLOUD_SERVER_TYPE=cax11                       # cax11 (ARM, default, cheapest) | cax21 | cax31 | cax41 | cx23 | cx33 (Intel x86)
 #   OPENCLAW_DEPLOY_BRANCH=main                    # git branch to clone on the server
@@ -90,9 +90,9 @@ Expected output (timings on a fresh run, EU location):
     HCLOUD_TOKEN:      ok
     SSH public key:    ~/.ssh/id_ed25519.pub
     Provider key:      MOONSHOT_API_KEY
-==> Registering SSH key with Hetzner project (openclaw-managed-runtime-key)
+==> Registering SSH key with Hetzner project (openclaw-managed-agents-key)
 ==> Rendering cloud-init user-data with MOONSHOT_API_KEY
-==> Provisioning cax11 server in nbg1 (openclaw-managed-runtime)
+==> Provisioning cax11 server in nbg1 (openclaw-managed-agents)
     IPv4:              5.75.123.45
     IPv6:              2a01:4f8:c0c:abc::1
 ==> Waiting for cloud-init to install Docker + bring up the stack (~4 min)
@@ -103,7 +103,7 @@ Expected output (timings on a fresh run, EU location):
 ==> Deploy complete
     Orchestrator:      http://5.75.123.45:8080
     Monthly cost:      €3.99 (€0.007/hr) — EU location
-    Destroy with:      hcloud server delete openclaw-managed-runtime
+    Destroy with:      hcloud server delete openclaw-managed-agents
 ```
 
 ## Validating the deploy
@@ -171,7 +171,7 @@ The Hetzner path is **~17x cheaper on compute** for an idle-heavy chat workload.
 ## Tearing down
 
 ```bash
-hcloud server delete openclaw-managed-runtime
+hcloud server delete openclaw-managed-agents
 # Or: ./scripts/deploy-hetzner.sh --destroy
 ```
 
@@ -184,20 +184,20 @@ If you want to understand what the script does, the underlying commands are:
 ```bash
 # 1. Register your SSH key (once per project)
 hcloud ssh-key create \
-  --name openclaw-managed-runtime-key \
+  --name openclaw-managed-agents-key \
   --public-key-from-file ~/.ssh/id_ed25519.pub
 
 # 2. Provision the server with cloud-init user-data
 hcloud server create \
-  --name openclaw-managed-runtime \
+  --name openclaw-managed-agents \
   --type cax11 \
   --image ubuntu-24.04 \
   --location nbg1 \
-  --ssh-key openclaw-managed-runtime-key \
+  --ssh-key openclaw-managed-agents-key \
   --user-data-from-file ./scripts/hetzner-cloud-init.yaml
 
 # 3. Grab the IP
-IP=$(hcloud server describe openclaw-managed-runtime -o json | jq -r .public_net.ipv4.ip)
+IP=$(hcloud server describe openclaw-managed-agents -o json | jq -r .public_net.ipv4.ip)
 
 # 4. Wait for cloud-init to finish Docker install + docker compose up
 while ! curl -sf "http://${IP}:8080/healthz" >/dev/null; do sleep 5; done

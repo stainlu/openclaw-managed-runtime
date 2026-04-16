@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy-aws-lightsail.sh — one-command deploy of the OpenClaw Managed Runtime
+# deploy-aws-lightsail.sh — one-command deploy of the OpenClaw Managed Agents
 # to an AWS Lightsail instance. Idempotent: re-running reuses the existing
 # instance if present.
 #
@@ -13,13 +13,13 @@
 #     ./scripts/deploy-aws-lightsail.sh --destroy  # tear down
 #
 # Environment variables (all optional except AWS creds + a provider key):
-#     LIGHTSAIL_INSTANCE_NAME=openclaw-managed-runtime    # run multiple deploys by setting different names
+#     LIGHTSAIL_INSTANCE_NAME=openclaw-managed-agents    # run multiple deploys by setting different names
 #     LIGHTSAIL_REGION=us-east-1                          # us-east-1 | us-east-2 | eu-west-1 | etc.
 #     LIGHTSAIL_AVAILABILITY_ZONE=us-east-1a              # must match region
 #     LIGHTSAIL_BUNDLE_ID=medium_3_0                      # nano_3_0 ($5) | micro_3_0 ($7) | small_3_0 ($12, 2GB) | medium_3_0 ($24, 4GB) | large_3_0 ($44, 8GB)
 #     LIGHTSAIL_BLUEPRINT_ID=ubuntu_24_04
 #     OPENCLAW_DEPLOY_BRANCH=main                         # git branch to clone on the instance
-#     OPENCLAW_DEPLOY_REPO=https://github.com/stainlu/openclaw-managed-runtime.git
+#     OPENCLAW_DEPLOY_REPO=https://github.com/stainlu/openclaw-managed-agents.git
 #
 # See docs/deploying-on-aws-lightsail.md for the full walkthrough.
 
@@ -29,12 +29,12 @@ set -euo pipefail
 # Configuration (with overridable defaults)
 # ------------------------------------------------------------------------------
 
-INSTANCE_NAME="${LIGHTSAIL_INSTANCE_NAME:-openclaw-managed-runtime}"
+INSTANCE_NAME="${LIGHTSAIL_INSTANCE_NAME:-openclaw-managed-agents}"
 REGION="${LIGHTSAIL_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 AVAILABILITY_ZONE="${LIGHTSAIL_AVAILABILITY_ZONE:-${REGION}a}"
 BUNDLE_ID="${LIGHTSAIL_BUNDLE_ID:-medium_3_0}"
 BLUEPRINT_ID="${LIGHTSAIL_BLUEPRINT_ID:-ubuntu_24_04}"
-REPO_URL="${OPENCLAW_DEPLOY_REPO:-https://github.com/stainlu/openclaw-managed-runtime.git}"
+REPO_URL="${OPENCLAW_DEPLOY_REPO:-https://github.com/stainlu/openclaw-managed-agents.git}"
 REPO_BRANCH="${OPENCLAW_DEPLOY_BRANCH:-main}"
 ORCH_PORT=8080
 
@@ -249,7 +249,7 @@ else
         --blueprint-id "${BLUEPRINT_ID}" \
         --bundle-id "${BUNDLE_ID}" \
         --user-data "${USER_DATA}" \
-        --tags 'key=managed-by,value=openclaw-managed-runtime' >/dev/null
+        --tags 'key=managed-by,value=openclaw-managed-agents' >/dev/null
 
     # Wait for Lightsail to finish provisioning the instance. Poll state until
     # it's "running", which means the VM is up and cloud-init has started.

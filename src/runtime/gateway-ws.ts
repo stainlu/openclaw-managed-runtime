@@ -238,7 +238,7 @@ export class GatewayWebSocketClient {
             // so the relaxed device-auth path is contained.
             client: {
               id: "openclaw-tui",
-              displayName: this.cfg.clientName ?? "openclaw-managed-runtime",
+              displayName: this.cfg.clientName ?? "openclaw-managed-agents",
               version: this.cfg.clientVersion ?? "0.0.0",
               platform: "node",
               mode: "ui",

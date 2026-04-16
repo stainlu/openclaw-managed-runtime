@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# OpenClaw Managed Runtime — container entrypoint
+# OpenClaw Managed Agents — container entrypoint
 #
 # Reads the agent's configuration from environment variables, writes a minimal
 # openclaw.json to the state directory, exports OPENCLAW_CONFIG_PATH so the CLI

@@ -7,7 +7,7 @@ export type Mount = {
 };
 
 export type SpawnOptions = {
-  /** Container image reference, e.g. "openclaw-managed-runtime/agent:latest". */
+  /** Container image reference, e.g. "openclaw-managed-agents/agent:latest". */
   image: string;
   /** Environment variables injected into the container. */
   env: Record<string, string>;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy-hetzner.sh — one-command deploy of the OpenClaw Managed Runtime to a
+# deploy-hetzner.sh — one-command deploy of the OpenClaw Managed Agents to a
 # Hetzner Cloud CX22 VPS. Idempotent: re-running reuses the existing server.
 #
 # Usage:
@@ -10,12 +10,12 @@
 #     ./scripts/deploy-hetzner.sh --destroy  # tear down
 #
 # Environment variables (all optional except HCLOUD_TOKEN + a provider key):
-#     HCLOUD_SERVER_NAME=openclaw-managed-runtime   # run multiple deploys by setting different names
+#     HCLOUD_SERVER_NAME=openclaw-managed-agents   # run multiple deploys by setting different names
 #     HCLOUD_LOCATION=nbg1                          # nbg1 | fsn1 | hel1 | ash | hil
 #     HCLOUD_SERVER_TYPE=cax11                      # cax11 (ARM, default, cheapest) | cax21 | cax31 | cx23 | cx33 (Intel x86)
 #     HCLOUD_IMAGE=ubuntu-24.04
 #     OPENCLAW_DEPLOY_BRANCH=main                   # git branch to clone on the server
-#     OPENCLAW_DEPLOY_REPO=https://github.com/stainlu/openclaw-managed-runtime.git
+#     OPENCLAW_DEPLOY_REPO=https://github.com/stainlu/openclaw-managed-agents.git
 #
 # See docs/deploying-on-hetzner.md for the full walkthrough.
 
@@ -25,12 +25,12 @@ set -euo pipefail
 # Configuration (with overridable defaults)
 # ------------------------------------------------------------------------------
 
-SERVER_NAME="${HCLOUD_SERVER_NAME:-openclaw-managed-runtime}"
-SSH_KEY_NAME="${HCLOUD_SERVER_NAME:-openclaw-managed-runtime}-key"
+SERVER_NAME="${HCLOUD_SERVER_NAME:-openclaw-managed-agents}"
+SSH_KEY_NAME="${HCLOUD_SERVER_NAME:-openclaw-managed-agents}-key"
 LOCATION="${HCLOUD_LOCATION:-nbg1}"
 SERVER_TYPE="${HCLOUD_SERVER_TYPE:-cax11}"
 IMAGE="${HCLOUD_IMAGE:-ubuntu-24.04}"
-REPO_URL="${OPENCLAW_DEPLOY_REPO:-https://github.com/stainlu/openclaw-managed-runtime.git}"
+REPO_URL="${OPENCLAW_DEPLOY_REPO:-https://github.com/stainlu/openclaw-managed-agents.git}"
 REPO_BRANCH="${OPENCLAW_DEPLOY_BRANCH:-main}"
 ORCH_PORT=8080
 

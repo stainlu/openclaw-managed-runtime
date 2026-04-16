@@ -1,6 +1,6 @@
 # Deploying on AWS Lightsail
 
-Run the OpenClaw Managed Runtime on an **AWS Lightsail** instance for **$5–$24/month** — AWS's own "cheap VPS with Docker" product, priced as a fixed monthly bundle and designed for exactly the workloads that Item 10a proved on Hetzner. One command, about 6 minutes end-to-end from zero.
+Run the OpenClaw Managed Agents on an **AWS Lightsail** instance for **$5–$24/month** — AWS's own "cheap VPS with Docker" product, priced as a fixed monthly bundle and designed for exactly the workloads that Item 10a proved on Hetzner. One command, about 6 minutes end-to-end from zero.
 
 This is the **Item 10b deploy target**. It uses the same `DockerContainerRuntime` the Hetzner path uses, so the runtime behavior is identical — you're only switching the underlying VPS provider. If you already know `scripts/deploy-hetzner.sh`, this script is a one-for-one mirror with the AWS CLI instead of the Hetzner CLI.
 
@@ -70,13 +70,13 @@ This is the **Item 10b deploy target**. It uses the same `DockerContainerRuntime
 ## Quick deploy
 
 ```bash
-cd openclaw-managed-runtime
+cd openclaw-managed-agents
 
 # One-command deploy. Idempotent — re-running reuses the existing instance.
 ./scripts/deploy-aws-lightsail.sh
 
 # Optional flags (environment variables):
-#   LIGHTSAIL_INSTANCE_NAME=openclaw-managed-runtime  # default; change to run multiple deploys
+#   LIGHTSAIL_INSTANCE_NAME=openclaw-managed-agents  # default; change to run multiple deploys
 #   LIGHTSAIL_REGION=us-east-1                        # us-east-1 | us-east-2 | eu-west-1 | eu-central-1 | ap-northeast-1 | ...
 #   LIGHTSAIL_AVAILABILITY_ZONE=us-east-1a            # must match region (append a/b/c to region)
 #   LIGHTSAIL_BUNDLE_ID=medium_3_0                    # nano_3_0 ($5) | micro_3_0 ($7) | small_3_0 ($12, 2GB) | medium_3_0 ($24, 4GB) | large_3_0 ($44, 8GB)
@@ -98,7 +98,7 @@ Expected output (timings on a fresh run, `us-east-1`, `medium_3_0`):
     Bundle:            medium_3_0
     Blueprint:         ubuntu_24_04
 ==> Rendering cloud-init user-data with MOONSHOT_API_KEY
-==> Provisioning medium_3_0 instance in us-east-1a (openclaw-managed-runtime)
+==> Provisioning medium_3_0 instance in us-east-1a (openclaw-managed-agents)
 ==> Waiting for Lightsail to bring the instance to running state
     state:             running (after 6 probes)
     IPv4:              54.196.x.x
@@ -167,7 +167,7 @@ curl -s "$ORCH/v1/sessions/$SESSION/events" \
 
 **Why Lightsail's first-turn is ~4× slower than Hetzner's.** `medium_3_0` runs on a shared-burstable vCPU with EBS-backed storage (~5-15 ms per I/O operation). Pi's `SessionManager` reads provider catalogs, skill manifests, and auth config from disk during boot — on Hetzner CAX11's local NVMe this completes in ~60 seconds; on Lightsail's burstable SSD it takes 3-5 minutes. Subsequent turns reuse the already-booted container from the orchestrator's session pool and complete in 4-5 seconds on both backends.
 
-**The deploy uses pre-built images from GHCR** — `ghcr.io/stainlu/openclaw-managed-runtime-{orchestrator,agent}:latest`, published by `.github/workflows/publish-images.yaml` on every push to `main`. Deploy time dropped from ~12 min (earlier build-from-source baseline) to ~5 min because `npm install -g openclaw@2026.4.11` (6.5 min of the original 12) no longer runs on the target VM. CPU burst credits also stay full for the first turn, shortening cold-spawn time as a side effect.
+**The deploy uses pre-built images from GHCR** — `ghcr.io/stainlu/openclaw-managed-agents-{orchestrator,agent}:latest`, published by `.github/workflows/publish-images.yaml` on every push to `main`. Deploy time dropped from ~12 min (earlier build-from-source baseline) to ~5 min because `npm install -g openclaw@2026.4.11` (6.5 min of the original 12) no longer runs on the target VM. CPU burst credits also stay full for the first turn, shortening cold-spawn time as a side effect.
 
 **The orchestrator's `OPENCLAW_READY_TIMEOUT_MS` is set to 600 seconds (10 minutes)** on every deploy specifically to accommodate Lightsail's slow first-turn. Hetzner never hits the old 120-second timeout, so the bump is free there; Lightsail needed it to avoid failing the first turn and forcing an immediate respawn.
 
@@ -188,7 +188,7 @@ For an idle-heavy chat session (5 minutes of active turn time per hour, 10 sessi
 
 ```bash
 ./scripts/deploy-aws-lightsail.sh --destroy
-# or: aws lightsail delete-instance --instance-name openclaw-managed-runtime
+# or: aws lightsail delete-instance --instance-name openclaw-managed-agents
 ```
 
 Lightsail bills in hourly increments — if you destroy an instance after 1 hour of testing, the total cost is about **$0.035** for the `medium_3_0` bundle (or $0.017 for `small_3_0`). Keep the instance running only as long as you need it.
@@ -208,32 +208,32 @@ packages:
   - curl
 runcmd:
   - curl -fsSL https://get.docker.com | sh
-  - git clone https://github.com/stainlu/openclaw-managed-runtime.git /opt/openclaw
+  - git clone https://github.com/stainlu/openclaw-managed-agents.git /opt/openclaw
   - cd /opt/openclaw && echo "MOONSHOT_API_KEY=$MOONSHOT_API_KEY" > .env && docker compose up -d --build
 CLOUDINIT
 )"
 
 # 2. Create the instance
 aws lightsail create-instances \
-  --instance-names openclaw-managed-runtime \
+  --instance-names openclaw-managed-agents \
   --availability-zone us-east-1a \
   --blueprint-id ubuntu_24_04 \
   --bundle-id medium_3_0 \
   --user-data "$USER_DATA" \
-  --tags 'key=managed-by,value=openclaw-managed-runtime'
+  --tags 'key=managed-by,value=openclaw-managed-agents'
 
 # 3. Wait for it to reach 'running' state
-while [ "$(aws lightsail get-instance --instance-name openclaw-managed-runtime --query 'instance.state.name' --output text)" != "running" ]; do
+while [ "$(aws lightsail get-instance --instance-name openclaw-managed-agents --query 'instance.state.name' --output text)" != "running" ]; do
   sleep 5
 done
 
 # 4. Open port 8080 (and keep 22 open for SSH)
 aws lightsail put-instance-public-ports \
-  --instance-name openclaw-managed-runtime \
+  --instance-name openclaw-managed-agents \
   --port-infos 'fromPort=22,toPort=22,protocol=tcp' 'fromPort=8080,toPort=8080,protocol=tcp'
 
 # 5. Get the public IP
-IP=$(aws lightsail get-instance --instance-name openclaw-managed-runtime --query 'instance.publicIpAddress' --output text)
+IP=$(aws lightsail get-instance --instance-name openclaw-managed-agents --query 'instance.publicIpAddress' --output text)
 
 # 6. Wait for the orchestrator healthz
 while ! curl -sf "http://${IP}:8080/healthz" >/dev/null; do sleep 5; done

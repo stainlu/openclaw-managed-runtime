@@ -6,8 +6,8 @@ name: publish-images
 # deploy time from ~12 minutes to ~2-3 minutes.
 #
 # Packages land at:
-#   ghcr.io/stainlu/openclaw-managed-runtime-orchestrator:{latest,sha-<sha>}
-#   ghcr.io/stainlu/openclaw-managed-runtime-agent:{latest,sha-<sha>}
+#   ghcr.io/stainlu/openclaw-managed-agents-orchestrator:{latest,sha-<sha>}
+#   ghcr.io/stainlu/openclaw-managed-agents-agent:{latest,sha-<sha>}
 #
 # After the first successful publish, make both packages public in the GitHub
 # UI (user profile -> Packages -> each package -> Package settings ->
@@ -45,10 +45,10 @@ jobs:
         include:
           - name: orchestrator
             dockerfile: Dockerfile.orchestrator
-            image: openclaw-managed-runtime-orchestrator
+            image: openclaw-managed-agents-orchestrator
           - name: agent
             dockerfile: Dockerfile.runtime
-            image: openclaw-managed-runtime-agent
+            image: openclaw-managed-agents-agent
 
     steps:
       - name: Checkout

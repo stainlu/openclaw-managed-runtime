@@ -129,10 +129,10 @@ export function buildApp(deps: ServerDeps): Hono {
   // full endpoint map without needing to read docs first.
   app.get("/", (c) =>
     c.json({
-      name: "OpenClaw Managed Runtime",
+      name: "OpenClaw Managed Agents",
       description: "The open alternative to Claude Managed Agents.",
       version: deps.version,
-      docs: "https://github.com/stainlu/openclaw-managed-runtime",
+      docs: "https://github.com/stainlu/openclaw-managed-agents",
       endpoints: {
         agents: {
           create: "POST /v1/agents",

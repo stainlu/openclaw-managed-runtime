@@ -1,4 +1,4 @@
-# Local development stack for OpenClaw Managed Runtime.
+# Local development stack for OpenClaw Managed Agents.
 #
 # Brings up:
 #   - orchestrator: the managed-agent HTTP API on http://localhost:8080
@@ -28,7 +28,7 @@ services:
     # both images from the Dockerfiles below, tagging them with the same
     # GHCR names. You do NOT need GHCR credentials for local builds; the
     # image tag just happens to point at a public registry path.
-    image: ghcr.io/stainlu/openclaw-managed-runtime-orchestrator:latest
+    image: ghcr.io/stainlu/openclaw-managed-agents-orchestrator:latest
     build:
       context: .
       dockerfile: Dockerfile.orchestrator
@@ -38,7 +38,7 @@ services:
     environment:
       PORT: "8080"
       OPENCLAW_DOCKER_NETWORK: openclaw-net
-      OPENCLAW_RUNTIME_IMAGE: ghcr.io/stainlu/openclaw-managed-runtime-agent:latest
+      OPENCLAW_RUNTIME_IMAGE: ghcr.io/stainlu/openclaw-managed-agents-agent:latest
       OPENCLAW_HOST_STATE_ROOT: ${PWD}/data/sessions
       OPENCLAW_GATEWAY_PORT: "18789"
       # 10 min container-ready timeout. Hetzner CAX11 fully boots Pi's
@@ -101,7 +101,7 @@ services:
   # --build` is used. The service itself runs `true` and exits immediately —
   # compose still pulls/builds the image and tags it for later use.
   ensure-agent-image:
-    image: ghcr.io/stainlu/openclaw-managed-runtime-agent:latest
+    image: ghcr.io/stainlu/openclaw-managed-agents-agent:latest
     build:
       context: .
       dockerfile: Dockerfile.runtime

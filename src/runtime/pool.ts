@@ -127,7 +127,7 @@ export class SessionContainerPool {
     const wsClient = new GatewayWebSocketClient({
       baseUrl: container.baseUrl,
       token: container.token,
-      clientName: "openclaw-managed-runtime",
+      clientName: "openclaw-managed-agents",
     });
     try {
       await wsClient.connect();

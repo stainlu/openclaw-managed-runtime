@@ -1,4 +1,4 @@
-# OpenClaw Managed Runtime — agent container image
+# OpenClaw Managed Agents — agent container image
 #
 # This image runs ONE OpenClaw gateway in API-only mode, serving a single agent
 # configured at container startup time via environment variables. The orchestrator
@@ -6,7 +6,7 @@
 # volume so containers are disposable.
 #
 # Build:
-#   docker build -f Dockerfile.runtime -t openclaw-managed-runtime/agent:latest .
+#   docker build -f Dockerfile.runtime -t openclaw-managed-agents/agent:latest .
 
 FROM node:22-slim
 

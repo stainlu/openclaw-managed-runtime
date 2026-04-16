@@ -467,7 +467,7 @@ const spawnOptions: SpawnOptions = {
   env,
   workspace,
   containerPort: this.cfg.gatewayPort,
-  labels: { "session-id": sessionId, "agent-id": agent.agentId, "managed-by": "openclaw-managed-runtime" },
+  labels: { "session-id": sessionId, "agent-id": agent.agentId, "managed-by": "openclaw-managed-agents" },
 };
 ```
 
@@ -687,7 +687,7 @@ Both research briefs were explicit about which numbers are secondary-sourced or 
 
 ## 13. Decision (2026-04-15, evening)
 
-**The refactor proposed in sections 5–7 was rejected. We will NOT build `SessionFileStore`, `WorkspaceProvisioner`, a Cloud Run adapter, or a Fargate adapter as core backends.** Instead, OpenClaw Managed Runtime targets **multi-provider cheap VPSes** as its cloud story, reusing the existing `DockerContainerRuntime` unchanged.
+**The refactor proposed in sections 5–7 was rejected. We will NOT build `SessionFileStore`, `WorkspaceProvisioner`, a Cloud Run adapter, or a Fargate adapter as core backends.** Instead, OpenClaw Managed Agents targets **multi-provider cheap VPSes** as its cloud story, reusing the existing `DockerContainerRuntime` unchanged.
 
 ### Why the refactor was the wrong answer
 

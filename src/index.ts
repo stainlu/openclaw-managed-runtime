@@ -115,7 +115,7 @@ async function main(): Promise<void> {
     "OPENCLAW_ORCHESTRATOR_URL",
     `http://openclaw-orchestrator:${port}`,
   );
-  const runtimeImage = env("OPENCLAW_RUNTIME_IMAGE", "openclaw-managed-runtime/agent:latest");
+  const runtimeImage = env("OPENCLAW_RUNTIME_IMAGE", "openclaw-managed-agents/agent:latest");
   // hostStateRoot is the host-side path, needed by dockerode for bind
   // mounts on spawned agent containers. The actual Docker daemon resolves
   // paths against the host filesystem, not the orchestrator's.
@@ -136,7 +136,7 @@ async function main(): Promise<void> {
   await runtime.ensureNetwork();
 
   // Reap any containers left behind by a previous orchestrator instance.
-  // Matched by the `managed-by=openclaw-managed-runtime` label so we do not
+  // Matched by the `managed-by=openclaw-managed-agents` label so we do not
   // touch anything else running on the host's Docker daemon.
   const orphanedContainers = await runtime.cleanupOrphaned();
 
@@ -223,7 +223,7 @@ async function main(): Promise<void> {
     routerCfg,
   );
 
-  console.log(`[orchestrator] OpenClaw Managed Runtime v${version} starting`);
+  console.log(`[orchestrator] OpenClaw Managed Agents v${version} starting`);
   console.log(`[orchestrator] runtime image: ${runtimeImage}`);
   console.log(`[orchestrator] docker network: ${network}`);
   console.log(`[orchestrator] host state root: ${hostStateRoot}`);

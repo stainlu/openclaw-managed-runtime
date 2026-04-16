@@ -56,7 +56,7 @@ One container per session, reused across turns. The first event on a session spa
 
 The pool has **no direct dependency on the store**. It takes an `isBusy: (sessionId) => boolean` predicate in config; `index.ts` closes over the session store to provide it. This keeps the runtime layer decoupled from the orchestrator layer. `cleanupOnReap` follows the same shape — the pool calls the callback and lets the caller decide what cleanup means.
 
-Orphan reaping: at startup, `DockerContainerRuntime.cleanupOrphaned()` finds any containers left behind by a previous orchestrator process (matched by the `managed-by=openclaw-managed-runtime` Docker label) and stops them.
+Orphan reaping: at startup, `DockerContainerRuntime.cleanupOrphaned()` finds any containers left behind by a previous orchestrator process (matched by the `managed-by=openclaw-managed-agents` Docker label) and stops them.
 
 ### GatewayWebSocketClient (`src/runtime/gateway-ws.ts`)
 
@@ -108,7 +108,7 @@ The architectural payoff: the "observability gap" documented by [three open issu
 
 ### DockerContainerRuntime (`src/runtime/docker.ts`)
 
-`dockerode`-backed implementation of the `ContainerRuntime` interface. Spawns containers on `openclaw-net` (a Docker bridge), labels them `managed-by=openclaw-managed-runtime` for orphan detection, caps memory at 2 GiB and PIDs at 512, waits for `/readyz` on the gateway port. `cleanupOrphaned()` is called by `index.ts` at startup — it's a concrete method on the Docker implementation, not on the interface, because the Docker-label filter is backend-specific.
+`dockerode`-backed implementation of the `ContainerRuntime` interface. Spawns containers on `openclaw-net` (a Docker bridge), labels them `managed-by=openclaw-managed-agents` for orphan detection, caps memory at 2 GiB and PIDs at 512, waits for `/readyz` on the gateway port. `cleanupOrphaned()` is called by `index.ts` at startup — it's a concrete method on the Docker implementation, not on the interface, because the Docker-label filter is backend-specific.
 
 The interface is the seam for cloud backends (ECS, Cloud Run, Container Apps, ECI, VKE) — new backends are drop-in alongside `docker.ts` without touching the pool, router, or server.
 
@@ -475,6 +475,6 @@ The runtime is provider-agnostic. To switch a running agent or the smoke default
 1. Export the matching API key on the host (e.g. `export OPENAI_API_KEY=sk-...`). `docker-compose.yml` forwards every common provider env var into the orchestrator by default.
 2. Change `OPENCLAW_MODEL` in `Dockerfile.runtime` (or override per-agent in the `POST /v1/agents` body), e.g. `openai/gpt-5.4`, `anthropic/claude-sonnet-4-6`, `google/gemini-2.5-pro`, `bedrock/anthropic.claude-sonnet-4-6`, `openrouter/moonshotai/kimi-k2.5`.
 3. If the provider is Category B (see "Provider plugin categories" above), extend `PROVIDER_BLOCK_JSON` in `docker/entrypoint.sh` with the equivalent `models.providers.<id>` block.
-4. Rebuild the runtime image: `docker build -f Dockerfile.runtime -t openclaw-managed-runtime/agent:latest .`
+4. Rebuild the runtime image: `docker build -f Dockerfile.runtime -t openclaw-managed-agents/agent:latest .`
 
 No orchestrator changes are required for Category A providers.

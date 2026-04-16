@@ -1,4 +1,4 @@
-# OpenClaw Managed Runtime
+# OpenClaw Managed Agents
 
 **The open alternative to Claude Managed Agents.** An API-first managed agent runtime built on top of OpenClaw.
 
@@ -8,11 +8,11 @@
 
 ## What this is
 
-OpenClaw Managed Runtime is an API-first service that runs agent tasks on demand. A developer sends an HTTP request to create an agent, submits a task, and receives results — with sandboxed tool execution, persistent sessions, and credential isolation, all without managing infrastructure.
+OpenClaw Managed Agents is an API-first service that runs agent tasks on demand. A developer sends an HTTP request to create an agent, submits a task, and receives results — with sandboxed tool execution, persistent sessions, and credential isolation, all without managing infrastructure.
 
 It is the open counter to Anthropic's Claude Managed Agents:
 
-| | Claude Managed Agents | OpenClaw Managed Runtime |
+| | Claude Managed Agents | OpenClaw Managed Agents |
 |---|---|---|
 | Model | Claude only | Any model (Bedrock, Gemini, Qwen, GPT, ...) |
 | Cloud | Anthropic-hosted only | Any cloud (AWS, GCP, Azure, Aliyun, Volcengine, self-hosted) |
@@ -196,8 +196,8 @@ print(r.choices[0].message.content)  # "Alice"
 Requires: Docker, Node 22+, and an API key for at least one provider OpenClaw supports. The default smoke path uses Moonshot Kimi K2.5 (`moonshot/kimi-k2.5`) because it works from any country Moonshot supports without needing a cloud account. Any OpenClaw provider works — just swap the `model` field and export the matching key.
 
 ```bash
-git clone https://github.com/stainlu/openclaw-managed-runtime
-cd openclaw-managed-runtime
+git clone https://github.com/stainlu/openclaw-managed-agents
+cd openclaw-managed-agents
 pnpm install
 
 # Pick your provider (examples — you only need one).
@@ -309,7 +309,7 @@ This is the "open and cheap" proof point for the runtime. Same code, same archit
 | Architecture | Docker + `DockerContainerRuntime` | Docker + `DockerContainerRuntime` (identical) |
 
 **Architectural notes:**
-- **Pre-built images**. Both the orchestrator image (`ghcr.io/stainlu/openclaw-managed-runtime-orchestrator`) and the agent runtime image (`ghcr.io/stainlu/openclaw-managed-runtime-agent`) are published to GHCR as public, multi-arch (linux/amd64 + linux/arm64) packages by `.github/workflows/publish-images.yaml` on every push to `main`. Deploy scripts run `docker compose pull && docker compose up -d`, never rebuild on the target VM. This cut Lightsail deploy time from ~12 min (build-from-source) to ~5 min, and avoids depleting CPU burst credits on burstable-disk backends.
+- **Pre-built images**. Both the orchestrator image (`ghcr.io/stainlu/openclaw-managed-agents-orchestrator`) and the agent runtime image (`ghcr.io/stainlu/openclaw-managed-agents-agent`) are published to GHCR as public, multi-arch (linux/amd64 + linux/arm64) packages by `.github/workflows/publish-images.yaml` on every push to `main`. Deploy scripts run `docker compose pull && docker compose up -d`, never rebuild on the target VM. This cut Lightsail deploy time from ~12 min (build-from-source) to ~5 min, and avoids depleting CPU burst credits on burstable-disk backends.
 - **Every VPS backend runs the same `DockerContainerRuntime` unchanged.** The cloud strategy is "any Linux VPS with Docker," not "native integration with each cloud's proprietary container product." Serverless container products (Cloud Run, Fargate, Cloudflare Containers, Azure Container Apps) are Item 10f+ and only ship if a specific partner requires them — their architectures force a rewrite of the orchestrator's storage layer for no user-visible benefit at our stateful-session-pool workload shape. See [`docs/cloud-backends.md`](./docs/cloud-backends.md) for the full decision record.
 - **Hetzner first-turn is ~4× faster than Lightsail first-turn** (78 s vs 294 s) because Hetzner's CX22/CAX11 use dedicated vCPU + local NVMe, while Lightsail's `medium_3_0` uses shared burstable vCPU + EBS-equivalent SSD. The orchestrator's `OPENCLAW_READY_TIMEOUT_MS` is set to 600 s (10 min) to give burstable-disk backends enough grace. Pool-reuse turns are identical on both clouds (~4-5 s).
 - **Lightsail costs ~5-6× more than Hetzner for equivalent specs** ($24/mo vs €3.99/mo). The AWS brand, native Bedrock proximity, and AWS Marketplace listing are the reasons you'd pick Lightsail over Hetzner; if you just want the cheapest VPS, use Hetzner or Oracle Cloud (free tier).
@@ -320,7 +320,7 @@ This is the "open and cheap" proof point for the runtime. Same code, same archit
 
 ## Delegated subagents
 
-> **Every agent in OpenClaw Managed Runtime is an inspectable session. That includes subagents.**
+> **Every agent in OpenClaw Managed Agents is an inspectable session. That includes subagents.**
 > Unlike Claude Managed Agents, there are no opaque delegated runs — you can subscribe to
 > `GET /v1/sessions/<any_session_id>/events?stream=true` in real time, whether the session
 > was created by a client or by another agent's `call_agent` tool call. The "black box
@@ -462,7 +462,7 @@ This is **early development**, but the runtime is end-to-end functional and ever
 - **Delegated subagents as first-class inspectable sessions** (Items 12-14). `callableAgents` + `maxSubagentDepth` on agent templates, HMAC-signed parent tokens, `openclaw-call-agent` CLI tool inside the container. Zero new HTTP endpoints; subagents spawn through the existing `POST /v1/sessions` + `POST /events` primitives. See [Delegated subagents](#delegated-subagents) above.
 - **Hetzner Cloud deploy path** (Item 10a). `scripts/deploy-hetzner.sh` + `docs/deploying-on-hetzner.md`. One command takes zero → live runtime on a **€3.99/month Hetzner CAX11** (ARM Ampere) or **€4.99/month CX23** (Intel x86) in ~4 minutes (build-from-source baseline; pre-built images cut this further). Reuses the existing `DockerContainerRuntime` end-to-end. Verified live on 2026-04-15: 78 s cold turn, 4 s pool-reuse turn, correct agent replies on `moonshot/kimi-k2.5`.
 - **AWS Lightsail deploy path** (Item 10b). `scripts/deploy-aws-lightsail.sh` + `docs/deploying-on-aws-lightsail.md`. Same architecture as Item 10a, different CLI (`aws lightsail create-instances`). Pure-shell user-data because Lightsail prepends its own `#!/bin/sh` boot script and cloud-config YAML is silently ignored. Verified live on 2026-04-16 with pre-built images from GHCR: ~5 min end-to-end deploy, 294 s cold turn, 5 s pool-reuse turn, correct replies on `moonshot/kimi-k2.5`. AWS partnership hook with direct Bedrock proximity.
-- **Pre-built multi-arch images on GHCR** (Item 10 supporting infrastructure). `.github/workflows/publish-images.yaml` builds `Dockerfile.orchestrator` and `Dockerfile.runtime` on every push to `main` and publishes them to `ghcr.io/stainlu/openclaw-managed-runtime-{orchestrator,agent}:latest` as public, multi-arch (linux/amd64 + linux/arm64) packages. Every deploy script pulls these instead of building from source on the target VM. On Lightsail this cut deploy time from ~12 min to ~5 min; on Hetzner from ~4 min to a projected ~1-2 min.
+- **Pre-built multi-arch images on GHCR** (Item 10 supporting infrastructure). `.github/workflows/publish-images.yaml` builds `Dockerfile.orchestrator` and `Dockerfile.runtime` on every push to `main` and publishes them to `ghcr.io/stainlu/openclaw-managed-agents-{orchestrator,agent}:latest` as public, multi-arch (linux/amd64 + linux/arm64) packages. Every deploy script pulls these instead of building from source on the target VM. On Lightsail this cut deploy time from ~12 min to ~5 min; on Hetzner from ~4 min to a projected ~1-2 min.
 
 **Next** (Items 10b-11):
 

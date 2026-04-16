@@ -46,7 +46,7 @@ export class DockerContainerRuntime implements ContainerRuntime {
     });
 
     const labels = {
-      "managed-by": "openclaw-managed-runtime",
+      "managed-by": "openclaw-managed-agents",
       ...(opts.labels ?? {}),
     };
 
@@ -126,7 +126,7 @@ export class DockerContainerRuntime implements ContainerRuntime {
 
   /**
    * Force-remove every container previously spawned by this runtime, matched
-   * by the `managed-by=openclaw-managed-runtime` label. Intended for startup:
+   * by the `managed-by=openclaw-managed-agents` label. Intended for startup:
    * if a prior orchestrator instance crashed without tearing down its live
    * containers, those containers are still running but are no longer tracked
    * by any process — safe to reap. Returns the number of containers reaped.
@@ -137,9 +137,17 @@ export class DockerContainerRuntime implements ContainerRuntime {
    * shared abstraction here would over-commit the interface.
    */
   async cleanupOrphaned(): Promise<number> {
-    const infos = await this.docker.listContainers({
-      all: true,
-      filters: { label: ["managed-by=openclaw-managed-runtime"] },
+    // Match both the current label AND the pre-rename label so containers
+    // spawned before the Item 16 rename are also cleaned up on startup.
+    const [current, legacy] = await Promise.all([
+      this.docker.listContainers({ all: true, filters: { label: ["managed-by=openclaw-managed-agents"] } }),
+      this.docker.listContainers({ all: true, filters: { label: ["managed-by=openclaw-managed-runtime"] } }),
+    ]);
+    const seen = new Set<string>();
+    const infos = [...current, ...legacy].filter((c) => {
+      if (seen.has(c.Id)) return false;
+      seen.add(c.Id);
+      return true;
     });
     let reaped = 0;
     for (const info of infos) {
