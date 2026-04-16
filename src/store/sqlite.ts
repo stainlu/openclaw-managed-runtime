@@ -7,6 +7,7 @@ import type {
   EnvironmentConfig,
   Networking,
   Packages,
+  PermissionPolicy,
   Session,
   SessionStatus,
   UpdateAgentRequest,
@@ -22,6 +23,7 @@ type AgentRow = {
   model: string;
   tools_json: string;
   instructions: string;
+  permission_policy_json: string | null;
   name: string | null;
   created_at: number;
   updated_at: number | null;
@@ -60,6 +62,9 @@ function rowToAgent(r: AgentRow): AgentConfig {
     model: r.model,
     tools: JSON.parse(r.tools_json) as string[],
     instructions: r.instructions,
+    permissionPolicy: r.permission_policy_json
+      ? (JSON.parse(r.permission_policy_json) as PermissionPolicy)
+      : { type: "always_allow" },
     name: r.name ?? undefined,
     createdAt: r.created_at,
     updatedAt: r.updated_at ?? r.created_at,
@@ -139,6 +144,7 @@ CREATE TABLE IF NOT EXISTS agent_versions (
   model TEXT NOT NULL,
   tools_json TEXT NOT NULL,
   instructions TEXT NOT NULL,
+  permission_policy_json TEXT,
   name TEXT,
   callable_agents_json TEXT,
   max_subagent_depth INTEGER NOT NULL DEFAULT 0,
@@ -187,21 +193,23 @@ class SqliteAgentStore implements AgentStore {
   constructor(private readonly db: Database.Database) {
     this.insertStmt = db.prepare(
       `INSERT INTO agents (
-        agent_id, model, tools_json, instructions, name, created_at,
-        updated_at, archived_at, version,
+        agent_id, model, tools_json, instructions, permission_policy_json,
+        name, created_at, updated_at, archived_at, version,
         callable_agents_json, max_subagent_depth
        ) VALUES (
-        @agent_id, @model, @tools_json, @instructions, @name, @created_at,
-        @updated_at, NULL, 1,
+        @agent_id, @model, @tools_json, @instructions, @permission_policy_json,
+        @name, @created_at, @updated_at, NULL, 1,
         @callable_agents_json, @max_subagent_depth
        )`,
     );
     this.insertVersionStmt = db.prepare(
       `INSERT INTO agent_versions (
-        agent_id, version, model, tools_json, instructions, name,
+        agent_id, version, model, tools_json, instructions,
+        permission_policy_json, name,
         callable_agents_json, max_subagent_depth, created_at
        ) VALUES (
-        @agent_id, @version, @model, @tools_json, @instructions, @name,
+        @agent_id, @version, @model, @tools_json, @instructions,
+        @permission_policy_json, @name,
         @callable_agents_json, @max_subagent_depth, @created_at
        )`,
     );
@@ -212,13 +220,15 @@ class SqliteAgentStore implements AgentStore {
     this.updateStmt = db.prepare(
       `UPDATE agents SET
         model = @model, tools_json = @tools_json, instructions = @instructions,
+        permission_policy_json = @permission_policy_json,
         name = @name, callable_agents_json = @callable_agents_json,
         max_subagent_depth = @max_subagent_depth,
         version = @version, updated_at = @updated_at
        WHERE agent_id = @agent_id AND version = @prev_version`,
     );
     this.listVersionsStmt = db.prepare(
-      `SELECT agent_id, version, model, tools_json, instructions, name,
+      `SELECT agent_id, version, model, tools_json, instructions,
+              permission_policy_json, name,
               callable_agents_json, max_subagent_depth, created_at,
               NULL as updated_at, NULL as archived_at
        FROM agent_versions WHERE agent_id = ? ORDER BY version ASC`,
@@ -234,6 +244,9 @@ class SqliteAgentStore implements AgentStore {
       model: agent.model,
       tools_json: JSON.stringify(agent.tools),
       instructions: agent.instructions,
+      permission_policy_json: agent.permissionPolicy.type !== "always_allow"
+        ? JSON.stringify(agent.permissionPolicy)
+        : null,
       name: agent.name ?? null,
       callable_agents_json: agent.callableAgents.length > 0
         ? JSON.stringify(agent.callableAgents)
@@ -249,6 +262,7 @@ class SqliteAgentStore implements AgentStore {
       model: req.model,
       tools: req.tools,
       instructions: req.instructions,
+      permissionPolicy: req.permissionPolicy,
       name: req.name,
       createdAt: now,
       updatedAt: now,
@@ -288,6 +302,7 @@ class SqliteAgentStore implements AgentStore {
       model: req.model ?? current.model,
       tools: req.tools === null ? [] : (req.tools ?? current.tools),
       instructions: req.instructions === null ? "" : (req.instructions ?? current.instructions),
+      permissionPolicy: req.permissionPolicy ?? current.permissionPolicy,
       name: req.name === null ? undefined : (req.name ?? current.name),
       callableAgents: req.callableAgents === null ? [] : (req.callableAgents ?? current.callableAgents),
       maxSubagentDepth: req.maxSubagentDepth ?? current.maxSubagentDepth,
@@ -298,6 +313,7 @@ class SqliteAgentStore implements AgentStore {
       updated.model === current.model &&
       JSON.stringify(updated.tools) === JSON.stringify(current.tools) &&
       updated.instructions === current.instructions &&
+      JSON.stringify(updated.permissionPolicy) === JSON.stringify(current.permissionPolicy) &&
       updated.name === current.name &&
       JSON.stringify(updated.callableAgents) === JSON.stringify(current.callableAgents) &&
       updated.maxSubagentDepth === current.maxSubagentDepth
@@ -629,6 +645,13 @@ export class SqliteStore implements Store {
     }
     if (!agentsCols.some((c) => c.name === "archived_at")) {
       this.db.exec("ALTER TABLE agents ADD COLUMN archived_at INTEGER");
+    }
+    if (!agentsCols.some((c) => c.name === "permission_policy_json")) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN permission_policy_json TEXT");
+    }
+    const versionsCols = this.db.pragma("table_info(agent_versions)") as Array<{ name: string }>;
+    if (versionsCols.length > 0 && !versionsCols.some((c) => c.name === "permission_policy_json")) {
+      this.db.exec("ALTER TABLE agent_versions ADD COLUMN permission_policy_json TEXT");
     }
 
     this.agents = new SqliteAgentStore(this.db);

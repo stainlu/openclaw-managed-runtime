@@ -4,6 +4,7 @@ import type {
   CreateAgentRequest,
   CreateEnvironmentRequest,
   EnvironmentConfig,
+  PermissionPolicy,
   Session,
   UpdateAgentRequest,
 } from "../orchestrator/types.js";
@@ -24,6 +25,7 @@ class InMemoryAgentStore implements AgentStore {
       model: req.model,
       tools: req.tools,
       instructions: req.instructions,
+      permissionPolicy: req.permissionPolicy,
       name: req.name,
       createdAt: now,
       updatedAt: now,
@@ -59,6 +61,7 @@ class InMemoryAgentStore implements AgentStore {
       model: req.model ?? current.model,
       tools: req.tools === null ? [] : (req.tools ?? current.tools),
       instructions: req.instructions === null ? "" : (req.instructions ?? current.instructions),
+      permissionPolicy: req.permissionPolicy ?? current.permissionPolicy,
       name: req.name === null ? undefined : (req.name ?? current.name),
       callableAgents: req.callableAgents === null ? [] : (req.callableAgents ?? current.callableAgents),
       maxSubagentDepth: req.maxSubagentDepth ?? current.maxSubagentDepth,
@@ -69,6 +72,7 @@ class InMemoryAgentStore implements AgentStore {
       updated.model === current.model &&
       JSON.stringify(updated.tools) === JSON.stringify(current.tools) &&
       updated.instructions === current.instructions &&
+      JSON.stringify(updated.permissionPolicy) === JSON.stringify(current.permissionPolicy) &&
       updated.name === current.name &&
       JSON.stringify(updated.callableAgents) === JSON.stringify(current.callableAgents) &&
       updated.maxSubagentDepth === current.maxSubagentDepth

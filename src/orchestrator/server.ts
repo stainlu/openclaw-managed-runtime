@@ -56,6 +56,7 @@ function agentResponse(agent: AgentConfig) {
     model: agent.model,
     tools: agent.tools,
     instructions: agent.instructions,
+    permission_policy: agent.permissionPolicy,
     name: agent.name,
     callable_agents: agent.callableAgents,
     max_subagent_depth: agent.maxSubagentDepth,

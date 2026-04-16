@@ -95,6 +95,22 @@ tools_json_fragment() {
 
 TOOLS_JSON=$(tools_json_fragment)
 
+# Build denied-tools list as a JSON array for OpenClaw's tools.deny config.
+denied_tools_json_fragment() {
+  if [[ -z "${OPENCLAW_DENIED_TOOLS:-}" ]]; then
+    printf '[]'
+    return
+  fi
+  echo "${OPENCLAW_DENIED_TOOLS}" \
+    | tr ',' '\n' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | grep -v '^$' \
+    | jq -R '.' \
+    | jq -s '.'
+}
+
+DENIED_TOOLS_JSON=$(denied_tools_json_fragment)
+
 # Some OpenClaw provider plugins auto-register their static catalog at plugin
 # load time (e.g. anthropic, openai, google). Others use
 # `defineSingleProviderPluginEntry` and only materialize their catalog into
@@ -163,6 +179,7 @@ jq -n \
   --arg plugin         "${OPENCLAW_PLUGIN}" \
   --argjson port       "${OPENCLAW_GATEWAY_PORT}" \
   --argjson tools      "${TOOLS_JSON}" \
+  --argjson denied     "${DENIED_TOOLS_JSON}" \
   --argjson providers  "${PROVIDER_BLOCK_JSON}" \
 '
 {
@@ -187,6 +204,7 @@ jq -n \
           model: { primary: $model }
         }
         + (if ($tools.alsoAllow // null) then { tools: $tools } else {} end)
+        + (if ($denied | length) > 0 then { tools: ((.tools // {}) + { deny: $denied }) } else {} end)
         + (if $instructions != "" then { systemPromptOverride: $instructions } else {} end)
       )
     ],

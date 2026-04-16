@@ -286,6 +286,9 @@ export class AgentRouter {
     if (envConfig?.packages) {
       env.OPENCLAW_PACKAGES_JSON = JSON.stringify(envConfig.packages);
     }
+    if (agent.permissionPolicy.type === "deny") {
+      env.OPENCLAW_DENIED_TOOLS = agent.permissionPolicy.tools.join(",");
+    }
 
     return {
       image: this.cfg.runtimeImage,

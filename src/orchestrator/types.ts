@@ -2,10 +2,21 @@ import { z } from "zod";
 
 // ---------- Agent (reusable template) ----------
 
+export const PermissionPolicySchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("always_allow") }),
+  z.object({
+    type: z.literal("deny"),
+    tools: z.array(z.string().min(1)).min(1),
+  }),
+]);
+
+export type PermissionPolicy = z.infer<typeof PermissionPolicySchema>;
+
 export const CreateAgentRequestSchema = z.object({
   model: z.string().min(1, "model is required"),
   tools: z.array(z.string()).default([]),
   instructions: z.string().default(""),
+  permissionPolicy: PermissionPolicySchema.default({ type: "always_allow" }),
   /** Optional stable display name for UI/logging. */
   name: z.string().optional(),
   /**
@@ -33,6 +44,7 @@ export const UpdateAgentRequestSchema = z.object({
   model: z.string().min(1).optional(),
   tools: z.array(z.string()).nullable().optional(),
   instructions: z.string().nullable().optional(),
+  permissionPolicy: PermissionPolicySchema.optional(),
   name: z.string().nullable().optional(),
   callableAgents: z.array(z.string()).nullable().optional(),
   maxSubagentDepth: z.number().int().min(0).optional(),
@@ -45,6 +57,7 @@ export type AgentConfig = {
   model: string;
   tools: string[];
   instructions: string;
+  permissionPolicy: PermissionPolicy;
   name?: string;
   createdAt: number;
   updatedAt: number;
