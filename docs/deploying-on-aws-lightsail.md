@@ -112,10 +112,11 @@ Expected output (timings on a fresh run, `us-east-1`, `medium_3_0`):
     Monthly cost:      ~$24 (medium_3_0 bundle: 2 vCPU / 4 GB / 80 GB / 4 TB egress)
                        Override LIGHTSAIL_BUNDLE_ID=small_3_0 for $12/mo (2 GB)
     Destroy with:      ./scripts/deploy-aws-lightsail.sh --destroy
-    SSH (port 22):     ssh ubuntu@54.196.x.x
-    SSH (port 222):    ssh -p 222 ubuntu@54.196.x.x
+    SSH:               ssh ubuntu@54.196.x.x
     Tail bootstrap:    ssh ubuntu@54.196.x.x 'sudo tail -f /var/log/openclaw-bootstrap.log'
 ```
+
+> The script opens port 222 in the Lightsail firewall as a historical carry-over from the Hetzner path, but **sshd is not configured to listen on 222 under the Lightsail Ubuntu image** (the `ssh.socket` drop-in that would enable it conflicts with Lightsail's `ssh.service` and breaks both sshd and the browser SSH console — `UPSTREAM_ERROR 515`). Use port 22 for SSH, or the Lightsail browser-based SSH console for debugging.
 
 ## Validating the deploy
 
@@ -267,5 +268,4 @@ Each new backend is a ~300-line sibling of this script. No orchestrator core cha
 - **`aws sts get-caller-identity` fails with "Unable to locate credentials"**: your credentials aren't configured. Run `aws configure` and enter your access key pair, or export the env vars directly.
 - **`aws lightsail create-instances` fails with "User is not authorized"**: your IAM principal doesn't have Lightsail permissions. Attach the `AmazonLightsailFullAccess` managed policy in the IAM console, or use the fine-grained list from the prereqs section.
 - **Instance reaches "running" state but `/healthz` never responds**: cloud-init is still running. SSH in (`ssh ubuntu@<ip>`) and inspect `sudo tail -f /var/log/openclaw-bootstrap.log`. Most commonly this is an image-build failure (check `cd /opt/openclaw && docker compose logs`).
-- **SSH to port 22 fails with "Connection closed by remote host"**: some ISPs and corporate networks block outbound SSH to port 22 on cloud provider IP ranges. The deploy script opens port 222 as a fallback — try `ssh -p 222 ubuntu@<ip>` instead.
-- **Port 222 is also blocked**: this is rare but possible on heavily-filtered networks. Use AWS Systems Manager Session Manager as a last resort — it tunnels SSH over the AWS API and bypasses network-level restrictions. See [Session Manager docs](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html).
+- **SSH to port 22 fails with "Connection closed by remote host"**: some ISPs and corporate networks block outbound SSH to port 22 on cloud provider IP ranges. Use the **Lightsail browser-based SSH console** (in the AWS console → Lightsail → your instance → "Connect using SSH" button) — it tunnels over HTTPS and bypasses network-level restrictions. The deploy script does open firewall port 222, but the Lightsail Ubuntu image's `ssh.service` is not configured to listen there (the Hetzner-style `ssh.socket` drop-in conflicts with Lightsail's unit and triggers `UPSTREAM_ERROR 515`). AWS Systems Manager Session Manager is an alternative, but requires attaching an IAM role to the instance — not set up by the quick deploy.

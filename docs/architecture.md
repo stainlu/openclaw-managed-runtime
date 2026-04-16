@@ -50,9 +50,14 @@ Parses OpenClaw's per-session JSONL at query time. Resolves our `session_id` →
 
 ### SessionContainerPool (`src/runtime/pool.ts`)
 
-Two pools in one: an **active** pool (per-session, reused across turns) and a **warm** pool (per-agent, pre-booted). When an agent is created, a container boots in the background and waits in the warm bucket. The first session on that agent claims the pre-warmed container instead of cold-spawning (near-zero latency). Subsequent events reuse the active container (~100 ms overhead). An unref'd `setInterval` sweeper reaps idle active containers after `OPENCLAW_IDLE_TIMEOUT_MS` (default 10 min). Warm containers are not reaped.
+Two pools in one: an **active** pool (per-session, reused across turns) and a **warm** pool (per-agent, pre-booted). When an agent is created, a container boots in the background and waits in the warm bucket. The first session on that agent claims the pre-warmed container instead of cold-spawning (near-zero latency). Subsequent events reuse the active container (~100 ms overhead).
 
-- **`warmForAgent(agentId, spawnOptions)`** — pre-boots a container (spawn + `/readyz` + WS handshake) and stores it in the warm bucket keyed by agentId. Called by the server after `POST /v1/agents`. No-ops if a warm container already exists for this agent.
+An unref'd `setInterval` sweeper reaps idle containers on both halves:
+
+- **Active containers** are reaped after `OPENCLAW_IDLE_TIMEOUT_MS` (default 10 min) of no use. `isBusy(sessionId)` is checked first so a session with a run in flight is never evicted mid-turn.
+- **Warm containers** are reaped after `OPENCLAW_WARM_IDLE_TIMEOUT_MS` (default: same as active idle timeout) without being claimed, and the warm pool is bounded by `OPENCLAW_MAX_WARM_CONTAINERS` (default 5). When a new `warmForAgent` would exceed the cap, the oldest-spawned warm entry is reaped first. This keeps a host with many distinct agent templates from accumulating one persistent 2 GiB container per template.
+
+- **`warmForAgent(agentId, spawnOptions)`** — pre-boots a container (spawn + `/readyz` + WS handshake) and stores it in the warm bucket keyed by agentId. Called by the server after `POST /v1/agents`. No-ops if a warm container already exists for this agent. Evicts the oldest warm entry first when the pool is at `OPENCLAW_MAX_WARM_CONTAINERS`. **The router skips this call entirely for delegating agents** (`callableAgents.length > 0 || maxSubagentDepth > 0`) — see the note under AgentRouter.warmForAgent for why.
 - **`acquireForSession({sessionId, spawnOptions, agentId?})`** — returns a live `Container` for the session. Checks three sources in order: (1) existing active container, (2) pre-warmed container matching the agentId, (3) fresh spawn. When claiming from the warm pool, auto-replenishes in the background. Bumps `lastUsedAt` on reuse.
 - **`getWsClient(sessionId)`** — lookup used by the router for cancel (`sessions.abort`) and per-event model override (`sessions.patch`).
 - **`evictSession(sessionId)`** — manual teardown (closes WS, stops container). Called by `DELETE /v1/sessions/:id` and the router's infra-failure path.
@@ -90,7 +95,7 @@ The brain of the orchestrator. Takes the store, the pool, the JSONL reader, the 
 
 - **`createSession(agentId, opts?)`** — pure metadata: allocates a store row, no container spawn, no JSONL write. Validates the agent is not archived. The container is only spawned when the first event arrives (or earlier via warm-up).
 - **`warmSession(sessionId)`** — proactively boots a container for a session so it's ready by the time the first event arrives. Called by the server right after `createSession`. Fire-and-forget.
-- **`warmForAgent(agentId)`** — pre-warms a container for an agent template. Called by the server after `POST /v1/agents`. The warm container waits in the pool until claimed by a session.
+- **`warmForAgent(agentId)`** — pre-warms a container for an agent template. Called by the server after `POST /v1/agents`. The warm container waits in the pool until claimed by a session. **Skipped for delegating agents** (`callableAgents.length > 0 || maxSubagentDepth > 0`). `buildSpawnOptions` bakes the sessionId into both Docker labels and the signed `OPENCLAW_ORCHESTRATOR_TOKEN` env var, and Docker env is immutable post-create; a warm container built with the `__warm__` placeholder would carry that placeholder into every subagent spawn the claimed session later hosts, producing wrong token lineage (the orchestrator doesn't currently verify `parentSessionId` against the session store, so the failure would be silent rather than a crash). Skipping the warm pool for delegating agents preserves the latency benefit for the common non-delegating case without the identity smear.
 - **`runEvent({sessionId, content, model?})`** — idle path starts a background run (`beginRun` + fire-and-forget `executeInBackground`); running path enqueues. Returns `{session, queued}`.
 - **`cancel(sessionId)`** — looks up the pool's WS client, calls `abort(canonicalKey)`, drains the queue, calls `endRunCancelled`. Cancellation is a deliberate stop, not an agent failure.
 - **`confirmTool(sessionId, approvalId, decision, denyMessage?)`** — resolves a pending tool-confirmation approval via the container's WS `plugin.approval.resolve`. Used when the agent template has `always_ask` permission policy.
@@ -141,6 +146,31 @@ The interface is the seam for cloud backends (ECS, Cloud Run, Container Apps, EC
 
 The server is self-documenting at `GET /`: the root returns name, description, version, and the full endpoint map. A developer landing on the orchestrator never needs to open a separate reference.
 
+### Orchestrator configuration (`src/index.ts`)
+
+The orchestrator process itself reads a small set of env vars at startup. Everything has a reasonable default; the only variables that are load-bearing under docker-compose are `OPENCLAW_HOST_STATE_ROOT` (host-side bind path for agent containers) and `OPENCLAW_RUNTIME_IMAGE` (which image to spawn).
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `PORT` | HTTP port for the orchestrator API | `8080` |
+| `OPENCLAW_STORE` | `sqlite` \| `memory`. Memory is for tests only — data is lost on restart | `sqlite` |
+| `OPENCLAW_STORE_PATH` | SQLite file path (when `OPENCLAW_STORE=sqlite`) | `/var/openclaw/state/managed-runtime.db` |
+| `OPENCLAW_STATE_ROOT` | **In-process** path of the mounted sessions directory — used by `PiJsonlEventReader` to open JSONL files | `/var/openclaw/sessions` |
+| `OPENCLAW_HOST_STATE_ROOT` | **Host-side** path of the same directory — passed to dockerode when spawning agent containers (the Docker daemon resolves against the host filesystem, so a container-relative path would fail). Must be absolute; startup throws if not | `/var/openclaw/sessions` |
+| `OPENCLAW_RUNTIME_IMAGE` | Docker image reference the orchestrator spawns per session | `openclaw-managed-agents/agent:latest` |
+| `OPENCLAW_DOCKER_NETWORK` | Docker bridge network the orchestrator and agent containers share | `openclaw-net` |
+| `OPENCLAW_GATEWAY_PORT` | Port exposed inside each agent container for its gateway | `18789` |
+| `OPENCLAW_READY_TIMEOUT_MS` | Max wait for a newly-spawned container's `/readyz` to respond | `60000` (60 s); `600000` (10 min) in `docker-compose.yml` to accommodate Lightsail's burstable-disk first-boot |
+| `OPENCLAW_RUN_TIMEOUT_MS` | Max end-to-end time for a single turn's `/v1/chat/completions` call | `600000` (10 min) |
+| `OPENCLAW_IDLE_TIMEOUT_MS` | Active-pool idle timeout before the sweeper reaps a session container | `600000` (10 min) |
+| `OPENCLAW_SWEEP_INTERVAL_MS` | How often the pool sweeper runs | `60000` (60 s) |
+| `OPENCLAW_MAX_WARM_CONTAINERS` | Cap on pre-warmed containers. Oldest-first eviction when exceeded | `5` |
+| `OPENCLAW_WARM_IDLE_TIMEOUT_MS` | Unclaimed-warm reap threshold | same as `OPENCLAW_IDLE_TIMEOUT_MS` |
+| `OPENCLAW_ORCHESTRATOR_URL` | URL injected into each spawned container so `openclaw-call-agent` can reach back | `http://openclaw-orchestrator:${PORT}` |
+| `OPENCLAW_PASSTHROUGH_ENV` | Comma-separated extra env var names to forward into agent containers | `""` |
+
+Provider API keys (`MOONSHOT_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AWS_*`, etc.) are forwarded via the `collectPassthroughEnv()` allowlist in `src/index.ts`. Add custom vars via `OPENCLAW_PASSTHROUGH_ENV`. The four `OPENCLAW_MOONSHOT_PRICE_*_USD_PER_M` overrides are in that allowlist by default.
+
 ### Agent container (`Dockerfile.runtime`, `docker/entrypoint.sh`)
 
 A Docker image wrapping the published `openclaw` npm package on `node:22-slim`. At startup, the entrypoint script reads environment variables, generates a minimal `openclaw.json`, and execs `openclaw gateway run`. The container serves OpenClaw's existing OpenAI-compatible endpoint on port 18789.
@@ -162,9 +192,13 @@ Environment the entrypoint reads:
 | `OPENCLAW_CONFIRM_TOOLS` | comma-separated tool names requiring confirmation, or `__ALL__` (from `always_ask` policy) | `""` |
 | `OPENCLAW_ORCHESTRATOR_URL` | URL for the in-container `call_agent` CLI to reach the orchestrator | injected per container |
 | `OPENCLAW_ORCHESTRATOR_TOKEN` | HMAC-signed parent token for subagent delegation | injected per container |
+| `OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M` | Moonshot per-turn cost override, USD per million input tokens (Category B plugin has no upstream catalog) | `0` |
+| `OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M` | Moonshot per-turn cost override, USD per million output tokens | `0` |
+| `OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M` | Moonshot per-turn cost override, USD per million cache-read tokens | `0` |
+| `OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M` | Moonshot per-turn cost override, USD per million cache-write tokens | `0` |
 | `<PROVIDER>_API_KEY` | whichever API key the selected provider needs | forwarded from the host |
 
-The orchestrator forwards whichever provider API keys are present in its own environment (`MOONSHOT_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AWS_*`, etc.). See `collectPassthroughEnv()` in `src/index.ts` for the default allowlist and `OPENCLAW_PASSTHROUGH_ENV` for the escape hatch.
+The orchestrator forwards whichever provider API keys are present in its own environment (`MOONSHOT_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AWS_*`, etc.). See `collectPassthroughEnv()` in `src/index.ts` for the default allowlist and `OPENCLAW_PASSTHROUGH_ENV` for the escape hatch. The `OPENCLAW_MOONSHOT_PRICE_*` overrides are also forwarded by default so Moonshot deployments can report real `cost_usd` without rebuilding the image.
 
 #### Generated `openclaw.json` (Moonshot example)
 
@@ -212,6 +246,13 @@ The orchestrator forwards whichever provider API keys are present in its own env
       }
     }
   },
+  // The `cost` block above shows the zero defaults. At runtime the
+  // entrypoint reads OPENCLAW_MOONSHOT_PRICE_*_USD_PER_M from the
+  // container env and substitutes per-token values (USD per token).
+  // See `docker/entrypoint.sh` for the awk/jq conversion path. Category A
+  // providers (anthropic, openai, google, xai, mistral, openrouter,
+  // amazon-bedrock) publish non-zero cost via their plugin catalogs and
+  // do not need this env-var override.
   "plugins": {
     "entries": {
       "moonshot": { "enabled": true },
@@ -249,6 +290,8 @@ OpenClaw provider plugins fall into two categories, and the entrypoint handles e
 **Category B: require an onboarding flow to materialize the catalog.** Plugins built with `defineSingleProviderPluginEntry` — for example `moonshot` — define their catalog declaratively through a `catalog.buildProvider` hook that is only invoked during the interactive `openclaw models auth login` flow (`applyMoonshotConfig` in `extensions/moonshot/onboard.ts`). Without that flow, the catalog never appears in the runtime registry and invocation fails with `Unknown model`.
 
 For Category B providers the entrypoint writes a hardcoded `models.providers.<id>` block that mirrors what the interactive flow would produce. Extend `PROVIDER_BLOCK_JSON` in `docker/entrypoint.sh` when adding more Category B providers (DeepSeek and Qwen are likely candidates). A clean upstream fix is to make `defineSingleProviderPluginEntry` auto-register its default catalog — that is a follow-up contribution to OpenClaw proper, not something the runtime blocks on.
+
+Category B plugins also don't publish catalog prices upstream, so `cost_usd` reads zero unless the operator supplies them. For Moonshot specifically, the entrypoint reads `OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M`, `OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M`, `OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M`, and `OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M` from the container env, divides by 1,000,000 (Pi's catalog uses USD/token, not USD/M), and substitutes the values into the generated `cost: { input, output, cacheRead, cacheWrite }` block. These env vars are in the default `collectPassthroughEnv()` allowlist, so exporting them on the orchestrator host flows through to every spawned agent container with no rebuild.
 
 ### Session persistence and continuity
 
@@ -466,7 +509,7 @@ Why read from the JSONL instead of computing cost in the orchestrator:
 2. **Cache-aware for free.** Moonshot and Anthropic both bill `cacheRead` tokens at a much lower rate than fresh input. A naive `tokens * perMillion` sheet ignores that and reports the wrong number. Pi's per-turn cost already includes the cache discount.
 3. **Zero hardcoding.** The orchestrator is provider-agnostic. It does not embed knowledge of any particular provider's pricing.
 
-When cost is zero: if a provider plugin does not report cost, `message.usage.cost.total` stays 0, and that's what the orchestrator rolls up. The current `docker/entrypoint.sh` `PROVIDER_BLOCK_JSON` for moonshot declares zero prices across input/output/cacheRead/cacheWrite (Category B provider onboarding hack from Item 1), so moonshot runs report `cost_usd: 0`. Updating those prices in the entrypoint propagates through this same read path with zero orchestrator code changes. Any Category A provider (anthropic, openai, google, xai, mistral, openrouter, amazon-bedrock) whose plugin auto-registers its catalog reports a real non-zero value.
+When cost is zero: if a provider plugin does not report cost, `message.usage.cost.total` stays 0, and that's what the orchestrator rolls up. Moonshot's Category B plugin has no upstream catalog prices, so its default is `0` across input/output/cacheRead/cacheWrite. The entrypoint reads `OPENCLAW_MOONSHOT_PRICE_{INPUT,OUTPUT,CACHE_READ,CACHE_WRITE}_USD_PER_M` at container start and substitutes per-token values into the generated `openclaw.json` — set these on the orchestrator host (or in `.env`) and Moonshot runs will report real `cost_usd` through the same read path with no code changes. Any Category A provider (anthropic, openai, google, xai, mistral, openrouter, amazon-bedrock) whose plugin auto-registers its catalog reports a real non-zero value without any operator action.
 
 ## What lives where
 
@@ -530,6 +573,22 @@ Future upstream contributions (nice-to-have, not blocking):
 - **`SecretRef` extension** — would let us pull provider API keys from AWS Secrets Manager / GCP Secret Manager / Azure Key Vault with rotation, replacing the env-var passthrough.
 - **Real-time delta forwarding** — an HTTP/SSE wrapper around Pi's `AgentSessionEvent` bus would let `GET /v1/sessions/:id/events?stream=true` and `POST /v1/chat/completions stream=true` forward token-by-token deltas instead of polling the JSONL.
 - **`sessions.compact` and `sessions.navigateTree`** exposed over the gateway WS control plane — currently there's no WS handler for compact or branch, which is why the runtime's control surface stops at cancel + steer + send + patch.
+
+## Testing
+
+The project has two layers of tests that serve different purposes.
+
+**Unit tests (`src/**/*.test.ts`, vitest).** Fast, no Docker required. Cover the three modules that encode load-bearing semantics you cannot see through the HTTP surface:
+
+- `src/runtime/parent-token.test.ts` — HMAC round-trip, rejection of tampered / expired / malformed / wrong-secret tokens, allowlist + depth edge cases.
+- `src/orchestrator/event-queue.test.ts` — FIFO order, per-session isolation, clear semantics.
+- `src/store/pi-jsonl.test.ts` — JSONL fixture files in a tmp dir; asserts user/assistant/tool/toolResult parsing, empty-content assistant message drop (Pi auto-retry noise), malformed-line recovery, `latestAgentMessage` reverse scan, `deleteBySession` removal of both JSONL and `sessions.json` entry.
+
+Run via `pnpm test`. Adding a new test module is just dropping a `*.test.ts` file alongside the source; vitest discovers it automatically.
+
+**End-to-end (`test/e2e.sh`, bash + curl + jq).** Exercises the full stack: spawns real containers via `docker compose up`, creates agents and sessions through the HTTP API, verifies multi-turn memory + pool reuse + SQLite persistence across orchestrator restart + OpenAI-compat + SSE streaming + cancel + queue ordering + delegated subagents + `always_ask` flow + agent versioning + environment CRUD. Requires a provider API key and ~5 minutes per run.
+
+Covering `router.ts` and `pool.ts` in unit tests is harder because both take concrete infrastructure (Docker, WebSockets). The e2e suite validates them end-to-end; a follow-up could add in-memory mocks of `ContainerRuntime` and `GatewayWebSocketClient` for faster router-level coverage.
 
 ## Security notes
 

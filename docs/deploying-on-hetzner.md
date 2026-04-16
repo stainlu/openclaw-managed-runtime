@@ -209,18 +209,19 @@ The cloud-init user-data (generated at deploy time by the script) installs Docke
 
 ## What's next — more backends
 
-Item 10a (this guide) is the geeky-cheap proof point. Upcoming backends extend the story without replacing it:
+Item 10a (this guide) is the geeky-cheap proof point. The rest of Item 10 extends the story without replacing it; every backend runs the same `DockerContainerRuntime` and the same multi-arch images from GHCR:
 
-- **Item 10b — Cloudflare Containers** (GA'd April 13, 2026). Edge-distributed across 330+ cities, $5/mo base includes substantial usage, ~200 ms cold start. **First managed agent runtime on Cloudflare Containers.**
-- **Item 10c — Google Cloud Run.** Serverless, scale-to-zero, ~$0.009 per active turn. Google Cloud partnership hook.
-- **Item 10d — AWS Fargate.** Always-on, ~$0.035/hr. AWS partnership hook + Bedrock model access.
-- **Item 10e — Azure Container Apps.** Similar cost shape to Cloud Run. Azure partnership hook.
+- **Item 10b — AWS Lightsail.** ✅ Shipped. $12/mo (`small_3_0`) or $24/mo (`medium_3_0`). AWS account required. See [docs/deploying-on-aws-lightsail.md](./deploying-on-aws-lightsail.md).
+- **Item 10c — Google Cloud Compute Engine.** `e2-small` / `e2-medium` via `gcloud compute instances create`. Same pattern as 10b, different CLI.
+- **Item 10d — Azure Virtual Machines.** `B2s` via `az vm create`. Azure partnership hook.
+- **Item 10e — DigitalOcean / Linode / Vultr / Oracle Cloud free tier.** One deploy script per provider, all at $0-$13/month. Oracle's Always-Free A1 tier gives 4 vCPU + 24 GB RAM for **$0 forever**.
+- **Item 10f — Optional serverless integrations** (Cloud Run, Fargate, Cloudflare Containers). Deferred, partnership-driven only. See [`docs/cloud-backends.md`](./cloud-backends.md) for the architectural decision record on why serverless containers are the wrong default for our workload.
 
-Each new backend is a drop-in `ContainerRuntime` adapter in `src/runtime/` — no orchestrator core changes. See [docs/architecture.md](./architecture.md) for the interface.
+Each new backend is a ~300-line sibling of `scripts/deploy-hetzner.sh` with a different provider CLI. No orchestrator core changes. See [docs/architecture.md](./architecture.md) for the `ContainerRuntime` interface and how a new adapter drops in alongside `src/runtime/docker.ts`.
 
 ## Security notes
 
 - **API key in cloud-init.** The provider API key (e.g., `MOONSHOT_API_KEY`) is written to `/opt/openclaw/.env` via cloud-init user-data. This means the key is visible in Hetzner's cloud-init logs and in `/var/log/cloud-init-output.log` on the server. Acceptable for a proof point; for production, use a secrets manager and swap the `.env` file for a pull at container start.
 - **Firewall.** The default Hetzner server has no firewall rules; port 8080 is publicly reachable. For production, add a Hetzner Cloud Firewall or use `ufw` to restrict to your known client IPs. Or put the orchestrator behind a Cloudflare Tunnel — no ports exposed, authenticated access only.
 - **No TLS by default.** The quick deploy exposes HTTP on port 8080 without a certificate. For any external access, terminate TLS at a reverse proxy (Caddy, Traefik, Nginx) or front it with Cloudflare. A Caddy sidecar with `--tls your-domain.example.com` is the simplest option.
-- **Single VPS = no HA.** If the CAX11 dies, all in-flight sessions fail and the orchestrator restarts. Hetzner's API-level restart is fast (~30 s) but there is no automatic failover. For HA, run two VPSes behind a Hetzner Load Balancer (€5.39/mo) with shared session storage — or wait for Item 10b (Cloudflare Containers) which handles this transparently.
+- **Single VPS = no HA.** If the CAX11 dies, all in-flight sessions fail and the orchestrator restarts. Hetzner's API-level restart is fast (~30 s) but there is no automatic failover. For HA, run two VPSes behind a Hetzner Load Balancer (€5.39/mo) with shared session storage. Multi-node HA with shared sessions requires the upstream `SessionStorage` abstraction called out in [architecture.md](./architecture.md#why-this-works-with-zero-upstream-changes); not shipped yet.
