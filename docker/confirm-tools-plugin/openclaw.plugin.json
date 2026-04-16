@@ -1,0 +1,8 @@
+{
+  "id": "confirm-tools",
+  "configSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  }
+}

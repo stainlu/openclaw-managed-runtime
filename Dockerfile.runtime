@@ -80,6 +80,16 @@ RUN chmod +x /usr/local/bin/openclaw-managed-entrypoint
 COPY docker/call-agent.mjs /usr/local/bin/openclaw-call-agent
 RUN chmod +x /usr/local/bin/openclaw-call-agent
 
+# Item 19: tool confirmation plugin. Installed in the global extensions
+# directory so OpenClaw's plugin loader discovers it alongside bundled
+# plugins. Conditionally enabled by the entrypoint when the agent
+# template has `permissionPolicy: { type: "always_ask" }`. The plugin
+# registers a before_tool_call hook that returns requireApproval for
+# matching tools, pausing the agent until the orchestrator resolves it.
+RUN mkdir -p /home/openclaw/.config/openclaw/extensions/confirm-tools
+COPY docker/confirm-tools-plugin/ /home/openclaw/.config/openclaw/extensions/confirm-tools/
+RUN chown -R openclaw:openclaw /home/openclaw/.config
+
 USER openclaw
 WORKDIR /workspace
 

@@ -177,6 +177,7 @@ jq -n \
   --arg model          "${OPENCLAW_MODEL}" \
   --arg instructions   "${OPENCLAW_INSTRUCTIONS}" \
   --arg plugin         "${OPENCLAW_PLUGIN}" \
+  --arg confirm_tools  "${OPENCLAW_CONFIRM_TOOLS:-}" \
   --argjson port       "${OPENCLAW_GATEWAY_PORT}" \
   --argjson tools      "${TOOLS_JSON}" \
   --argjson denied     "${DENIED_TOOLS_JSON}" \
@@ -219,6 +220,7 @@ jq -n \
   plugins: {
     entries: (
       { ($plugin): { enabled: true } }
+      + (if $confirm_tools != "" then { "confirm-tools": { enabled: true } } else {} end)
     )
   }
 }
