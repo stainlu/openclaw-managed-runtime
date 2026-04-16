@@ -13,9 +13,18 @@ import { definePluginEntry } from "openclaw/plugin-sdk/core";
 
 const raw = (process.env.OPENCLAW_CONFIRM_TOOLS || "").trim();
 const confirmAll = raw === "__ALL__";
-const confirmTools = confirmAll
+
+// OpenClaw normalizes tool names internally: "bash" becomes "exec",
+// "apply-patch" becomes "apply_patch", etc. The hook receives the
+// normalized name, so we expand common aliases to match both forms.
+const ALIASES = { bash: "exec", "apply-patch": "apply_patch" };
+const rawTools = confirmAll
   ? []
   : raw.split(",").map((t) => t.trim()).filter(Boolean);
+const confirmTools = [
+  ...rawTools,
+  ...rawTools.map((t) => ALIASES[t]).filter(Boolean),
+];
 
 export default definePluginEntry({
   id: "confirm-tools",
