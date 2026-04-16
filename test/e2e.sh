@@ -762,5 +762,101 @@ if ! echo "${LOCKED_OUTPUT}" | grep -q "4"; then
 fi
 echo "[e2e] allowlist rejection PASSED (locked-down caller stays single-agent)"
 
+# ---- Environment abstraction (Item 15) --------------------------------------
+
+echo "[e2e] environment: creating environment with packages"
+ENV_RESPONSE=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/environments" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "e2e-test-env",
+    "packages": {"npm": ["cowsay"]},
+    "networking": {"type": "unrestricted"}
+  }')
+ENV_ID=$(echo "${ENV_RESPONSE}" | jq -r '.environment_id')
+if [[ -z "${ENV_ID}" || "${ENV_ID}" == "null" ]]; then
+  echo "[e2e] FAIL: failed to create environment: ${ENV_RESPONSE}"
+  exit 1
+fi
+echo "[e2e] created environment: ${ENV_ID}"
+
+echo "[e2e] environment: verifying GET returns the environment"
+ENV_GET=$(curl --silent --fail "${BASE_URL}/v1/environments/${ENV_ID}")
+ENV_NAME=$(echo "${ENV_GET}" | jq -r '.name')
+ENV_NPM=$(echo "${ENV_GET}" | jq -r '.packages.npm[0]')
+if [[ "${ENV_NAME}" != "e2e-test-env" || "${ENV_NPM}" != "cowsay" ]]; then
+  echo "[e2e] FAIL: environment GET mismatch (name=${ENV_NAME}, npm=${ENV_NPM})"
+  exit 1
+fi
+echo "[e2e] environment GET OK"
+
+echo "[e2e] environment: verifying LIST includes the environment"
+ENV_LIST_COUNT=$(curl --silent --fail "${BASE_URL}/v1/environments" | jq -r '.count')
+if [[ "${ENV_LIST_COUNT}" -lt 1 ]]; then
+  echo "[e2e] FAIL: environment LIST count is ${ENV_LIST_COUNT}, expected >= 1"
+  exit 1
+fi
+echo "[e2e] environment LIST OK (count=${ENV_LIST_COUNT})"
+
+echo "[e2e] environment: creating session with environmentId"
+ENV_SESSION_RESPONSE=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"agentId\": \"${AGENT_ID}\", \"environmentId\": \"${ENV_ID}\"}")
+ENV_SESSION_ID=$(echo "${ENV_SESSION_RESPONSE}" | jq -r '.session_id')
+ENV_SESSION_ENV=$(echo "${ENV_SESSION_RESPONSE}" | jq -r '.environment_id')
+if [[ -z "${ENV_SESSION_ID}" || "${ENV_SESSION_ID}" == "null" ]]; then
+  echo "[e2e] FAIL: failed to create session with environment: ${ENV_SESSION_RESPONSE}"
+  exit 1
+fi
+if [[ "${ENV_SESSION_ENV}" != "${ENV_ID}" ]]; then
+  echo "[e2e] FAIL: session environment_id mismatch (expected ${ENV_ID}, got ${ENV_SESSION_ENV})"
+  exit 1
+fi
+echo "[e2e] created session with environment: ${ENV_SESSION_ID}"
+
+echo "[e2e] environment: posting event to session with environment"
+post_event "${ENV_SESSION_ID}" "What is 7 + 8? Answer with just the number." >/dev/null
+poll_session "${ENV_SESSION_ID}" "env-session" >/dev/null || exit 1
+ENV_OUTPUT=$(latest_agent_message "${ENV_SESSION_ID}")
+echo "[e2e] environment session output: ${ENV_OUTPUT}"
+if ! echo "${ENV_OUTPUT}" | grep -q "15"; then
+  echo "[e2e] FAIL: environment session did not answer 7+8=15 (got: ${ENV_OUTPUT})"
+  exit 1
+fi
+echo "[e2e] environment session OK (agent responded correctly)"
+
+echo "[e2e] environment: verifying deletion rejected while session references it"
+DELETE_RESULT=$(curl --silent -w "%{http_code}" -o /tmp/env-delete-body.json \
+  -X DELETE "${BASE_URL}/v1/environments/${ENV_ID}")
+if [[ "${DELETE_RESULT}" != "409" ]]; then
+  echo "[e2e] FAIL: expected 409 on environment delete with referencing session, got ${DELETE_RESULT}"
+  exit 1
+fi
+echo "[e2e] environment deletion correctly rejected with 409"
+
+echo "[e2e] environment: cleaning up session then deleting environment"
+curl --silent --fail -X DELETE "${BASE_URL}/v1/sessions/${ENV_SESSION_ID}" >/dev/null
+DELETE_AFTER=$(curl --silent -w "%{http_code}" -o /dev/null \
+  -X DELETE "${BASE_URL}/v1/environments/${ENV_ID}")
+if [[ "${DELETE_AFTER}" != "200" ]]; then
+  echo "[e2e] FAIL: environment delete after session cleanup returned ${DELETE_AFTER}"
+  exit 1
+fi
+echo "[e2e] environment cleanup OK (deleted after session removed)"
+
+echo "[e2e] environment: verifying session without environmentId still works (backward compat)"
+COMPAT_SESSION=$(curl --silent --fail \
+  -X POST "${BASE_URL}/v1/sessions" \
+  -H 'Content-Type: application/json' \
+  -d "{\"agentId\": \"${AGENT_ID}\"}" | jq -r '.environment_id')
+if [[ "${COMPAT_SESSION}" != "null" ]]; then
+  echo "[e2e] FAIL: session without environmentId should have null, got ${COMPAT_SESSION}"
+  exit 1
+fi
+echo "[e2e] backward compat OK (session without environment has null environment_id)"
+
+echo "[e2e] environment abstraction PASSED"
+
 echo "[e2e] ALL CHECKS PASSED"
 exit 0

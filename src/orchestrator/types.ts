@@ -41,6 +41,49 @@ export type AgentConfig = {
   maxSubagentDepth: number;
 };
 
+// ---------- Environment (container configuration template) ----------
+
+// An environment defines WHAT the container provides: packages, networking,
+// optionally a custom image. Agents define WHAT the brain does; environments
+// define WHAT it runs in. Sessions compose both at creation time.
+
+export const PackagesSchema = z
+  .object({
+    pip: z.array(z.string()).optional(),
+    apt: z.array(z.string()).optional(),
+    npm: z.array(z.string()).optional(),
+  })
+  .strict();
+
+// v1: only unrestricted networking. "limited" mode (allowedHosts) requires
+// per-container Docker network rules (iptables) which are non-trivial to
+// implement correctly across VPS providers. Accepting "limited" without
+// enforcement would give false security. Expand when enforcement is built.
+export const NetworkingSchema = z.object({
+  type: z.literal("unrestricted"),
+});
+
+export const CreateEnvironmentRequestSchema = z.object({
+  name: z.string().min(1, "name is required"),
+  packages: PackagesSchema.optional(),
+  networking: NetworkingSchema.default({ type: "unrestricted" }),
+});
+
+export type CreateEnvironmentRequest = z.infer<
+  typeof CreateEnvironmentRequestSchema
+>;
+
+export type Packages = z.infer<typeof PackagesSchema>;
+export type Networking = z.infer<typeof NetworkingSchema>;
+
+export type EnvironmentConfig = {
+  environmentId: string;
+  name: string;
+  packages: Packages | null;
+  networking: Networking;
+  createdAt: number;
+};
+
 // ---------- Session (long-lived, one per conversation) ----------
 
 // Sessions are durable and outlive individual turns. A session is idle when
@@ -53,6 +96,7 @@ export type SessionStatus = "idle" | "running" | "failed";
 export type Session = {
   sessionId: string;
   agentId: string;
+  environmentId: string | null;
   status: SessionStatus;
   /**
    * True when the session was auto-created by POST /v1/chat/completions
@@ -87,6 +131,7 @@ export type Session = {
 
 export const CreateSessionRequestSchema = z.object({
   agentId: z.string().min(1, "agentId is required"),
+  environmentId: z.string().min(1).optional(),
 });
 
 export type CreateSessionRequest = z.infer<typeof CreateSessionRequestSchema>;

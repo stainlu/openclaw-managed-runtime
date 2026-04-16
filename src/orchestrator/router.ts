@@ -5,7 +5,7 @@ import { GatewayWsError } from "../runtime/gateway-ws.js";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { SessionContainerPool } from "../runtime/pool.js";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
-import type { AgentStore, RunUsage, SessionStore } from "../store/types.js";
+import type { AgentStore, EnvironmentStore, RunUsage, SessionStore } from "../store/types.js";
 import type { SessionEventQueue } from "./event-queue.js";
 import type { AgentConfig, Session } from "./types.js";
 
@@ -69,6 +69,7 @@ export type RunEventResult = {
 export class AgentRouter {
   constructor(
     private readonly agents: AgentStore,
+    private readonly environments: EnvironmentStore,
     private readonly sessions: SessionStore,
     private readonly events: PiJsonlEventReader,
     private readonly pool: SessionContainerPool,
@@ -89,7 +90,7 @@ export class AgentRouter {
    */
   createSession(
     agentId: string,
-    opts?: { remainingSubagentDepth?: number },
+    opts?: { environmentId?: string; remainingSubagentDepth?: number },
   ): Session {
     const agent = this.agents.get(agentId);
     if (!agent) {
@@ -97,7 +98,26 @@ export class AgentRouter {
     }
     const remainingSubagentDepth =
       opts?.remainingSubagentDepth ?? agent.maxSubagentDepth;
-    return this.sessions.create({ agentId, remainingSubagentDepth });
+    return this.sessions.create({
+      agentId,
+      environmentId: opts?.environmentId,
+      remainingSubagentDepth,
+    });
+  }
+
+  /**
+   * Proactively start booting a container for the given session in the
+   * background. Called by the server handler right after createSession so
+   * the container is warm (or warming) by the time the first event arrives.
+   * Fire-and-forget — failure is non-fatal, the first event will cold-spawn.
+   */
+  async warmSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const agent = this.agents.get(session.agentId);
+    if (!agent) return;
+    const spawnOptions = this.buildSpawnOptions(sessionId, agent, session);
+    await this.pool.acquireForSession({ sessionId, spawnOptions });
   }
 
   /**
@@ -203,69 +223,25 @@ export class AgentRouter {
     return this.sessions.endRunCancelled(sessionId) ?? session;
   }
 
-  private async executeInBackground(
+  private buildSpawnOptions(
     sessionId: string,
     agent: AgentConfig,
-    content: string,
-    modelOverride?: string,
-  ): Promise<void> {
-    // Per-orchestrator-agent mount. Gives every orchestrator agent its own
-    // isolated OpenClaw workspace (sessions.json, per-session JSONLs, skills
-    // cache, models cache). The mount path is stable across container
-    // restarts for the same orchestrator agent, which is what lets session
-    // resume work.
+    session: Session,
+  ): SpawnOptions {
     const hostMount: Mount = {
       hostPath: `${this.cfg.hostStateRoot}/${agent.agentId}`,
       containerPath: "/workspace",
     };
 
-    // Pre-create the workspace directory on the orchestrator's in-process
-    // view of the same mount, and chown to the non-root UID that runs
-    // inside the agent container. Without this, Docker daemon on Linux
-    // creates the bind-mount source dir as root:root, and the agent
-    // container's openclaw user (UID 999) can't write openclaw.json there.
-    // See the AGENT_CONTAINER_UID comment for the full rationale.
     const inProcessWorkspace = join(this.events.stateRoot, agent.agentId);
     mkdirSync(inProcessWorkspace, { recursive: true, mode: 0o755 });
     try {
       chownSync(inProcessWorkspace, AGENT_CONTAINER_UID, AGENT_CONTAINER_UID);
-    } catch (err) {
-      // chown fails on Docker Desktop for Mac (virtiofs ignores UID changes)
-      // and in any userns-remapped environment. That's OK — the original
-      // permission problem only exists on plain Linux bind mounts.
-      console.warn(
-        `[router] chown(${inProcessWorkspace}, ${AGENT_CONTAINER_UID}) failed (non-fatal on Mac/userns): ${String(err)}`,
-      );
+    } catch {
+      // Non-fatal on Mac/userns — see AGENT_CONTAINER_UID comment.
     }
 
-    // Inside the container, OpenClaw always sees itself as agent "main".
-    // That is OpenClaw's DEFAULT_AGENT_ID — aligning with it means:
-    //   1. The session store lives at agents/main/sessions/sessions.json,
-    //      which is where OpenClaw's session-key resolver and orphan-key
-    //      migration both look by default.
-    //   2. The canonical session key form `agent:main:<stable-key>` matches
-    //      OpenClaw's buildAgentMainSessionKey output, so startup migrations
-    //      don't wipe our mappings as "orphaned."
-    // Multi-tenancy is provided by the mount path (one orchestrator agent =
-    // one mount = one container), not by naming. The orchestrator's agent id
-    // lives in the label and mount path; inside the container it is "main".
-    // Item 12-14: mint a per-session parent token scoped to this agent
-    // template's callable_agents + the session's remaining subagent depth.
-    // The in-container `call_agent` CLI tool reads OPENCLAW_ORCHESTRATOR_URL
-    // and OPENCLAW_ORCHESTRATOR_TOKEN from the container env and uses them
-    // to make authenticated HTTP calls back to POST /v1/sessions. The
-    // orchestrator verifies the token on each call and rejects spawns that
-    // target an agent outside the allowlist or exceed the depth cap.
-    //
-    // Look up the session row to get remainingSubagentDepth (which was
-    // initialized at createSession time — either from the agent template's
-    // maxSubagentDepth for top-level sessions, or from the parent token's
-    // remaining_depth - 1 for child sessions). If the session is missing
-    // at this point something has gone very wrong, but fall back to a
-    // zero-depth token so the run can still complete without subagent
-    // capability rather than crashing.
-    const currentSession = this.sessions.get(sessionId);
-    const remainingDepth = currentSession?.remainingSubagentDepth ?? 0;
+    const remainingDepth = session.remainingSubagentDepth;
     const parentToken = this.cfg.tokenMinter.mint({
       parentSessionId: sessionId,
       parentAgentId: agent.agentId,
@@ -273,13 +249,6 @@ export class AgentRouter {
       remainingDepth,
     });
 
-    // Progressive disclosure of the call_agent capability. If this agent
-    // template permits delegation AND the session has remaining depth,
-    // append a short hint to the system prompt so the model discovers the
-    // tool exists. Full usage is still loaded on-demand via
-    // `openclaw-call-agent --help`, matching Mario's "CLI tools with
-    // READMEs" philosophy — the tool documentation is not baked into
-    // every container's context.
     let effectiveInstructions = agent.instructions;
     if (agent.callableAgents.length > 0 && remainingDepth > 0) {
       const hint = [
@@ -296,6 +265,10 @@ export class AgentRouter {
         : hint.trimStart();
     }
 
+    const envConfig = session.environmentId
+      ? this.environments.get(session.environmentId)
+      : undefined;
+
     const env: Record<string, string> = {
       ...this.cfg.passthroughEnv,
       OPENCLAW_AGENT_ID: "main",
@@ -307,8 +280,11 @@ export class AgentRouter {
       OPENCLAW_ORCHESTRATOR_URL: this.cfg.orchestratorUrl,
       OPENCLAW_ORCHESTRATOR_TOKEN: parentToken,
     };
+    if (envConfig?.packages) {
+      env.OPENCLAW_PACKAGES_JSON = JSON.stringify(envConfig.packages);
+    }
 
-    const spawnOptions: SpawnOptions = {
+    return {
       image: this.cfg.runtimeImage,
       env,
       mounts: [hostMount],
@@ -319,6 +295,20 @@ export class AgentRouter {
         "orchestrator-session-id": sessionId,
       },
     };
+  }
+
+  private async executeInBackground(
+    sessionId: string,
+    agent: AgentConfig,
+    content: string,
+    modelOverride?: string,
+  ): Promise<void> {
+    const currentSession = this.sessions.get(sessionId);
+    const spawnOptions = this.buildSpawnOptions(
+      sessionId,
+      agent,
+      currentSession ?? { remainingSubagentDepth: 0, environmentId: null } as Session,
+    );
 
     // Pool-backed: the first event for a session spawns a fresh container,
     // waits for /readyz, and runs the WS handshake; subsequent events

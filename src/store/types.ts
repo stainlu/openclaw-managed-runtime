@@ -1,6 +1,8 @@
 import type {
   AgentConfig,
   CreateAgentRequest,
+  CreateEnvironmentRequest,
+  EnvironmentConfig,
   Session,
 } from "../orchestrator/types.js";
 
@@ -19,6 +21,13 @@ export interface AgentStore {
   get(agentId: string): AgentConfig | undefined;
   list(): AgentConfig[];
   delete(agentId: string): boolean;
+}
+
+export interface EnvironmentStore {
+  create(req: CreateEnvironmentRequest): EnvironmentConfig;
+  get(environmentId: string): EnvironmentConfig | undefined;
+  list(): EnvironmentConfig[];
+  delete(environmentId: string): boolean;
 }
 
 export type RunUsage = {
@@ -54,6 +63,7 @@ export interface SessionStore {
   create(args: {
     agentId: string;
     sessionId?: string;
+    environmentId?: string;
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
   }): Session;
@@ -96,6 +106,7 @@ export interface SessionStore {
  */
 export interface Store {
   readonly agents: AgentStore;
+  readonly environments: EnvironmentStore;
   readonly sessions: SessionStore;
   /** Closes any backing file handles or connections. Safe to call more than once. */
   close(): void;

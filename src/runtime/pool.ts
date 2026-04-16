@@ -61,6 +61,7 @@ type ActiveContainer = {
 
 export class SessionContainerPool {
   private readonly active = new Map<string, ActiveContainer>();
+  private readonly pending = new Map<string, Promise<Container>>();
   private sweeperHandle: NodeJS.Timeout | undefined;
 
   constructor(
@@ -93,22 +94,36 @@ export class SessionContainerPool {
       existing.lastUsedAt = Date.now();
       return existing.container;
     }
+
+    // Deduplicate concurrent spawns for the same session. If a background
+    // warm-up (triggered at session-create time) is already in progress,
+    // wait for it rather than spawning a second container.
+    const inflight = this.pending.get(args.sessionId);
+    if (inflight) return inflight;
+
+    const spawnPromise = this.doSpawn(args);
+    this.pending.set(args.sessionId, spawnPromise);
+    try {
+      return await spawnPromise;
+    } finally {
+      this.pending.delete(args.sessionId);
+    }
+  }
+
+  private async doSpawn(args: {
+    sessionId: string;
+    spawnOptions: SpawnOptions;
+  }): Promise<Container> {
     const container = await this.runtime.spawn(args.spawnOptions);
     try {
       await this.runtime.waitForReady(container, this.cfg.readyTimeoutMs);
     } catch (err) {
-      // Spawn succeeded but readyz never came. The container is a dead
-      // tree — reap it before propagating the error.
       await this.runtime.stop(container.id).catch(() => {
         /* best-effort */
       });
       throw err;
     }
 
-    // After /readyz succeeds, run the WS handshake. If THAT fails, the
-    // container is fine but Item 7 control ops would be broken — we still
-    // tear the container down so the next event respawns cleanly with a
-    // working WS client.
     const wsClient = new GatewayWebSocketClient({
       baseUrl: container.baseUrl,
       token: container.token,

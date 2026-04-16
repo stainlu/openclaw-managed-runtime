@@ -11,3 +11,6 @@ coverage/
 *.tsbuildinfo
 data/
 .openclaw/
+
+# Local strategy notes — gitignored by design (see docs/strategic-comparisons.md)
+docs/strategic-comparisons.md

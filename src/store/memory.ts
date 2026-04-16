@@ -2,9 +2,11 @@ import { customAlphabet } from "nanoid";
 import type {
   AgentConfig,
   CreateAgentRequest,
+  CreateEnvironmentRequest,
+  EnvironmentConfig,
   Session,
 } from "../orchestrator/types.js";
-import type { AgentStore, RunUsage, SessionStore, Store } from "./types.js";
+import type { AgentStore, EnvironmentStore, RunUsage, SessionStore, Store } from "./types.js";
 
 const nanoid = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
 
@@ -41,6 +43,36 @@ class InMemoryAgentStore implements AgentStore {
   }
 }
 
+// ---------- Environments ----------
+
+class InMemoryEnvironmentStore implements EnvironmentStore {
+  private readonly environments = new Map<string, EnvironmentConfig>();
+
+  create(req: CreateEnvironmentRequest): EnvironmentConfig {
+    const env: EnvironmentConfig = {
+      environmentId: `env_${nanoid()}`,
+      name: req.name,
+      packages: req.packages ?? null,
+      networking: req.networking,
+      createdAt: Date.now(),
+    };
+    this.environments.set(env.environmentId, env);
+    return env;
+  }
+
+  get(environmentId: string): EnvironmentConfig | undefined {
+    return this.environments.get(environmentId);
+  }
+
+  list(): EnvironmentConfig[] {
+    return Array.from(this.environments.values());
+  }
+
+  delete(environmentId: string): boolean {
+    return this.environments.delete(environmentId);
+  }
+}
+
 // ---------- Sessions ----------
 
 class InMemorySessionStore implements SessionStore {
@@ -49,6 +81,7 @@ class InMemorySessionStore implements SessionStore {
   create(args: {
     agentId: string;
     sessionId?: string;
+    environmentId?: string;
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
   }): Session {
@@ -56,6 +89,7 @@ class InMemorySessionStore implements SessionStore {
     const session: Session = {
       sessionId,
       agentId: args.agentId,
+      environmentId: args.environmentId ?? null,
       status: "idle",
       ephemeral: args.ephemeral ?? false,
       remainingSubagentDepth: args.remainingSubagentDepth ?? 0,
@@ -148,10 +182,12 @@ class InMemorySessionStore implements SessionStore {
 
 export class InMemoryStore implements Store {
   readonly agents: AgentStore;
+  readonly environments: EnvironmentStore;
   readonly sessions: SessionStore;
 
   constructor() {
     this.agents = new InMemoryAgentStore();
+    this.environments = new InMemoryEnvironmentStore();
     this.sessions = new InMemorySessionStore();
   }
 

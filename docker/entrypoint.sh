@@ -213,6 +213,35 @@ cat "${CONFIG_PATH}"
 export OPENCLAW_CONFIG_PATH="${CONFIG_PATH}"
 export OPENCLAW_STATE_DIR="${STATE_DIR}"
 
+# Item 15: install environment packages if OPENCLAW_PACKAGES_JSON is set.
+# The JSON has optional keys: pip, apt, npm (each an array of package specs).
+# Runs BEFORE the gateway boots so packages are available when the agent starts.
+if [ -n "${OPENCLAW_PACKAGES_JSON:-}" ]; then
+  echo "[entrypoint] installing environment packages: ${OPENCLAW_PACKAGES_JSON}"
+  APT_PKGS=$(echo "${OPENCLAW_PACKAGES_JSON}" | jq -r '.apt // [] | join(" ")')
+  PIP_PKGS=$(echo "${OPENCLAW_PACKAGES_JSON}" | jq -r '.pip // [] | join(" ")')
+  NPM_PKGS=$(echo "${OPENCLAW_PACKAGES_JSON}" | jq -r '.npm // [] | join(" ")')
+  if [ -n "${APT_PKGS}" ] && command -v apt-get >/dev/null 2>&1; then
+    echo "[entrypoint] apt-get install: ${APT_PKGS}"
+    (apt-get update -qq && apt-get install -y -qq ${APT_PKGS}) 2>&1 | tail -5 || echo "[entrypoint] WARNING: apt-get install failed (non-fatal)"
+  elif [ -n "${APT_PKGS}" ]; then
+    echo "[entrypoint] WARNING: apt-get not available, skipping: ${APT_PKGS}"
+  fi
+  if [ -n "${PIP_PKGS}" ] && command -v pip >/dev/null 2>&1; then
+    echo "[entrypoint] pip install: ${PIP_PKGS}"
+    pip install --quiet ${PIP_PKGS} 2>&1 | tail -5 || echo "[entrypoint] WARNING: pip install failed (non-fatal)"
+  elif [ -n "${PIP_PKGS}" ]; then
+    echo "[entrypoint] WARNING: pip not available, skipping: ${PIP_PKGS}"
+  fi
+  if [ -n "${NPM_PKGS}" ] && command -v npm >/dev/null 2>&1; then
+    echo "[entrypoint] npm install: ${NPM_PKGS}"
+    npm install --prefix /tmp/openclaw-env-packages ${NPM_PKGS} 2>&1 | tail -5 || echo "[entrypoint] WARNING: npm install failed (non-fatal)"
+  elif [ -n "${NPM_PKGS}" ]; then
+    echo "[entrypoint] WARNING: npm not available, skipping: ${NPM_PKGS}"
+  fi
+  echo "[entrypoint] environment packages installed"
+fi
+
 echo "[entrypoint] starting gateway on port ${OPENCLAW_GATEWAY_PORT} (bind=lan, auth=token)"
 exec openclaw gateway run \
   --port "${OPENCLAW_GATEWAY_PORT}" \

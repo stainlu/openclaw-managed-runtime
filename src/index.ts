@@ -215,6 +215,7 @@ async function main(): Promise<void> {
 
   const router = new AgentRouter(
     store.agents,
+    store.environments,
     store.sessions,
     eventReader,
     pool,
@@ -260,6 +261,7 @@ async function main(): Promise<void> {
   await startServer(
     {
       agents: store.agents,
+      environments: store.environments,
       sessions: store.sessions,
       events: eventReader,
       router,

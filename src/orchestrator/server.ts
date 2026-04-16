@@ -3,15 +3,17 @@ import { type Context, Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
-import type { AgentStore, SessionStore } from "../store/types.js";
+import type { AgentStore, EnvironmentStore, SessionStore } from "../store/types.js";
 import { AgentRouter, RouterError } from "./router.js";
 import {
   CreateAgentRequestSchema,
+  CreateEnvironmentRequestSchema,
   CreateSessionRequestSchema,
   OpenAIChatCompletionRequestSchema,
   PostEventRequestSchema,
   RunAgentRequestSchema,
   type AgentConfig,
+  type EnvironmentConfig,
   type Event,
   type Session,
 } from "./types.js";
@@ -30,6 +32,7 @@ const CHAT_COMPLETION_POLL_MS = 500;
 
 export type ServerDeps = {
   agents: AgentStore;
+  environments: EnvironmentStore;
   sessions: SessionStore;
   events: PiJsonlEventReader;
   router: AgentRouter;
@@ -57,6 +60,16 @@ function agentResponse(agent: AgentConfig) {
   };
 }
 
+function environmentResponse(env: EnvironmentConfig) {
+  return {
+    environment_id: env.environmentId,
+    name: env.name,
+    packages: env.packages,
+    networking: env.networking,
+    created_at: env.createdAt,
+  };
+}
+
 // Session response shape. `output` is a computed convenience: the content of
 // the most recent agent.message in the session, or null if none yet. The
 // event log lives in Pi's JSONL on the host mount — see PiJsonlEventReader.
@@ -65,6 +78,7 @@ function sessionResponse(session: Session, events: PiJsonlEventReader) {
   return {
     session_id: session.sessionId,
     agent_id: session.agentId,
+    environment_id: session.environmentId,
     status: session.status,
     output: latestAgent?.content ?? null,
     tokens: {
@@ -127,6 +141,12 @@ export function buildApp(deps: ServerDeps): Hono {
           delete: "DELETE /v1/agents/:agentId",
           run: "POST /v1/agents/:agentId/run",
         },
+        environments: {
+          create: "POST /v1/environments",
+          list: "GET /v1/environments",
+          get: "GET /v1/environments/:environmentId",
+          delete: "DELETE /v1/environments/:environmentId",
+        },
         sessions: {
           create: "POST /v1/sessions",
           list: "GET /v1/sessions",
@@ -184,6 +204,51 @@ export function buildApp(deps: ServerDeps): Hono {
     return c.json({ deleted: true });
   });
 
+  // ---------- Environments (container configuration templates) ----------
+
+  app.post("/v1/environments", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = CreateEnvironmentRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
+    }
+    const env = deps.environments.create(parsed.data);
+    return c.json(environmentResponse(env));
+  });
+
+  app.get("/v1/environments", (c) => {
+    const envs = deps.environments.list().map(environmentResponse);
+    return c.json({ environments: envs, count: envs.length });
+  });
+
+  app.get("/v1/environments/:environmentId", (c) => {
+    const environmentId = c.req.param("environmentId");
+    const env = deps.environments.get(environmentId);
+    if (!env) {
+      return c.json({ error: "environment_not_found" }, 404);
+    }
+    return c.json(environmentResponse(env));
+  });
+
+  app.delete("/v1/environments/:environmentId", (c) => {
+    const environmentId = c.req.param("environmentId");
+    const env = deps.environments.get(environmentId);
+    if (!env) {
+      return c.json({ error: "environment_not_found" }, 404);
+    }
+    const referencingSessions = deps.sessions.list().filter(
+      (s) => s.environmentId === environmentId,
+    );
+    if (referencingSessions.length > 0) {
+      return c.json({
+        error: "environment_in_use",
+        message: `${referencingSessions.length} session(s) reference this environment`,
+      }, 409);
+    }
+    deps.environments.delete(environmentId);
+    return c.json({ deleted: true });
+  });
+
   // ---------- Sessions (long-lived, session-centric API) ----------
 
   app.post("/v1/sessions", async (c) => {
@@ -232,9 +297,23 @@ export function buildApp(deps: ServerDeps): Hono {
       remainingSubagentDepthOverride = payload.remainingDepth - 1;
     }
 
+    if (parsed.data.environmentId) {
+      const env = deps.environments.get(parsed.data.environmentId);
+      if (!env) {
+        return c.json({ error: "environment_not_found", message: `environment ${parsed.data.environmentId} does not exist` }, 404);
+      }
+    }
+
     try {
       const session = deps.router.createSession(parsed.data.agentId, {
+        environmentId: parsed.data.environmentId,
         remainingSubagentDepth: remainingSubagentDepthOverride,
+      });
+      // Proactive warm-up: start booting the container in the background
+      // so it's ready (or nearly ready) by the time the first event arrives.
+      // Fire-and-forget — failure is non-fatal; the first event cold-spawns.
+      void deps.router.warmSession(session.sessionId).catch((err) => {
+        console.warn(`[server] background warm-up for ${session.sessionId} failed (non-fatal):`, err);
       });
       return c.json(sessionResponse(session, deps.events));
     } catch (err) {

@@ -3,10 +3,14 @@ import { customAlphabet } from "nanoid";
 import type {
   AgentConfig,
   CreateAgentRequest,
+  CreateEnvironmentRequest,
+  EnvironmentConfig,
+  Networking,
+  Packages,
   Session,
   SessionStatus,
 } from "../orchestrator/types.js";
-import type { AgentStore, RunUsage, SessionStore, Store } from "./types.js";
+import type { AgentStore, EnvironmentStore, RunUsage, SessionStore, Store } from "./types.js";
 
 const nanoid = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
 
@@ -23,9 +27,18 @@ type AgentRow = {
   max_subagent_depth: number;
 };
 
+type EnvironmentRow = {
+  environment_id: string;
+  name: string;
+  packages_json: string | null;
+  networking_json: string;
+  created_at: number;
+};
+
 type SessionRow = {
   session_id: string;
   agent_id: string;
+  environment_id: string | null;
   status: string;
   ephemeral: number;
   remaining_subagent_depth: number;
@@ -52,10 +65,21 @@ function rowToAgent(r: AgentRow): AgentConfig {
   };
 }
 
+function rowToEnvironment(r: EnvironmentRow): EnvironmentConfig {
+  return {
+    environmentId: r.environment_id,
+    name: r.name,
+    packages: r.packages_json ? (JSON.parse(r.packages_json) as Packages) : null,
+    networking: JSON.parse(r.networking_json) as Networking,
+    createdAt: r.created_at,
+  };
+}
+
 function rowToSession(r: SessionRow): Session {
   return {
     sessionId: r.session_id,
     agentId: r.agent_id,
+    environmentId: r.environment_id,
     status: r.status as SessionStatus,
     ephemeral: r.ephemeral === 1,
     remainingSubagentDepth: r.remaining_subagent_depth,
@@ -97,6 +121,14 @@ CREATE TABLE IF NOT EXISTS agents (
   created_at INTEGER NOT NULL,
   callable_agents_json TEXT,
   max_subagent_depth INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS environments (
+  environment_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  packages_json TEXT,
+  networking_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -182,6 +214,61 @@ class SqliteAgentStore implements AgentStore {
   }
 }
 
+// ---------- Environment store ----------
+
+class SqliteEnvironmentStore implements EnvironmentStore {
+  private readonly insertStmt: Database.Statement;
+  private readonly getStmt: Database.Statement;
+  private readonly listStmt: Database.Statement;
+  private readonly deleteStmt: Database.Statement;
+
+  constructor(private readonly db: Database.Database) {
+    this.insertStmt = db.prepare(
+      `INSERT INTO environments (
+        environment_id, name, packages_json, networking_json, created_at
+       ) VALUES (
+        @environment_id, @name, @packages_json, @networking_json, @created_at
+       )`,
+    );
+    this.getStmt = db.prepare(`SELECT * FROM environments WHERE environment_id = ?`);
+    this.listStmt = db.prepare(`SELECT * FROM environments ORDER BY created_at ASC`);
+    this.deleteStmt = db.prepare(`DELETE FROM environments WHERE environment_id = ?`);
+  }
+
+  create(req: CreateEnvironmentRequest): EnvironmentConfig {
+    const env: EnvironmentConfig = {
+      environmentId: `env_${nanoid()}`,
+      name: req.name,
+      packages: req.packages ?? null,
+      networking: req.networking,
+      createdAt: Date.now(),
+    };
+    this.insertStmt.run({
+      environment_id: env.environmentId,
+      name: env.name,
+      packages_json: env.packages ? JSON.stringify(env.packages) : null,
+      networking_json: JSON.stringify(env.networking),
+      created_at: env.createdAt,
+    });
+    return env;
+  }
+
+  get(environmentId: string): EnvironmentConfig | undefined {
+    const row = this.getStmt.get(environmentId) as EnvironmentRow | undefined;
+    return row ? rowToEnvironment(row) : undefined;
+  }
+
+  list(): EnvironmentConfig[] {
+    const rows = this.listStmt.all() as EnvironmentRow[];
+    return rows.map(rowToEnvironment);
+  }
+
+  delete(environmentId: string): boolean {
+    const info = this.deleteStmt.run(environmentId);
+    return info.changes > 0;
+  }
+}
+
 // ---------- Session store ----------
 
 class SqliteSessionStore implements SessionStore {
@@ -199,11 +286,13 @@ class SqliteSessionStore implements SessionStore {
   constructor(private readonly db: Database.Database) {
     this.insertStmt = db.prepare(
       `INSERT INTO sessions (
-        session_id, agent_id, status, ephemeral, remaining_subagent_depth,
+        session_id, agent_id, environment_id, status, ephemeral,
+        remaining_subagent_depth,
         tokens_in, tokens_out, cost_usd,
         error, created_at, last_event_at
        ) VALUES (
-        @session_id, @agent_id, 'idle', @ephemeral, @remaining_subagent_depth,
+        @session_id, @agent_id, @environment_id, 'idle', @ephemeral,
+        @remaining_subagent_depth,
         0, 0, 0, NULL, @created_at, NULL
        )`,
     );
@@ -252,16 +341,19 @@ class SqliteSessionStore implements SessionStore {
   create(args: {
     agentId: string;
     sessionId?: string;
+    environmentId?: string;
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
   }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
+    const environmentId = args.environmentId ?? null;
     const ephemeral = args.ephemeral ?? false;
     const remainingSubagentDepth = args.remainingSubagentDepth ?? 0;
     const createdAt = Date.now();
     this.insertStmt.run({
       session_id: sessionId,
       agent_id: args.agentId,
+      environment_id: environmentId,
       ephemeral: ephemeral ? 1 : 0,
       remaining_subagent_depth: remainingSubagentDepth,
       created_at: createdAt,
@@ -269,6 +361,7 @@ class SqliteSessionStore implements SessionStore {
     return {
       sessionId,
       agentId: args.agentId,
+      environmentId,
       status: "idle",
       ephemeral,
       remainingSubagentDepth,
@@ -355,6 +448,7 @@ class SqliteSessionStore implements SessionStore {
 
 export class SqliteStore implements Store {
   readonly agents: AgentStore;
+  readonly environments: EnvironmentStore;
   readonly sessions: SessionStore;
   private readonly db: Database.Database;
   private closed = false;
@@ -377,6 +471,11 @@ export class SqliteStore implements Store {
     const sessionsCols = this.db.pragma("table_info(sessions)") as Array<{
       name: string;
     }>;
+    if (!sessionsCols.some((c) => c.name === "environment_id")) {
+      this.db.exec(
+        "ALTER TABLE sessions ADD COLUMN environment_id TEXT",
+      );
+    }
     if (!sessionsCols.some((c) => c.name === "ephemeral")) {
       // Item 8: ephemeral sessions are auto-created by /v1/chat/completions
       // for keyless calls and reaped with their container. Rows that pre-date
@@ -411,6 +510,7 @@ export class SqliteStore implements Store {
     }
 
     this.agents = new SqliteAgentStore(this.db);
+    this.environments = new SqliteEnvironmentStore(this.db);
     this.sessions = new SqliteSessionStore(this.db);
   }
 
