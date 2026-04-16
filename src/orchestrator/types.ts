@@ -164,17 +164,22 @@ export type CreateSessionRequest = z.infer<typeof CreateSessionRequestSchema>;
 
 // ---------- Event (the interaction primitive) ----------
 
-// Event types map 1:1 to what flows through Pi's AgentSession event bus, just
-// projected onto our HTTP API. For Item 2 the orchestrator only materializes
-// user.message (posted by the client), agent.message (the model's reply), and
-// agent.error (an unrecoverable run failure). Richer event types — tool_call,
-// thinking, compaction — are added when we wire up the streaming event bus.
+// Event types projected from Pi's JSONL session file onto our HTTP API.
+// Agent-level events (message, tool_use, tool_result, thinking) come from
+// Pi's message entries. Session-level events (model_change,
+// thinking_level_change, compaction) come from Pi's metadata entries.
+// session.status_* events are synthetic — emitted by the orchestrator in
+// the SSE stream, not read from the JSONL.
 export type EventType =
   | "user.message"
   | "agent.message"
   | "agent.error"
   | "agent.tool_use"
-  | "agent.tool_result";
+  | "agent.tool_result"
+  | "agent.thinking"
+  | "session.model_change"
+  | "session.thinking_level_change"
+  | "session.compaction";
 
 export type Event = {
   eventId: string;

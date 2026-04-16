@@ -460,11 +460,38 @@ export function buildApp(deps: ServerDeps): Hono {
         const abort = new AbortController();
         sse.onAbort(() => abort.abort());
 
+        // Track session status so we can emit synthetic status events
+        // when the session transitions between idle/running/failed.
+        let lastEmittedStatus = session.status;
+        const emitStatusEvent = async (status: string) => {
+          if (sse.aborted || sse.closed) return;
+          await sse.writeSSE({
+            event: `session.status_${status}`,
+            data: JSON.stringify({
+              session_id: sessionId,
+              status,
+              ts: Date.now(),
+            }),
+          });
+        };
+
+        // Emit the initial session status so the client knows the
+        // starting state without having to query GET /v1/sessions/:id.
+        await emitStatusEvent(lastEmittedStatus);
+
         // Heartbeats so intermediate proxies don't idle-kill the socket.
         // Every 15s we send a dedicated "heartbeat" event type; clients
         // that don't care can ignore it via addEventListener filtering.
+        // Also check for session status transitions on each tick.
         const heartbeat = setInterval(() => {
           if (sse.aborted || sse.closed) return;
+          const current = deps.sessions.get(sessionId);
+          if (current && current.status !== lastEmittedStatus) {
+            lastEmittedStatus = current.status;
+            emitStatusEvent(lastEmittedStatus).catch(() => {
+              /* best-effort */
+            });
+          }
           sse
             .writeSSE({
               event: "heartbeat",
@@ -486,11 +513,28 @@ export function buildApp(deps: ServerDeps): Hono {
             },
           )) {
             if (sse.aborted || sse.closed) break;
+
+            // Check for status change on every yielded event (more
+            // responsive than waiting for the 15s heartbeat).
+            const current = deps.sessions.get(sessionId);
+            if (current && current.status !== lastEmittedStatus) {
+              lastEmittedStatus = current.status;
+              await emitStatusEvent(lastEmittedStatus);
+            }
+
             await sse.writeSSE({
               event: event.type,
               id: event.eventId,
               data: JSON.stringify(eventResponse(event)),
             });
+          }
+
+          // follow() returned — either client disconnected, session went
+          // idle past the grace period, or the abort signal fired. Emit
+          // a final status event if it changed since last emission.
+          const finalSession = deps.sessions.get(sessionId);
+          if (finalSession && finalSession.status !== lastEmittedStatus) {
+            await emitStatusEvent(finalSession.status);
           }
         } finally {
           clearInterval(heartbeat);

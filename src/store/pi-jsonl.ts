@@ -54,6 +54,15 @@ type PiLine = {
   id?: string;
   timestamp?: string;
   message?: PiMessage;
+  // model_change entry fields
+  provider?: string;
+  modelId?: string;
+  // thinking_level_change entry fields
+  thinkingLevel?: string;
+  // compaction entry fields
+  summary?: string;
+  firstKeptEntryId?: string;
+  tokensBefore?: number;
 };
 
 type SessionsJsonEntry = {
@@ -253,12 +262,48 @@ function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 function mapLineToEvents(line: PiLine, sessionId: string): Event[] {
+  const eventId = line.id ?? "";
+  const createdAt = line.timestamp ? Date.parse(line.timestamp) : Date.now();
+
+  // Non-message JSONL entry types: model changes, thinking level toggles,
+  // compaction summaries. These are session-level metadata events, not
+  // agent conversation turns.
+  if (line.type === "model_change") {
+    const model = combineModel(line.provider, line.modelId);
+    if (!model) return [];
+    return [{
+      eventId,
+      sessionId,
+      type: "session.model_change",
+      content: model,
+      createdAt,
+      model,
+    }];
+  }
+
+  if (line.type === "thinking_level_change") {
+    return [{
+      eventId,
+      sessionId,
+      type: "session.thinking_level_change",
+      content: line.thinkingLevel ?? "unknown",
+      createdAt,
+    }];
+  }
+
+  if (line.type === "compaction") {
+    return [{
+      eventId,
+      sessionId,
+      type: "session.compaction",
+      content: line.summary ?? "(compacted)",
+      createdAt,
+    }];
+  }
+
   if (line.type !== "message") return [];
   const msg = line.message;
   if (!msg) return [];
-
-  const eventId = line.id ?? "";
-  const createdAt = line.timestamp ? Date.parse(line.timestamp) : Date.now();
 
   if (msg.role === "user") {
     const text = extractText(msg.content);
@@ -275,6 +320,25 @@ function mapLineToEvents(line: PiLine, sessionId: string): Event[] {
   if (msg.role === "assistant") {
     const events: Event[] = [];
     const text = extractText(msg.content);
+
+    // Emit agent.thinking events for thinking content blocks.
+    // These appear when a thinking-capable model (e.g. Claude with
+    // extended thinking) is used with thinkingLevel != "off".
+    if (msg.content) {
+      let thinkingIdx = 0;
+      for (const block of msg.content) {
+        if (block.type === "thinking" && typeof block.text === "string" && block.text.length > 0) {
+          events.push({
+            eventId: `${eventId}:thinking:${String(thinkingIdx)}`,
+            sessionId,
+            type: "agent.thinking",
+            content: block.text,
+            createdAt,
+          });
+          thinkingIdx++;
+        }
+      }
+    }
 
     // Emit agent.tool_use events for each toolCall content block.
     if (msg.content) {
