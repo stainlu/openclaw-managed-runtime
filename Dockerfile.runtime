@@ -92,6 +92,16 @@ RUN chmod +x /usr/local/bin/openclaw-call-agent
 # in place and owned by the openclaw user.
 COPY docker/confirm-tools-plugin/ /opt/openclaw-plugins/confirm-tools/
 
+# Category B provider catalog bootstrap. At container startup the entrypoint
+# runs this script with the generated openclaw.json path and the active
+# provider id; the script dynamic-imports the bundled openclaw extension's
+# catalog-builder (e.g. buildMoonshotProvider) and merges the full catalog
+# into config.models.providers.<id>. Replaces the earlier hand-mirrored
+# PROVIDER_BLOCK_JSON in entrypoint.sh — upstream catalog changes (new
+# models, revised prices — see openclaw/openclaw#67928) now flow through
+# automatically on the next image rebuild.
+COPY docker/apply-provider-config.mjs /opt/openclaw-plugins/apply-provider-config.mjs
+
 USER openclaw
 WORKDIR /workspace
 

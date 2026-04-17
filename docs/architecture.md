@@ -192,13 +192,9 @@ Environment the entrypoint reads:
 | `OPENCLAW_CONFIRM_TOOLS` | comma-separated tool names requiring confirmation, or `__ALL__` (from `always_ask` policy) | `""` |
 | `OPENCLAW_ORCHESTRATOR_URL` | URL for the in-container `call_agent` CLI to reach the orchestrator | injected per container |
 | `OPENCLAW_ORCHESTRATOR_TOKEN` | HMAC-signed parent token for subagent delegation | injected per container |
-| `OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M` | Moonshot per-turn cost override, USD per million input tokens (Category B plugin has no upstream catalog) | `0` |
-| `OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M` | Moonshot per-turn cost override, USD per million output tokens | `0` |
-| `OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M` | Moonshot per-turn cost override, USD per million cache-read tokens | `0` |
-| `OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M` | Moonshot per-turn cost override, USD per million cache-write tokens | `0` |
 | `<PROVIDER>_API_KEY` | whichever API key the selected provider needs | forwarded from the host |
 
-The orchestrator forwards whichever provider API keys are present in its own environment (`MOONSHOT_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AWS_*`, etc.). See `collectPassthroughEnv()` in `src/index.ts` for the default allowlist and `OPENCLAW_PASSTHROUGH_ENV` for the escape hatch. The `OPENCLAW_MOONSHOT_PRICE_*` overrides are also forwarded by default so Moonshot deployments can report real `cost_usd` without rebuilding the image.
+The orchestrator forwards whichever provider API keys are present in its own environment (`MOONSHOT_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AWS_*`, etc.). See `collectPassthroughEnv()` in `src/index.ts` for the default allowlist and `OPENCLAW_PASSTHROUGH_ENV` for the escape hatch.
 
 #### Generated `openclaw.json` (Moonshot example)
 
@@ -230,29 +226,10 @@ The orchestrator forwards whichever provider API keys are present in its own env
   "models": {
     "mode": "merge",
     "providers": {
-      "moonshot": {
-        "baseUrl": "https://api.moonshot.ai/v1",
-        "api": "openai-completions",
-        "models": [
-          {
-            "id": "kimi-k2.5",
-            "name": "Kimi K2.5",
-            "input": ["text", "image"],
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": 262144,
-            "maxTokens": 262144
-          }
-        ]
-      }
+      "moonshot": { /* full catalog injected at startup by apply-provider-config.mjs
+                       from the bundled openclaw extension's buildMoonshotProvider() */ }
     }
   },
-  // The `cost` block above shows the zero defaults. At runtime the
-  // entrypoint reads OPENCLAW_MOONSHOT_PRICE_*_USD_PER_M from the
-  // container env and substitutes per-token values (USD per token).
-  // See `docker/entrypoint.sh` for the awk/jq conversion path. Category A
-  // providers (anthropic, openai, google, xai, mistral, openrouter,
-  // amazon-bedrock) publish non-zero cost via their plugin catalogs and
-  // do not need this env-var override.
   "plugins": {
     "entries": {
       "moonshot": { "enabled": true },
@@ -289,9 +266,9 @@ OpenClaw provider plugins fall into two categories, and the entrypoint handles e
 
 **Category B: require an onboarding flow to materialize the catalog.** Plugins built with `defineSingleProviderPluginEntry` — for example `moonshot` — define their catalog declaratively through a `catalog.buildProvider` hook that is only invoked during the interactive `openclaw models auth login` flow (`applyMoonshotConfig` in `extensions/moonshot/onboard.ts`). Without that flow, the catalog never appears in the runtime registry and invocation fails with `Unknown model`.
 
-For Category B providers the entrypoint writes a hardcoded `models.providers.<id>` block that mirrors what the interactive flow would produce. Extend `PROVIDER_BLOCK_JSON` in `docker/entrypoint.sh` when adding more Category B providers (DeepSeek and Qwen are likely candidates). A clean upstream fix is to make `defineSingleProviderPluginEntry` auto-register its default catalog — that is a follow-up contribution to OpenClaw proper, not something the runtime blocks on.
+For Category B providers the entrypoint runs `docker/apply-provider-config.mjs` at container startup. That script dynamic-imports the bundled openclaw extension's catalog-builder (e.g. `buildMoonshotProvider()` from `openclaw/dist/extensions/moonshot/provider-catalog.js`) and merges the full catalog into `config.models.providers.<id>`. The upstream catalog is the source of truth — when upstream prices or model IDs change (see [openclaw/openclaw#67928](https://github.com/openclaw/openclaw/pull/67928) for real Moonshot prices), we pick up the change on the next image rebuild with no downstream edit required.
 
-Category B plugins also don't publish catalog prices upstream, so `cost_usd` reads zero unless the operator supplies them. For Moonshot specifically, the entrypoint reads `OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M`, `OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M`, `OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M`, and `OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M` from the container env, divides by 1,000,000 (Pi's catalog uses USD/token, not USD/M), and substitutes the values into the generated `cost: { input, output, cacheRead, cacheWrite }` block. These env vars are in the default `collectPassthroughEnv()` allowlist, so exporting them on the orchestrator host flows through to every spawned agent container with no rebuild.
+Earlier versions of this runtime hand-mirrored the provider block inside `docker/entrypoint.sh` (the old `PROVIDER_BLOCK_JSON` variable) and had a parallel `OPENCLAW_MOONSHOT_PRICE_*_USD_PER_M` env-var override path to compensate for the upstream catalog's zero prices. Both are gone; the bundled extension is now the single source of truth. Adding another Category B provider (deepseek, qwen, fireworks, together, kilocode) is one line in `PROVIDER_CATALOGS` at the top of `apply-provider-config.mjs`.
 
 ### Session persistence and continuity
 
@@ -509,7 +486,7 @@ Why read from the JSONL instead of computing cost in the orchestrator:
 2. **Cache-aware for free.** Moonshot and Anthropic both bill `cacheRead` tokens at a much lower rate than fresh input. A naive `tokens * perMillion` sheet ignores that and reports the wrong number. Pi's per-turn cost already includes the cache discount.
 3. **Zero hardcoding.** The orchestrator is provider-agnostic. It does not embed knowledge of any particular provider's pricing.
 
-When cost is zero: if a provider plugin does not report cost, `message.usage.cost.total` stays 0, and that's what the orchestrator rolls up. Moonshot's Category B plugin has no upstream catalog prices, so its default is `0` across input/output/cacheRead/cacheWrite. The entrypoint reads `OPENCLAW_MOONSHOT_PRICE_{INPUT,OUTPUT,CACHE_READ,CACHE_WRITE}_USD_PER_M` at container start and substitutes per-token values into the generated `openclaw.json` — set these on the orchestrator host (or in `.env`) and Moonshot runs will report real `cost_usd` through the same read path with no code changes. Any Category A provider (anthropic, openai, google, xai, mistral, openrouter, amazon-bedrock) whose plugin auto-registers its catalog reports a real non-zero value without any operator action.
+When cost is zero: if a provider plugin does not report cost, `message.usage.cost.total` stays 0, and that's what the orchestrator rolls up. Moonshot's upstream catalog currently ships zero prices (tracked by [openclaw/openclaw#67928](https://github.com/openclaw/openclaw/pull/67928), which populates real per-token prices); once that PR lands and we bump the `openclaw` pin in `Dockerfile.runtime`, Moonshot runs start reporting real `cost_usd` through `apply-provider-config.mjs` with no other code change required. Any Category A provider (anthropic, openai, google, xai, mistral, openrouter, amazon-bedrock) whose plugin auto-registers its catalog reports a real non-zero value today without any operator action.
 
 ## What lives where
 

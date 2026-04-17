@@ -88,14 +88,6 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
-      # Moonshot price overrides (per million tokens). Moonshot's plugin
-      # does not publish catalog prices upstream, so `cost_usd` reads zero
-      # unless real numbers are supplied here. Check
-      # https://platform.moonshot.ai/docs/pricing and set whichever apply.
-      OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M: ${OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M:-}
-      OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M: ${OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M:-}
-      OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M: ${OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M:-}
-      OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M: ${OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M:-}
       # Extend with custom provider env vars without recompiling:
       OPENCLAW_PASSTHROUGH_ENV: ${OPENCLAW_PASSTHROUGH_ENV:-}
     volumes:

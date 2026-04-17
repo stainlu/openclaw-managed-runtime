@@ -92,15 +92,6 @@ function collectPassthroughEnv(): Record<string, string> {
     "OPENROUTER_API_KEY",
     "FIREWORKS_API_KEY",
     "GROQ_API_KEY",
-    // Optional per-provider price overrides. Moonshot's plugin does not
-    // publish catalog prices upstream, so cost_usd reads zero unless the
-    // operator supplies real numbers. See docker/entrypoint.sh for the
-    // per-M USD semantics. Forwarding these matches how provider API
-    // keys flow — set once on the orchestrator host, picked up at spawn.
-    "OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M",
-    "OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M",
-    "OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M",
-    "OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M",
   ];
   const extraKeys = (process.env.OPENCLAW_PASSTHROUGH_ENV ?? "")
     .split(",")

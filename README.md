@@ -181,7 +181,7 @@ The SSE stream emits an initial status event on connect and checks for status tr
 
 **Cancel + queue.** Cancel aborts the in-flight run via the WebSocket control plane. Events posted to a busy session queue automatically and drain in order.
 
-**Per-turn cost.** Each session tracks rolling `tokens_in`, `tokens_out`, and `cost_usd` from the provider's own billing data — cache-aware, not a static price sheet. Anthropic, OpenAI, Google, xAI, Mistral, OpenRouter, and Bedrock auto-report non-zero cost with no config. Moonshot's upstream plugin does not publish catalog prices, so `cost_usd` reads zero unless you supply them via `OPENCLAW_MOONSHOT_PRICE_{INPUT,OUTPUT,CACHE_READ,CACHE_WRITE}_USD_PER_M` (USD per million tokens).
+**Per-turn cost.** Each session tracks rolling `tokens_in`, `tokens_out`, and `cost_usd` from the provider's own billing data — cache-aware, not a static price sheet. Anthropic, OpenAI, Google, xAI, Mistral, OpenRouter, and Bedrock auto-report non-zero cost with no config. Moonshot's upstream catalog currently ships zero prices (real prices tracked in [openclaw/openclaw#67928](https://github.com/openclaw/openclaw/pull/67928)); once that PR lands and the openclaw pin bumps, Moonshot reports real cost via the same path with zero runtime changes.
 
 **OpenAI SDK drop-in.** Point any OpenAI SDK at `http://<host>:8080/v1` with an `x-openclaw-agent-id` header. Sticky sessions via the `user` field. Emulated streaming (`stream: true`).
 

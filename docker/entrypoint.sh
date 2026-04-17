@@ -111,82 +111,13 @@ denied_tools_json_fragment() {
 
 DENIED_TOOLS_JSON=$(denied_tools_json_fragment)
 
-# Some OpenClaw provider plugins auto-register their static catalog at plugin
-# load time (e.g. anthropic, openai, google). Others use
-# `defineSingleProviderPluginEntry` and only materialize their catalog into
-# `models.providers.<id>` through an interactive `openclaw models auth login`
-# flow (e.g. moonshot). For the second class, we have to emit that block
-# ourselves so the runtime model registry knows about the model. The content
-# below mirrors what `applyMoonshotConfig` / `applyMoonshotConfigCn` in
-# extensions/moonshot/onboard.ts produces. Extend PROVIDER_BLOCK_JSON below as
-# we add more providers that require this pattern.
-#
-# Pricing caveat (Moonshot). Prices below default to zero — kept as a
-# placeholder because Moonshot's plugin does NOT publish catalog prices
-# upstream, and hardcoding stale prices here would drift silently. The
-# `cost_usd` field surfaced to clients via Pi's JSONL will read zero for
-# Moonshot until one of the following happens:
-#
-#   1. (preferred) The operator overrides via env vars at boot:
-#        OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M
-#        OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M
-#        OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M
-#        OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M
-#      The block below reads them if set. Check
-#      https://platform.moonshot.ai/docs/pricing for current numbers.
-#   2. (upstream) The moonshot plugin gets changed upstream to auto-register
-#      its catalog — eliminating this hack entirely. Tracked in the plan
-#      file under "Item 11 — upstream OpenClaw contributions".
-#
-# For direct providers that auto-register (anthropic, openai, google, xai,
-# mistral, openrouter, amazon-bedrock), cost_usd surfaces real cache-aware
-# numbers with no operator action required.
-PROVIDER_BLOCK_JSON='{}'
-case "${OPENCLAW_PLUGIN}" in
-  moonshot)
-    : "${OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M:=0}"
-    : "${OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M:=0}"
-    : "${OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M:=0}"
-    : "${OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M:=0}"
-    # Pi's provider catalog uses per-token prices (USD/token), not per-M.
-    # Convert here so operators can specify the more natural per-M values.
-    PRICE_IN=$(awk "BEGIN{printf \"%.12f\", ${OPENCLAW_MOONSHOT_PRICE_INPUT_USD_PER_M}/1000000}")
-    PRICE_OUT=$(awk "BEGIN{printf \"%.12f\", ${OPENCLAW_MOONSHOT_PRICE_OUTPUT_USD_PER_M}/1000000}")
-    PRICE_CR=$(awk "BEGIN{printf \"%.12f\", ${OPENCLAW_MOONSHOT_PRICE_CACHE_READ_USD_PER_M}/1000000}")
-    PRICE_CW=$(awk "BEGIN{printf \"%.12f\", ${OPENCLAW_MOONSHOT_PRICE_CACHE_WRITE_USD_PER_M}/1000000}")
-    PROVIDER_BLOCK_JSON=$(jq -n \
-      --argjson price_in "${PRICE_IN}" \
-      --argjson price_out "${PRICE_OUT}" \
-      --argjson price_cr "${PRICE_CR}" \
-      --argjson price_cw "${PRICE_CW}" \
-      '{
-        moonshot: {
-          baseUrl: "https://api.moonshot.ai/v1",
-          api: "openai-completions",
-          models: [
-            {
-              id: "kimi-k2.5",
-              name: "Kimi K2.5",
-              input: ["text", "image"],
-              cost: { input: $price_in, output: $price_out, cacheRead: $price_cr, cacheWrite: $price_cw },
-              contextWindow: 262144,
-              maxTokens: 262144
-            },
-            {
-              id: "kimi-k2-thinking",
-              name: "Kimi K2 Thinking",
-              input: ["text"],
-              cost: { input: $price_in, output: $price_out, cacheRead: $price_cr, cacheWrite: $price_cw },
-              contextWindow: 262144,
-              maxTokens: 262144
-            }
-          ]
-        }
-      }')
-    ;;
-esac
-
-# Assemble the full config with jq to avoid any string-escaping footguns.
+# Assemble the base config with jq (no string-escaping footguns). The
+# models.providers.<plugin-id> block that Category B providers need (moonshot,
+# deepseek, qwen, etc.) is populated by apply-provider-config.mjs after this
+# block writes, using the bundled openclaw extension's catalog builder as the
+# source of truth. This eliminates the previous hand-mirror that hardcoded
+# moonshot's model catalog + zero prices and made the runtime drift from
+# upstream on every openclaw release.
 #
 # Things that matter beyond the obvious:
 #
@@ -198,9 +129,9 @@ esac
 #      agent-level default. Without this block the gateway logs "Unknown
 #      model" during runtime resolution even when the plugin is loaded.
 #
-#   3. `models.providers.<plugin-id>: {...}` is required for providers that
-#      do not auto-register their catalog. Populated above via
-#      PROVIDER_BLOCK_JSON.
+#   3. `models.providers.<plugin-id>: {...}` is required for Category B
+#      providers that do not auto-register their catalog at plugin-load
+#      time. Populated by apply-provider-config.mjs below.
 #
 #   4. `gateway.controlUi.dangerouslyDisableDeviceAuth: true` lets the
 #      orchestrator's WebSocket client (Item 7) connect as
@@ -217,7 +148,6 @@ jq -n \
   --argjson port       "${OPENCLAW_GATEWAY_PORT}" \
   --argjson tools      "${TOOLS_JSON}" \
   --argjson denied     "${DENIED_TOOLS_JSON}" \
-  --argjson providers  "${PROVIDER_BLOCK_JSON}" \
 '
 {
   gateway: {
@@ -249,10 +179,7 @@ jq -n \
       model: { primary: $model },
       models: ({ ($model): {} })
     }
-  }
-}
-+ (if ($providers | length) > 0 then { models: { mode: "merge", providers: $providers } } else {} end)
-+ {
+  },
   plugins: {
     entries: (
       { ($plugin): { enabled: true } }
@@ -261,6 +188,16 @@ jq -n \
   }
 }
 ' > "${CONFIG_PATH}"
+
+# Populate models.providers.<id> for Category B providers from the bundled
+# openclaw extension's catalog builder. No-op for Category A providers — they
+# auto-register their catalog at plugin load. Prints a status line on success,
+# fails loudly on error (we'd rather surface a clear startup failure than
+# silently produce a config with no provider block).
+if [ -f /opt/openclaw-plugins/apply-provider-config.mjs ]; then
+  echo "[entrypoint] applying ${OPENCLAW_PLUGIN} catalog via bundled openclaw extension"
+  node /opt/openclaw-plugins/apply-provider-config.mjs "${CONFIG_PATH}" "${OPENCLAW_PLUGIN}"
+fi
 
 echo "[entrypoint] wrote config to ${CONFIG_PATH}:"
 cat "${CONFIG_PATH}"
