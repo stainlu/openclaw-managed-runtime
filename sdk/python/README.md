@@ -13,7 +13,9 @@ pip install openclaw-managed-agents
 ```python
 from openclaw_managed_agents import OpenClawClient
 
-client = OpenClawClient(base_url="http://localhost:8080")
+# Pass api_token to match the orchestrator's OPENCLAW_API_TOKEN when
+# bearer-token auth is enabled. Omit for a local orchestrator without auth.
+client = OpenClawClient(base_url="http://localhost:8080", api_token="my-shared-secret")
 
 # Create an agent
 agent = client.agents.create(

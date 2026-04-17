@@ -60,6 +60,23 @@ while [ "$(curl -s http://localhost:8080/v1/sessions/$SESSION | jq -r .status)" 
 curl -s "http://localhost:8080/v1/sessions/$SESSION" | jq .output
 ```
 
+Or use the Python SDK:
+
+```python
+from openclaw_managed_agents import OpenClawClient
+
+client = OpenClawClient(base_url="http://localhost:8080")
+agent = client.agents.create(model="moonshot/kimi-k2.5", instructions="You are helpful.")
+session = client.sessions.create(agent_id=agent.agent_id)
+client.sessions.send(session.session_id, content="What is 2+2?")
+for event in client.sessions.stream(session.session_id):
+    if event.type == "agent.message":
+        print(event.content)
+        break
+```
+
+See [`examples/research-assistant/`](./examples/research-assistant/) for a ~200-line copy-paste starting point that streams events in real time.
+
 Or use the OpenAI SDK — just change `base_url`:
 
 ```python

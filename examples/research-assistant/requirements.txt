@@ -1,0 +1,1 @@
+openclaw-managed-agents>=0.2.0
