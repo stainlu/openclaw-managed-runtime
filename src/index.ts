@@ -136,6 +136,23 @@ async function main(): Promise<void> {
   // local dev (pnpm dev) both must be set to the host directory.
   const stateRoot = env("OPENCLAW_STATE_ROOT", "/var/openclaw/sessions");
   const network = env("OPENCLAW_DOCKER_NETWORK", "openclaw-net");
+  // Internal Docker network carrying orchestrator↔agent control-plane
+  // traffic for `networking: limited` sessions. Must be reachable by
+  // the orchestrator container AND agent containers whose environments
+  // are configured with limited networking. docker-compose declares
+  // this network and attaches the orchestrator to both; for bespoke
+  // deploys, `ensureNetwork` creates it on startup with internal=true
+  // so it has no external egress.
+  const controlPlaneNetwork = env(
+    "OPENCLAW_CONTROL_PLANE_NETWORK",
+    "openclaw-control-plane",
+  );
+  // Image used for the per-session egress-proxy sidecar when an
+  // environment is configured with networking.type === "limited".
+  const egressProxyImage = env(
+    "OPENCLAW_EGRESS_PROXY_IMAGE",
+    "ghcr.io/stainlu/openclaw-managed-agents-egress-proxy:latest",
+  );
   const gatewayPort = envInt("OPENCLAW_GATEWAY_PORT", 18789);
   const readyTimeoutMs = envInt("OPENCLAW_READY_TIMEOUT_MS", 60_000);
   const runTimeoutMs = envInt("OPENCLAW_RUN_TIMEOUT_MS", 10 * 60_000);
@@ -165,6 +182,10 @@ async function main(): Promise<void> {
 
   const runtime = new DockerContainerRuntime({ network });
   await runtime.ensureNetwork();
+  // Control-plane network for limited-networking sessions. Internal so
+  // it has no external egress; only the orchestrator and limited-
+  // session agents join it. Safe no-op when no limited sessions exist.
+  await runtime.ensureNetwork(controlPlaneNetwork, { internal: true });
 
   // Reap any containers left behind by a previous orchestrator instance.
   // Matched by the `managed-by=openclaw-managed-agents` label so we do not
@@ -210,6 +231,10 @@ async function main(): Promise<void> {
     sweepIntervalMs,
     maxWarmContainers,
     warmIdleTimeoutMs,
+    limitedNetworking: {
+      sidecarImage: egressProxyImage,
+      controlPlaneNetwork,
+    },
     isBusy: (sessionId) => store.sessions.get(sessionId)?.status === "running",
     cleanupOnReap: async (sessionId) => {
       const session = store.sessions.get(sessionId);
@@ -261,6 +286,8 @@ async function main(): Promise<void> {
       version,
       runtime_image: runtimeImage,
       docker_network: network,
+      control_plane_network: controlPlaneNetwork,
+      egress_proxy_image: egressProxyImage,
       host_state_root: hostStateRoot,
       state_root: stateRoot,
       orchestrator_url: orchestratorUrl,

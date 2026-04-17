@@ -74,6 +74,20 @@ export class DockerContainerRuntime implements ContainerRuntime {
 
     await container.start();
 
+    // Attach additional networks after boot — Docker's CreateContainer
+    // only accepts one primary NetworkMode at a time. For limited-
+    // networking sessions the agent joins confined+control-plane, and
+    // the sidecar joins confined+egress; the second network on each is
+    // wired here.
+    if (opts.additionalNetworks && opts.additionalNetworks.length > 0) {
+      for (const n of opts.additionalNetworks) {
+        await this.docker.getNetwork(n).connect({
+          Container: container.id,
+          EndpointConfig: { Aliases: [name] },
+        });
+      }
+    }
+
     // The container is reachable over the Docker network by its name.
     const baseUrl = `http://${name}:${opts.containerPort}`;
     return { id: container.id, name, baseUrl, token };
@@ -114,14 +128,63 @@ export class DockerContainerRuntime implements ContainerRuntime {
     );
   }
 
-  /** Ensure the shared network exists. Call this at orchestrator startup. */
-  async ensureNetwork(name?: string): Promise<void> {
+  /**
+   * Idempotently create a Docker bridge network. Call this at
+   * orchestrator startup for shared networks (openclaw-net,
+   * openclaw-control-plane), and per-session for limited-networking
+   * confinement. When `internal: true`, the network has no external
+   * egress — Docker drops every packet headed for a non-member.
+   */
+  async ensureNetwork(name: string, opts?: { internal?: boolean }): Promise<void>;
+  /** Legacy overload: use the default network name. Kept for the startup path. */
+  async ensureNetwork(): Promise<void>;
+  async ensureNetwork(
+    name?: string,
+    opts?: { internal?: boolean },
+  ): Promise<void> {
     const target = name ?? this.defaultNetwork;
+    const internal = opts?.internal ?? false;
     const existing = await this.docker.listNetworks({
       filters: { name: [target] },
     });
     if (existing.some((n) => n.Name === target)) return;
-    await this.docker.createNetwork({ Name: target, Driver: "bridge" });
+    await this.docker.createNetwork({
+      Name: target,
+      Driver: "bridge",
+      Internal: internal,
+    });
+  }
+
+  /**
+   * Remove a Docker network. Used to clean up per-session networks
+   * created for limited-networking sessions. Best-effort: silently
+   * tolerates "network not found" (already cleaned up) and does NOT
+   * force-disconnect attached containers (the caller is responsible
+   * for stopping them first).
+   */
+  async removeNetwork(name: string): Promise<void> {
+    try {
+      await this.docker.getNetwork(name).remove();
+    } catch (err) {
+      if (!isNotFoundError(err)) throw err;
+    }
+  }
+
+  /**
+   * Attach a running container to an additional network. Used when a
+   * container needs membership in more than one network — the Docker
+   * API's CreateContainer accepts one `NetworkMode` at boot, so any
+   * additional networks go via `network connect` post-spawn.
+   */
+  async connectNetwork(
+    containerId: string,
+    network: string,
+    opts?: { aliases?: string[] },
+  ): Promise<void> {
+    await this.docker.getNetwork(network).connect({
+      Container: containerId,
+      EndpointConfig: opts?.aliases ? { Aliases: opts.aliases } : undefined,
+    });
   }
 
   /**
