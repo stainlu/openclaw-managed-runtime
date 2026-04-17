@@ -87,13 +87,57 @@ export const PackagesSchema = z
   })
   .strict();
 
-// v1: only unrestricted networking. "limited" mode (allowedHosts) requires
-// per-container Docker network rules (iptables) which are non-trivial to
-// implement correctly across VPS providers. Accepting "limited" without
-// enforcement would give false security. Expand when enforcement is built.
-export const NetworkingSchema = z.object({
-  type: z.literal("unrestricted"),
-});
+// Egress networking policy.
+//
+// - "unrestricted" (default): agent container joins the normal bridge
+//   network and can reach any host on the internet. Same behavior we've
+//   had since v1.
+//
+// - "limited": agent container is spawned on a --internal Docker network
+//   (no direct egress) paired with an egress-proxy sidecar that filters
+//   outbound connections against `allowedHosts`. Proxy-layer check on
+//   HTTP/HTTPS + DNS-layer check on UDP 53, so raw-socket and DNS
+//   exfiltration paths are both closed. Enforcement is at the Docker
+//   bridge / sidecar level, not inside the agent container — the agent
+//   cannot bypass it even with arbitrary code execution.
+//
+// Allowed-hosts format:
+//   - Plain hostname: "api.openai.com"
+//   - Wildcard prefix: "*.googleapis.com" matches any hostname ending in
+//     ".googleapis.com" at any depth (so `maps.googleapis.com` and
+//     `storage.googleapis.com` both match, but `googleapis.com` alone
+//     does NOT — list it separately if needed).
+//   - No IPs, no CIDRs, no ports, no schemes. Hostnames only.
+//
+// See docs/designs/networking-limited.md for the full design.
+const HOSTNAME_PATTERN_RE = /^[a-z0-9*](?:[a-z0-9.*-]{0,253}[a-z0-9])?$/i;
+// Matches IPv4 literals (and degenerate all-digit-and-dots patterns the
+// hostname regex would otherwise accept). A real hostname has at least
+// one non-digit character in at least one label, so anything that parses
+// as "digits and dots only" is unambiguously an IP.
+const IPV4_LIKE_RE = /^\d+(\.\d+)*$/;
+export const NetworkingSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("unrestricted") }),
+  z.object({
+    type: z.literal("limited"),
+    allowedHosts: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(253, "allowedHost entry must be <= 253 characters")
+          .regex(
+            HOSTNAME_PATTERN_RE,
+            'allowedHost entries must be hostnames (e.g. "api.example.com" or "*.example.com"); IPs, ports, and URL schemes are not allowed',
+          )
+          .refine((v) => !IPV4_LIKE_RE.test(v), {
+            message: "allowedHost entries must be hostnames, not IP literals",
+          }),
+      )
+      .min(1, "allowedHosts must contain at least one entry")
+      .max(256, "allowedHosts supports at most 256 entries"),
+  }),
+]);
 
 export const CreateEnvironmentRequestSchema = z.object({
   name: z.string().min(1, "name is required"),

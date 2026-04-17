@@ -8,6 +8,7 @@ name: publish-images
 # Packages land at:
 #   ghcr.io/stainlu/openclaw-managed-agents-orchestrator:{latest,sha-<sha>}
 #   ghcr.io/stainlu/openclaw-managed-agents-agent:{latest,sha-<sha>}
+#   ghcr.io/stainlu/openclaw-managed-agents-egress-proxy:{latest,sha-<sha>}
 #
 # After the first successful publish, make both packages public in the GitHub
 # UI (user profile -> Packages -> each package -> Package settings ->
@@ -46,9 +47,17 @@ jobs:
           - name: orchestrator
             dockerfile: Dockerfile.orchestrator
             image: openclaw-managed-agents-orchestrator
+            context: .
           - name: agent
             dockerfile: Dockerfile.runtime
             image: openclaw-managed-agents-agent
+            context: .
+          - name: egress-proxy
+            dockerfile: docker/egress-proxy/Dockerfile
+            image: openclaw-managed-agents-egress-proxy
+            # Proxy image only needs its own directory; COPY is relative
+            # to the context root, and the Dockerfile lives inside it.
+            context: docker/egress-proxy
 
     steps:
       - name: Checkout
@@ -80,7 +89,7 @@ jobs:
       - name: Build and push ${{ matrix.name }}
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true

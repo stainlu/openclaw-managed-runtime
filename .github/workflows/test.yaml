@@ -67,6 +67,18 @@ jobs:
       - name: apply-provider-config.mjs syntax
         run: node --check docker/apply-provider-config.mjs
 
+      # Egress-proxy sidecar (networking: limited enforcement). Shipped
+      # as its own tiny image with no deps — uses node:test built-in.
+      - name: Egress-proxy — syntax
+        run: |
+          node --check docker/egress-proxy/proxy.mjs
+          node --check docker/egress-proxy/allowlist.mjs
+          node --check docker/egress-proxy/dns.mjs
+
+      - name: Egress-proxy — unit tests
+        working-directory: docker/egress-proxy
+        run: node --test allowlist.test.mjs dns.test.mjs
+
       # TypeScript SDK lives in its own package with its own deps (vitest,
       # typescript). Install via npm (not pnpm workspaces) so it stays
       # self-contained and can be published independently.
