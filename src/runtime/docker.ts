@@ -64,6 +64,13 @@ export class DockerContainerRuntime implements ContainerRuntime {
         // Sensible resource limits for a single agent worker.
         Memory: 2 * 1024 * 1024 * 1024, // 2 GB
         PidsLimit: 512,
+        // Override the container's /etc/resolv.conf when dns is supplied.
+        // Used by networking: limited agents to route all DNS through the
+        // egress-proxy sidecar's UDP 53 filter. Only the sidecar's IP
+        // ends up here — Docker does NOT also append its embedded resolver
+        // (127.0.0.11) when Dns is set, which is what we want: every
+        // hostname lookup from inside the agent goes through the filter.
+        Dns: opts.dns,
       },
       NetworkingConfig: {
         EndpointsConfig: {
@@ -88,9 +95,33 @@ export class DockerContainerRuntime implements ContainerRuntime {
       }
     }
 
+    // Inspect once post-connect so the caller can read per-network IPs
+    // (needed for Dns wiring on limited-networking sessions — the pool
+    // queries the sidecar's confined-network IP and passes it to the
+    // agent's Dns option).
+    const networks = await this.readNetworkIps(container.id);
+
     // The container is reachable over the Docker network by its name.
     const baseUrl = `http://${name}:${opts.containerPort}`;
-    return { id: container.id, name, baseUrl, token };
+    return { id: container.id, name, baseUrl, token, networks };
+  }
+
+  private async readNetworkIps(
+    id: string,
+  ): Promise<Record<string, string> | undefined> {
+    try {
+      const info = await this.docker.getContainer(id).inspect();
+      const nets = info.NetworkSettings?.Networks;
+      if (!nets) return undefined;
+      const out: Record<string, string> = {};
+      for (const [name, cfg] of Object.entries(nets)) {
+        const ip = cfg?.IPAddress;
+        if (typeof ip === "string" && ip.length > 0) out[name] = ip;
+      }
+      return Object.keys(out).length > 0 ? out : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   async stop(id: string): Promise<void> {
@@ -134,10 +165,8 @@ export class DockerContainerRuntime implements ContainerRuntime {
    * openclaw-control-plane), and per-session for limited-networking
    * confinement. When `internal: true`, the network has no external
    * egress — Docker drops every packet headed for a non-member.
+   * Called with no args, creates the backend's default network.
    */
-  async ensureNetwork(name: string, opts?: { internal?: boolean }): Promise<void>;
-  /** Legacy overload: use the default network name. Kept for the startup path. */
-  async ensureNetwork(): Promise<void>;
   async ensureNetwork(
     name?: string,
     opts?: { internal?: boolean },

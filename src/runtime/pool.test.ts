@@ -71,11 +71,20 @@ class FakeRuntime implements ContainerRuntime {
         this.calls.push({ kind: "connectNetwork", containerId: id, network: n });
       }
     }
+    // Synthesize a deterministic IP per (container, network) pair so
+    // tests can assert Dns wiring downstream.
+    const networks: Record<string, string> = {};
+    const primary = opts.network;
+    if (primary) networks[primary] = `10.0.${this.counter}.1`;
+    for (const n of opts.additionalNetworks ?? []) {
+      networks[n] = `10.0.${this.counter}.2`;
+    }
     return {
       id,
       name: `name_${this.counter}`,
       baseUrl: `http://${id}:18789`,
       token: `tok_${this.counter}`,
+      networks: Object.keys(networks).length > 0 ? networks : undefined,
     };
   }
 
@@ -452,6 +461,57 @@ describe("SessionContainerPool — networking: limited", () => {
     expect(agentSpawn.opts.env["NO_PROXY"]).toContain("openclaw-orchestrator");
     expect(agentSpawn.opts.additionalNetworks).toEqual(["openclaw-control-plane"]);
     expect(agentSpawn.opts.network).toMatch(/-confined$/);
+  });
+
+  it("wires agent's Dns to the sidecar's IP on the confined network", async () => {
+    // Without this, a caller inside the agent that bypasses HTTP_PROXY
+    // (raw socket.connect / getaddrinfo) would resolve against Docker's
+    // embedded DNS, not our filter. Dns config writes the sidecar's IP
+    // into /etc/resolv.conf so every name lookup hits the sidecar's
+    // UDP 53 allowlist.
+    const { pool, runtime } = makeLimitedPool();
+    await pool.acquireForSession({
+      sessionId: "ses_dns",
+      spawnOptions: baseSpawnOptions(),
+      networking: { type: "limited", allowedHosts: ["api.example.com"] },
+    });
+    const [sidecarSpawn, agentSpawn] = runtime.calls.filter(
+      (c) => c.kind === "spawn",
+    );
+    if (sidecarSpawn?.kind !== "spawn" || agentSpawn?.kind !== "spawn") {
+      throw new Error("expected two spawns");
+    }
+    const confinedName = sidecarSpawn.opts.network!;
+    // FakeRuntime synthesizes a stable per-network IP; the pool reads
+    // the sidecar's confined-network IP and passes it as agent Dns.
+    const sidecarIp =
+      agentSpawn.opts.network === confinedName
+        ? `10.0.1.1` // sidecar was cnt_1, confined is its primary network
+        : undefined;
+    expect(agentSpawn.opts.dns).toEqual([sidecarIp]);
+  });
+
+  it("doesn't truncate the session id — two long ids with a shared prefix get distinct networks", async () => {
+    // Before the fix, slice(0, 12) truncated the id. Two sessions
+    // starting with the same 12-char prefix would share a sidecar and
+    // confined network — silent collapse, not confinement.
+    const { pool, runtime } = makeLimitedPool();
+    await pool.acquireForSession({
+      sessionId: "ses_abcdef12345xyz",
+      spawnOptions: baseSpawnOptions(),
+      networking: { type: "limited", allowedHosts: ["api.example.com"] },
+    });
+    await pool.acquireForSession({
+      sessionId: "ses_abcdef12345wwx",
+      spawnOptions: baseSpawnOptions(),
+      networking: { type: "limited", allowedHosts: ["api.example.com"] },
+    });
+    const networks = runtime.calls
+      .filter((c) => c.kind === "ensureNetwork")
+      .map((c) => (c.kind === "ensureNetwork" ? c.network : ""));
+    // Four networks total — two per session, no deduplication.
+    expect(new Set(networks).size).toBe(4);
+    await pool.shutdown();
   });
 
   it("rolls back sidecar + networks when the agent spawn fails", async () => {

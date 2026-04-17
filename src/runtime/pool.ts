@@ -364,10 +364,20 @@ export class SessionContainerPool {
     const netCfg = this.cfg.limitedNetworking;
     const spawnEnd = poolSpawnDurationSeconds.startTimer();
 
-    const shortId = args.sessionId.replace(/^ses_/, "").slice(0, 12);
-    const confinedNet = `openclaw-sess-${shortId}-confined`;
-    const egressNet = `openclaw-sess-${shortId}-egress`;
-    const sidecarName = `openclaw-sess-${shortId}-proxy`;
+    // Full session id, sanitized to Docker's name rules ([a-z0-9-_]).
+    // Do NOT truncate: nanoid session ids are 12 chars and prefix
+    // truncation would let two sessions with the same prefix collide
+    // on the same network + sidecar (`ensureNetwork` is idempotent so
+    // it wouldn't error — it would silently share the sidecar).
+    // Underscores in nanoids do not occur (alphabet is a-z0-9), but
+    // test ids may have them; replace to keep Docker's parser happy.
+    const safeId = args.sessionId
+      .replace(/^ses_/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, "-");
+    const confinedNet = `openclaw-sess-${safeId}-confined`;
+    const egressNet = `openclaw-sess-${safeId}-egress`;
+    const sidecarName = `openclaw-sess-${safeId}-proxy`;
     const dnsPort = netCfg.proxyDnsPort ?? 53;
     const httpPort = netCfg.proxyHttpPort ?? 8118;
     const healthzPort = netCfg.proxyHealthzPort ?? 8119;
@@ -452,14 +462,29 @@ export class SessionContainerPool {
 
       // 3. Agent container: boot on confined network, then attach to
       //    control-plane so the orchestrator can reach its gateway.
-      //    HTTP_PROXY/HTTPS_PROXY points at the sidecar's confined
-      //    address; NO_PROXY excludes localhost + the orchestrator
-      //    (we reach the orchestrator via control-plane, no proxy
-      //    needed). Docker's embedded resolver on the confined
-      //    network won't route DNS queries to the sidecar
-      //    automatically; the agent image's entrypoint / glibc
-      //    handles this by reading resolv.conf, which Docker sets
-      //    from the network config. Wire below.
+      //    Two layers of confinement wire up here:
+      //
+      //    a) HTTP_PROXY / HTTPS_PROXY → sidecar's name on the confined
+      //       network. HTTP clients (Node fetch, Python requests, curl,
+      //       git) route through it automatically.
+      //    b) Dns: [sidecarIp] → sidecar's IP on the confined network,
+      //       written into /etc/resolv.conf. Catches the gap where a
+      //       caller doesn't respect HTTP_PROXY (raw sockets, direct
+      //       getaddrinfo). With the filter at DNS layer, a denied
+      //       hostname returns NXDOMAIN; with the --internal network
+      //       topology, there's no egress for an IP-literal either.
+      //
+      //    NO_PROXY excludes localhost + the orchestrator (reached via
+      //    control-plane, not the sidecar).
+      const sidecarConfinedIp =
+        sidecar.networks?.[confinedNet] ??
+        // Fallback: use the sidecar name. Docker's per-network alias
+        // resolution makes this work via /etc/hosts inside containers
+        // on the same network, but only for hostname lookups — Dns
+        // only accepts IPs. The name here is effectively a smoke-test
+        // fallback for the FakeRuntime in unit tests; production
+        // paths always have a real IP from the post-spawn inspect.
+        sidecarName;
       const agentEnv: Record<string, string> = {
         ...args.spawnOptions.env,
         HTTP_PROXY: `http://${sidecarName}:${httpPort}`,
@@ -474,6 +499,7 @@ export class SessionContainerPool {
         env: agentEnv,
         network: confinedNet,
         additionalNetworks: [netCfg.controlPlaneNetwork],
+        dns: [sidecarConfinedIp],
       });
       created.agent = agent;
       await this.runtime.waitForReady(agent, this.cfg.readyTimeoutMs);

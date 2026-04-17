@@ -31,6 +31,14 @@ export type SpawnOptions = {
    * the orchestrator's control-plane network.
    */
   additionalNetworks?: string[];
+  /**
+   * Optional DNS resolver IPs to write into the container's
+   * `/etc/resolv.conf`. When set, the container uses these resolvers
+   * instead of the Docker host's default. Used for `networking:
+   * limited` agents so that hostname lookups route through the egress-
+   * proxy sidecar's filter instead of the embedded resolver.
+   */
+  dns?: string[];
   /** Optional label map for listing/filtering. */
   labels?: Record<string, string>;
 };
@@ -68,6 +76,13 @@ export type Container = {
    * /src/cli/gateway-cli/run.ts:505-528.
    */
   token: string;
+  /**
+   * Resolved IP address on each network this container is attached to.
+   * Map key is the Docker network name, value is the IPv4 address
+   * assigned on that network. Populated after spawn. Used by the pool
+   * to hand sidecar IPs to agent spawns for Dns config.
+   */
+  networks?: Record<string, string>;
 };
 
 export interface ContainerRuntime {
@@ -78,12 +93,13 @@ export interface ContainerRuntime {
   /**
    * Idempotently create a Docker network. If it already exists, no-op.
    *
-   * `internal: true` creates a network with no external egress — Docker
-   * drops any packet leaving the bridge. Used for `networking: limited`
-   * session confinement and for the orchestrator↔agent control-plane
-   * network.
+   * Called with no args, creates the backend's default network
+   * (`openclaw-net`). `internal: true` creates a network with no
+   * external egress — Docker drops any packet leaving the bridge.
+   * Used for `networking: limited` session confinement and for the
+   * orchestrator↔agent control-plane network.
    */
-  ensureNetwork(name: string, opts?: { internal?: boolean }): Promise<void>;
+  ensureNetwork(name?: string, opts?: { internal?: boolean }): Promise<void>;
   /**
    * Tear down a Docker network. Used to drop per-session networks when
    * a limited-networking session is evicted. No-op if the network
