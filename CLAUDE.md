@@ -126,6 +126,15 @@ For `pnpm dev` (no compose), set both env vars to the same absolute host directo
 - TypeScript (`sdk/typescript/`) — publishable as `@stainlu/openclaw-managed-agents`.
 - OpenAI drop-in — any OpenAI SDK pointed at `http://<host>:8080/v1` with `x-openclaw-agent-id` header. Sticky sessions via the `user` field or `x-openclaw-session-key` header. Streaming is emulated (three chunks + `[DONE]`).
 
+## Adding a new `ContainerRuntime` backend
+
+The `ContainerRuntime` interface in `src/runtime/container.ts` is the seam for non-Docker backends (ECS, Cloud Run, Container Apps, Azure ECI, etc.). To add one:
+
+1. Implement `spawn(opts) → Container`, `stop(id)`, `waitForReady(c, timeoutMs)` in a new module like `src/runtime/ecs.ts`.
+2. Import `runContainerRuntimeContract` from `src/runtime/container-contract.ts` and run it from a test file with your backend's factory. If the suite passes, the pool, router, and startup adoption will all Just Work.
+3. Honor `spawn-time env` and `labels` verbatim — the adopt-on-restart path in `src/index.ts` reads `orchestrator-session-id`/`orchestrator-agent-id` labels plus the `OPENCLAW_GATEWAY_PORT` / `OPENCLAW_GATEWAY_TOKEN` env vars via your backend's equivalent of `docker inspect`. Your backend must expose a `listManaged()` method analogous to `DockerContainerRuntime.listManaged()` if you want reattach to survive across restarts.
+4. `index.ts` picks the runtime by constructing it directly today; introduce a small factory if you plan to ship multiple backends in the same binary.
+
 ## Things to avoid
 
 - Don't add an "events" table to SQLite. Events are in Pi JSONL by design. Duplicating them guarantees drift.

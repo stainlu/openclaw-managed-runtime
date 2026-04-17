@@ -66,6 +66,8 @@ describe("SqliteStore — fresh-DB schema", () => {
       "version",
       "callable_agents_json",
       "max_subagent_depth",
+      "mcp_servers_json",
+      "quota_json",
     ]) {
       expect(agents, `agents missing ${col}`).toContain(col);
     }

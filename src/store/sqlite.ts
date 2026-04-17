@@ -5,15 +5,19 @@ import type {
   CreateAgentRequest,
   CreateEnvironmentRequest,
   EnvironmentConfig,
+  McpServers,
   Networking,
   Packages,
   PermissionPolicy,
+  Quota,
   Session,
   SessionStatus,
   UpdateAgentRequest,
 } from "../orchestrator/types.js";
 import type {
   AgentStore,
+  AuditRecord,
+  AuditStore,
   EnvironmentStore,
   QueuedEvent,
   QueueStore,
@@ -40,6 +44,8 @@ type AgentRow = {
   version: number;
   callable_agents_json: string | null;
   max_subagent_depth: number;
+  mcp_servers_json: string | null;
+  quota_json: string | null;
 };
 
 type EnvironmentRow = {
@@ -83,6 +89,10 @@ function rowToAgent(r: AgentRow): AgentConfig {
       ? (JSON.parse(r.callable_agents_json) as string[])
       : [],
     maxSubagentDepth: r.max_subagent_depth,
+    mcpServers: r.mcp_servers_json
+      ? (JSON.parse(r.mcp_servers_json) as McpServers)
+      : {},
+    quota: r.quota_json ? (JSON.parse(r.quota_json) as Quota) : undefined,
   };
 }
 
@@ -144,7 +154,9 @@ CREATE TABLE IF NOT EXISTS agents (
   archived_at INTEGER,
   version INTEGER NOT NULL DEFAULT 1,
   callable_agents_json TEXT,
-  max_subagent_depth INTEGER NOT NULL DEFAULT 0
+  max_subagent_depth INTEGER NOT NULL DEFAULT 0,
+  mcp_servers_json TEXT,
+  quota_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_versions (
@@ -157,6 +169,8 @@ CREATE TABLE IF NOT EXISTS agent_versions (
   name TEXT,
   callable_agents_json TEXT,
   max_subagent_depth INTEGER NOT NULL DEFAULT 0,
+  mcp_servers_json TEXT,
+  quota_json TEXT,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (agent_id, version)
 );
@@ -211,6 +225,25 @@ CREATE TABLE IF NOT EXISTS queued_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_queued_events_session ON queued_events(session_id, id);
+
+-- Structured audit log. One row per mutating API call. See
+-- src/audit.ts for the actor-extraction policy (token fingerprint, IP,
+-- or "anonymous") and the list of actions written. Indexed by target
+-- + ts so "what happened to agent X last month" is O(log n) not O(n).
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  request_id TEXT,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT,
+  outcome TEXT NOT NULL,
+  metadata_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_target_ts ON audit_events(target, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_action_ts ON audit_events(action, ts);
 `;
 
 // ---------- Agent store ----------
@@ -231,22 +264,22 @@ class SqliteAgentStore implements AgentStore {
       `INSERT INTO agents (
         agent_id, model, tools_json, instructions, permission_policy_json,
         name, created_at, updated_at, archived_at, version,
-        callable_agents_json, max_subagent_depth
+        callable_agents_json, max_subagent_depth, mcp_servers_json, quota_json
        ) VALUES (
         @agent_id, @model, @tools_json, @instructions, @permission_policy_json,
         @name, @created_at, @updated_at, NULL, 1,
-        @callable_agents_json, @max_subagent_depth
+        @callable_agents_json, @max_subagent_depth, @mcp_servers_json, @quota_json
        )`,
     );
     this.insertVersionStmt = db.prepare(
       `INSERT INTO agent_versions (
         agent_id, version, model, tools_json, instructions,
         permission_policy_json, name,
-        callable_agents_json, max_subagent_depth, created_at
+        callable_agents_json, max_subagent_depth, mcp_servers_json, quota_json, created_at
        ) VALUES (
         @agent_id, @version, @model, @tools_json, @instructions,
         @permission_policy_json, @name,
-        @callable_agents_json, @max_subagent_depth, @created_at
+        @callable_agents_json, @max_subagent_depth, @mcp_servers_json, @quota_json, @created_at
        )`,
     );
     this.getStmt = db.prepare(`SELECT * FROM agents WHERE agent_id = ?`);
@@ -259,13 +292,17 @@ class SqliteAgentStore implements AgentStore {
         permission_policy_json = @permission_policy_json,
         name = @name, callable_agents_json = @callable_agents_json,
         max_subagent_depth = @max_subagent_depth,
+        mcp_servers_json = @mcp_servers_json,
+        quota_json = @quota_json,
         version = @version, updated_at = @updated_at
        WHERE agent_id = @agent_id AND version = @prev_version`,
     );
     this.listVersionsStmt = db.prepare(
       `SELECT agent_id, version, model, tools_json, instructions,
               permission_policy_json, name,
-              callable_agents_json, max_subagent_depth, created_at,
+              callable_agents_json, max_subagent_depth, mcp_servers_json,
+              quota_json,
+              created_at,
               created_at as updated_at, NULL as archived_at
        FROM agent_versions WHERE agent_id = ? ORDER BY version ASC`,
     );
@@ -288,6 +325,11 @@ class SqliteAgentStore implements AgentStore {
         ? JSON.stringify(agent.callableAgents)
         : null,
       max_subagent_depth: agent.maxSubagentDepth,
+      mcp_servers_json:
+        agent.mcpServers && Object.keys(agent.mcpServers).length > 0
+          ? JSON.stringify(agent.mcpServers)
+          : null,
+      quota_json: agent.quota ? JSON.stringify(agent.quota) : null,
     };
   }
 
@@ -306,6 +348,8 @@ class SqliteAgentStore implements AgentStore {
       version: 1,
       callableAgents: req.callableAgents,
       maxSubagentDepth: req.maxSubagentDepth,
+      mcpServers: req.mcpServers,
+      quota: req.quota,
     };
     const row = this.agentToRow(agent);
     this.insertStmt.run({ ...row, created_at: now, updated_at: now });
@@ -342,6 +386,8 @@ class SqliteAgentStore implements AgentStore {
       name: req.name === null ? undefined : (req.name ?? current.name),
       callableAgents: req.callableAgents === null ? [] : (req.callableAgents ?? current.callableAgents),
       maxSubagentDepth: req.maxSubagentDepth ?? current.maxSubagentDepth,
+      mcpServers: req.mcpServers === null ? {} : (req.mcpServers ?? current.mcpServers),
+      quota: req.quota === null ? undefined : (req.quota ?? current.quota),
       updatedAt: now,
       version: current.version + 1,
     };
@@ -352,7 +398,9 @@ class SqliteAgentStore implements AgentStore {
       JSON.stringify(updated.permissionPolicy) === JSON.stringify(current.permissionPolicy) &&
       updated.name === current.name &&
       JSON.stringify(updated.callableAgents) === JSON.stringify(current.callableAgents) &&
-      updated.maxSubagentDepth === current.maxSubagentDepth
+      updated.maxSubagentDepth === current.maxSubagentDepth &&
+      JSON.stringify(updated.mcpServers) === JSON.stringify(current.mcpServers) &&
+      JSON.stringify(updated.quota) === JSON.stringify(current.quota)
     ) {
       return current;
     }
@@ -710,6 +758,107 @@ class SqliteQueueStore implements QueueStore {
   }
 }
 
+// ---------- Audit store ----------
+
+class SqliteAuditStore implements AuditStore {
+  private readonly insertStmt: Database.Statement;
+  private readonly baseSelect: string;
+  private readonly deleteOlderThanStmt: Database.Statement;
+
+  constructor(private readonly db: Database.Database) {
+    this.insertStmt = db.prepare(
+      `INSERT INTO audit_events (
+        ts, request_id, actor, action, target, outcome, metadata_json
+       ) VALUES (
+        @ts, @request_id, @actor, @action, @target, @outcome, @metadata_json
+       )`,
+    );
+    this.baseSelect = `SELECT id, ts, request_id, actor, action, target, outcome, metadata_json FROM audit_events`;
+    this.deleteOlderThanStmt = db.prepare(
+      `DELETE FROM audit_events WHERE ts < @before`,
+    );
+  }
+
+  record(event: Omit<AuditRecord, "id">): void {
+    this.insertStmt.run({
+      ts: event.ts,
+      request_id: event.requestId,
+      actor: event.actor,
+      action: event.action,
+      target: event.target,
+      outcome: event.outcome,
+      metadata_json: event.metadata ? JSON.stringify(event.metadata) : null,
+    });
+  }
+
+  list(filters: {
+    since?: number;
+    until?: number;
+    action?: string;
+    target?: string;
+    limit?: number;
+  }): AuditRecord[] {
+    // Dynamic WHERE construction — keep each predicate a single named
+    // parameter so the SQL stays parameterised (no injection risk even
+    // though `action` filters are operator-supplied).
+    const conditions: string[] = [];
+    const params: Record<string, unknown> = {};
+    if (filters.since !== undefined) {
+      conditions.push("ts >= @since");
+      params.since = filters.since;
+    }
+    if (filters.until !== undefined) {
+      conditions.push("ts <= @until");
+      params.until = filters.until;
+    }
+    if (filters.action !== undefined) {
+      // Support prefix match on action ("agent.*" etc.) via LIKE. If
+      // the caller didn't include a wildcard we treat it as exact match.
+      if (filters.action.includes("%")) {
+        conditions.push("action LIKE @action");
+        params.action = filters.action;
+      } else {
+        conditions.push("action = @action");
+        params.action = filters.action;
+      }
+    }
+    if (filters.target !== undefined) {
+      conditions.push("target = @target");
+      params.target = filters.target;
+    }
+    const where = conditions.length > 0 ? ` WHERE ${conditions.join(" AND ")}` : "";
+    const limit = Math.min(Math.max(filters.limit ?? 100, 1), 1000);
+    const sql = `${this.baseSelect}${where} ORDER BY ts DESC, id DESC LIMIT ${limit}`;
+    const rows = this.db.prepare(sql).all(params) as Array<{
+      id: number;
+      ts: number;
+      request_id: string | null;
+      actor: string;
+      action: string;
+      target: string | null;
+      outcome: string;
+      metadata_json: string | null;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      ts: r.ts,
+      requestId: r.request_id,
+      actor: r.actor,
+      action: r.action,
+      target: r.target,
+      outcome: r.outcome,
+      metadata: r.metadata_json
+        ? (JSON.parse(r.metadata_json) as Record<string, unknown>)
+        : null,
+    }));
+  }
+
+  deleteOlderThan(ts: number): number {
+    const info = this.deleteOlderThanStmt.run({ before: ts });
+    return info.changes;
+  }
+}
+
 // ---------- Bundle ----------
 
 export class SqliteStore implements Store {
@@ -718,6 +867,7 @@ export class SqliteStore implements Store {
   readonly sessions: SessionStore;
   readonly secrets: SecretStore;
   readonly queue: QueueStore;
+  readonly audit: AuditStore;
   private readonly db: Database.Database;
   private closed = false;
 
@@ -786,9 +936,27 @@ export class SqliteStore implements Store {
     if (!agentsCols.some((c) => c.name === "permission_policy_json")) {
       this.db.exec("ALTER TABLE agents ADD COLUMN permission_policy_json TEXT");
     }
+    if (!agentsCols.some((c) => c.name === "mcp_servers_json")) {
+      // A2: agent template declares MCP servers; forwarded to the
+      // container as OPENCLAW_MCP_SERVERS_JSON. Pre-A2 rows default to
+      // NULL (no MCP servers), which is the safe no-op — existing
+      // sessions behave identically.
+      this.db.exec("ALTER TABLE agents ADD COLUMN mcp_servers_json TEXT");
+    }
+    if (!agentsCols.some((c) => c.name === "quota_json")) {
+      // B5: per-session quota caps (cost, tokens, wall duration).
+      // Pre-B5 rows default to NULL = no caps, matching pre-B5 behavior.
+      this.db.exec("ALTER TABLE agents ADD COLUMN quota_json TEXT");
+    }
     const versionsCols = this.db.pragma("table_info(agent_versions)") as Array<{ name: string }>;
     if (versionsCols.length > 0 && !versionsCols.some((c) => c.name === "permission_policy_json")) {
       this.db.exec("ALTER TABLE agent_versions ADD COLUMN permission_policy_json TEXT");
+    }
+    if (versionsCols.length > 0 && !versionsCols.some((c) => c.name === "mcp_servers_json")) {
+      this.db.exec("ALTER TABLE agent_versions ADD COLUMN mcp_servers_json TEXT");
+    }
+    if (versionsCols.length > 0 && !versionsCols.some((c) => c.name === "quota_json")) {
+      this.db.exec("ALTER TABLE agent_versions ADD COLUMN quota_json TEXT");
     }
 
     this.agents = new SqliteAgentStore(this.db);
@@ -796,6 +964,7 @@ export class SqliteStore implements Store {
     this.sessions = new SqliteSessionStore(this.db);
     this.secrets = new SqliteSecretStore(this.db);
     this.queue = new SqliteQueueStore(this.db);
+    this.audit = new SqliteAuditStore(this.db);
   }
 
   close(): void {

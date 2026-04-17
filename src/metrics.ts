@@ -76,6 +76,35 @@ export const startupQueueDrainedTotal = new Counter({
   registers: [registry],
 });
 
+/** Peak per-session JSONL size seen by the sampler (bytes). */
+export const sessionJsonlBytesMax = new Gauge({
+  name: "session_jsonl_bytes_max",
+  help: "Largest single-session JSONL file (bytes) as of the last sample.",
+  registers: [registry],
+});
+
+/** Aggregate JSONL disk usage across all sessions (bytes). */
+export const sessionJsonlBytesSum = new Gauge({
+  name: "session_jsonl_bytes_sum",
+  help: "Total JSONL disk usage across all sessions (bytes) as of the last sample.",
+  registers: [registry],
+});
+
+/** Sessions whose JSONL exceeds OPENCLAW_JSONL_WARN_BYTES at last sample. */
+export const sessionJsonlOverThreshold = new Gauge({
+  name: "session_jsonl_over_threshold",
+  help: "Count of sessions whose JSONL exceeded the warn threshold as of the last sample.",
+  registers: [registry],
+});
+
+/** Runs rejected because an agent template quota was exceeded. */
+export const quotaRejectionsTotal = new Counter({
+  name: "quota_rejections_total",
+  help: "Total runs rejected because a session quota was tripped.",
+  labelNames: ["kind"] as const, // "cost" | "tokens" | "duration"
+  registers: [registry],
+});
+
 /** Time to spawn a fresh container (spawn + /readyz wait + WS handshake). */
 export const poolSpawnDurationSeconds = new Histogram({
   name: "pool_spawn_duration_seconds",

@@ -18,6 +18,50 @@ import type {
 // query time; there is no orchestrator-side event log to keep in sync.
 
 /**
+ * Structured audit log. One row per mutating API call. Written
+ * synchronously from the server handler (via src/audit.ts) so an entry
+ * exists on durable storage before the response is returned.
+ *
+ * Scope: actor (token fingerprint / IP), action verb, target resource
+ * id, outcome (ok / error code), optional metadata JSON. Retention is
+ * operator-controlled via OPENCLAW_AUDIT_RETENTION_DAYS; a periodic
+ * pass deletes rows older than the window.
+ *
+ * Query surface: GET /v1/audit?since=<ts>&action=<prefix>&target=<id>.
+ * Intended for operators auditing "who changed agent X last month" or
+ * "which sessions did this API token create".
+ */
+export type AuditRecord = {
+  id: number;
+  ts: number;
+  /** Correlation id from the HTTP request (x-request-id). */
+  requestId: string | null;
+  /** Token fingerprint (first 8 hex chars of sha256) or "ip:<addr>" or "anonymous". */
+  actor: string;
+  /** Verb like "agent.create", "session.cancel", "session.post_event". */
+  action: string;
+  /** Primary resource id this action targeted (agent id, session id, etc.). */
+  target: string | null;
+  /** "ok" for 2xx, or the RouterError / HTTP status code for failures. */
+  outcome: string;
+  /** Optional JSON payload with action-specific context. */
+  metadata: Record<string, unknown> | null;
+};
+
+export interface AuditStore {
+  record(event: Omit<AuditRecord, "id">): void;
+  list(filters: {
+    since?: number;
+    until?: number;
+    action?: string;
+    target?: string;
+    limit?: number;
+  }): AuditRecord[];
+  /** Delete rows older than the given timestamp. Returns the number removed. */
+  deleteOlderThan(ts: number): number;
+}
+
+/**
  * Small orchestrator-private key/value store. Today this has exactly one
  * caller: the HMAC secret for `ParentTokenMinter` must survive restart so
  * subagent delegation chains can run across deploys without 403-ing.
@@ -129,6 +173,7 @@ export interface Store {
   readonly secrets: SecretStore;
   /** Queue backend — durable on SQLite, in-memory on memory. */
   readonly queue: QueueStore;
+  readonly audit: AuditStore;
   /** Closes any backing file handles or connections. Safe to call more than once. */
   close(): void;
 }

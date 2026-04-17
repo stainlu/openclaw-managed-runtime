@@ -2,6 +2,7 @@ import { chownSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { addContext, getLogger, withCapturedContext } from "../log.js";
 import {
+  quotaRejectionsTotal,
   sessionRunDurationSeconds,
   sessionRunFailuresTotal,
 } from "../metrics.js";
@@ -133,6 +134,49 @@ export class AgentRouter {
   }
 
   /**
+   * Enforce the agent template's per-session quota against the session's
+   * rolling totals (cost, tokens) and elapsed wall time. Throws
+   * `quota_exceeded` on any violation. Called BEFORE the container is
+   * invoked — we refuse to start a turn we know the session can't
+   * afford. Post-turn overage (a single turn exceeding the remaining
+   * budget) is accepted and rejected on the NEXT turn; that's simpler
+   * than aborting mid-run and matches the "budget is a soft ceiling"
+   * contract operators actually want. Operators who need a hard kill
+   * stack runTimeoutMs on top.
+   */
+  private assertQuota(session: Session, agent: AgentConfig): void {
+    const q = agent.quota;
+    if (!q) return;
+    if (q.maxCostUsdPerSession !== undefined && session.costUsd >= q.maxCostUsdPerSession) {
+      quotaRejectionsTotal.labels({ kind: "cost" }).inc();
+      throw new RouterError(
+        "quota_exceeded",
+        `session ${session.sessionId} has spent $${session.costUsd.toFixed(4)} which meets or exceeds its quota of $${q.maxCostUsdPerSession}`,
+      );
+    }
+    if (q.maxTokensPerSession !== undefined) {
+      const tokens = session.tokensIn + session.tokensOut;
+      if (tokens >= q.maxTokensPerSession) {
+        quotaRejectionsTotal.labels({ kind: "tokens" }).inc();
+        throw new RouterError(
+          "quota_exceeded",
+          `session ${session.sessionId} has consumed ${tokens} tokens which meets or exceeds its quota of ${q.maxTokensPerSession}`,
+        );
+      }
+    }
+    if (q.maxWallDurationMs !== undefined) {
+      const elapsed = Date.now() - session.createdAt;
+      if (elapsed >= q.maxWallDurationMs) {
+        quotaRejectionsTotal.labels({ kind: "duration" }).inc();
+        throw new RouterError(
+          "quota_exceeded",
+          `session ${session.sessionId} has been alive for ${elapsed}ms which meets or exceeds its duration quota of ${q.maxWallDurationMs}ms`,
+        );
+      }
+    }
+  }
+
+  /**
    * Create a session bound to an agent. Pure metadata: no container spawn,
    * no JSONL allocation, no remote calls. The container is only spawned
    * when the first event is posted to this session via runEvent().
@@ -260,6 +304,10 @@ export class AgentRouter {
       );
     }
 
+    // Quotas are checked BEFORE the busy-session queue path: we refuse
+    // to even enqueue a run for a session that's already out of budget.
+    this.assertQuota(session, agent);
+
     if (session.status === "running") {
       // Queue path: the current background task will pop this on completion.
       this.queue.enqueue(args.sessionId, {
@@ -322,6 +370,7 @@ export class AgentRouter {
         `session ${args.sessionId} is busy; wait for the current run to complete before streaming`,
       );
     }
+    this.assertQuota(session, agent);
 
     const running = this.sessions.beginRun(args.sessionId) ?? session;
     addContext({ sessionId: args.sessionId, agentId: agent.agentId });
@@ -600,6 +649,9 @@ export class AgentRouter {
     if (envConfig?.packages) {
       env.OPENCLAW_PACKAGES_JSON = JSON.stringify(envConfig.packages);
     }
+    if (agent.mcpServers && Object.keys(agent.mcpServers).length > 0) {
+      env.OPENCLAW_MCP_SERVERS_JSON = JSON.stringify(agent.mcpServers);
+    }
     if (agent.permissionPolicy.type === "deny") {
       env.OPENCLAW_DENIED_TOOLS = agent.permissionPolicy.tools.join(",");
     }
@@ -747,6 +799,136 @@ export class AgentRouter {
   }
 
   /**
+   * Observer for a session that was adopted at orchestrator startup (the
+   * container survived the restart, the session was still `running`).
+   * Subscribes to the container's gateway `chat` broadcasts so we can
+   * finalize the session when the in-flight turn completes server-side —
+   * `state: "final"` → rollup + endRunSuccess + drain queue;
+   * `state: "error"` → endRunFailure + evict. Also runs a JSONL
+   * fast-path check: if the turn already completed between shutdown and
+   * restart, the `chat` event is gone but a fresh `agent.message` is on
+   * disk — we finalize immediately instead of waiting for an event that
+   * will never come.
+   *
+   * Wired up from `src/index.ts` after a successful `pool.adopt` when
+   * the adopted session was `running` at shutdown. No-op for sessions
+   * that were already idle — those have no pending run to observe.
+   *
+   * Idempotent: the `finalized` guard + session-status check inside
+   * `finalizeFromJsonl` ensure the JSONL fast-path and the WS callback
+   * don't double-transition the session if they race.
+   */
+  async observeAdoptedSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.status !== "running") return;
+    const agent = this.agents.get(session.agentId);
+    if (!agent) return;
+
+    let finalized = false;
+    let unsubscribe: (() => void) | undefined;
+    const handleFinal = async (outcome: StreamOutcome): Promise<void> => {
+      if (finalized) return;
+      finalized = true;
+      unsubscribe?.();
+      await this.finalizeFromJsonl(sessionId, agent, outcome);
+    };
+
+    // Subscribe BEFORE the fast-path check so an event that fires during
+    // the check still lands on us. `unsubscribe` guards against double-fire.
+    const wsClient = this.pool.getWsClient(sessionId);
+    if (wsClient) {
+      const canonicalKey = `agent:main:${sessionId}`;
+      unsubscribe = wsClient.onEvent("chat", (payload) => {
+        const p = payload as
+          | { sessionKey?: string; state?: string; errorMessage?: string }
+          | undefined;
+        if (!p || p.sessionKey !== canonicalKey) return;
+        // State "delta" is per-token progress — not a completion signal.
+        // We only care about terminal states.
+        if (p.state === "final") {
+          void handleFinal({ ok: true });
+        } else if (p.state === "error") {
+          void handleFinal({
+            ok: false,
+            error: p.errorMessage ?? "run failed (observed post-restart)",
+          });
+        }
+      });
+    } else {
+      log.warn(
+        { session_id: sessionId },
+        "adopted session has no WS client — falling back to JSONL-only observation",
+      );
+    }
+
+    // Fast path: turn may have completed while the orchestrator was down.
+    // Compare the latest agent.message's createdAt to the session's
+    // lastEventAt (which was set by beginRun before the crash). A newer
+    // agent.message means Pi finished the turn without us watching.
+    const latest = this.events.latestAgentMessage(agent.agentId, sessionId);
+    const startedAt = session.lastEventAt ?? session.createdAt;
+    if (latest && latest.createdAt > startedAt) {
+      log.info(
+        { session_id: sessionId },
+        "adopted session's turn already completed during downtime — finalizing from JSONL",
+      );
+      await handleFinal({ ok: true });
+    }
+  }
+
+  private async finalizeFromJsonl(
+    sessionId: string,
+    agent: AgentConfig,
+    outcome: StreamOutcome,
+  ): Promise<void> {
+    // External-cancel guard: if another path already transitioned the
+    // session out of running (e.g., a client posted a cancel during
+    // startup), don't overwrite.
+    const current = this.sessions.get(sessionId);
+    if (current?.status !== "running") return;
+
+    if (outcome.ok) {
+      const latest = this.events.latestAgentMessage(agent.agentId, sessionId);
+      const tokensIn = latest?.tokensIn ?? 0;
+      const tokensOut = latest?.tokensOut ?? 0;
+      const costUsd = latest?.costUsd ?? 0;
+      this.sessions.endRunSuccess(sessionId, { tokensIn, tokensOut, costUsd });
+      log.info(
+        { session_id: sessionId, cost_usd: costUsd },
+        "adopted session finalized",
+      );
+      // Now that the session is idle, drain any queued events the
+      // previous process had committed to but not dispatched. One event
+      // is enough — runEvent will chain the rest via the normal
+      // queue-drain path.
+      const next = this.queue.shift(sessionId);
+      if (next) {
+        void this.runEvent({
+          sessionId,
+          content: next.content,
+          model: next.model,
+        }).catch((err) => {
+          log.warn(
+            { err, session_id: sessionId },
+            "post-adopt queue drain failed",
+          );
+        });
+      }
+      return;
+    }
+    sessionRunFailuresTotal.inc();
+    log.error(
+      { session_id: sessionId, error: outcome.error },
+      "adopted session run failed post-restart",
+    );
+    this.queue.clear(sessionId);
+    await this.pool.evictSession(sessionId).catch(() => {
+      /* best-effort */
+    });
+    this.sessions.endRunFailure(sessionId, outcome.error);
+  }
+
+  /**
    * Centralized failure handling for background tasks. Called from the
    * outer .catch of every executeInBackground invocation (idle path and
    * queue-drain recursive path). The guard against status != running is
@@ -865,7 +1047,8 @@ export type RouterErrorCode =
   | "chat_completions_failed"
   | "cancel_failed"
   | "patch_failed"
-  | "confirm_tool_failed";
+  | "confirm_tool_failed"
+  | "quota_exceeded";
 
 export class RouterError extends Error {
   constructor(

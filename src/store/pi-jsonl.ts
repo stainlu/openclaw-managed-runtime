@@ -1,4 +1,4 @@
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Event } from "../orchestrator/types.js";
 
@@ -111,6 +111,25 @@ export class PiJsonlEventReader {
       if (e && e.type === "agent.message") return e;
     }
     return undefined;
+  }
+
+  /**
+   * Return the on-disk byte size of the session's JSONL, or undefined
+   * if the file doesn't exist yet (session hasn't written anything, or
+   * container hasn't booted). Pure stat — no parsing, no read. Used by
+   * the size sampler in src/index.ts to expose growth metrics and
+   * warn operators about unbounded single-session logs (Pi's
+   * compaction is a context-window concern, not a file-rotation one).
+   */
+  statJsonl(agentId: string, sessionId: string): { bytes: number } | undefined {
+    const piSessionId = this.resolvePiSessionId(agentId, sessionId);
+    if (!piSessionId) return undefined;
+    try {
+      const s = statSync(this.jsonlPath(agentId, piSessionId));
+      return { bytes: s.size };
+    } catch {
+      return undefined;
+    }
   }
 
   deleteBySession(agentId: string, sessionId: string): void {

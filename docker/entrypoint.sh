@@ -111,6 +111,71 @@ denied_tools_json_fragment() {
 
 DENIED_TOOLS_JSON=$(denied_tools_json_fragment)
 
+# OpenTelemetry passthrough. When OTEL_EXPORTER_OTLP_ENDPOINT is set in
+# the container env (forwarded by the orchestrator's passthrough list
+# in src/index.ts:collectPassthroughEnv), populate diagnostics.otel in
+# openclaw.json so openclaw's built-in OTEL exporter turns on traces +
+# metrics + logs at boot. Uses the standard OTel env-var names so
+# operators who already run an OTel collector can drop it in via the
+# same OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_HEADERS pair
+# their other services use.
+otel_json_fragment() {
+  if [[ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]]; then
+    printf 'null'
+    return
+  fi
+  # Headers are comma-separated key=value pairs per OTel spec. Parse to
+  # a JSON object; missing or empty → omit the field entirely.
+  local headers_json='null'
+  if [[ -n "${OTEL_EXPORTER_OTLP_HEADERS:-}" ]]; then
+    headers_json=$(echo "${OTEL_EXPORTER_OTLP_HEADERS}" \
+      | tr ',' '\n' \
+      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      | grep -v '^$' \
+      | jq -Rs 'split("\n") | map(select(length > 0) | split("=") | {(.[0]): (.[1:] | join("="))}) | add // {}')
+  fi
+  local protocol="${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}"
+  local service_name="${OTEL_SERVICE_NAME:-openclaw-agent}"
+  jq -n \
+    --arg endpoint "${OTEL_EXPORTER_OTLP_ENDPOINT}" \
+    --arg protocol "${protocol}" \
+    --arg service_name "${service_name}" \
+    --argjson headers "${headers_json}" \
+    --argjson sample_rate "${OPENCLAW_OTEL_SAMPLE_RATE:-1.0}" \
+    --argjson flush_interval_ms "${OPENCLAW_OTEL_FLUSH_INTERVAL_MS:-5000}" '
+    {
+      enabled: true,
+      endpoint: $endpoint,
+      protocol: $protocol,
+      serviceName: $service_name,
+      traces: true,
+      metrics: true,
+      logs: true,
+      sampleRate: $sample_rate,
+      flushIntervalMs: $flush_interval_ms
+    }
+    + (if $headers != null and ($headers | length) > 0 then { headers: $headers } else {} end)
+  '
+}
+
+OTEL_JSON=$(otel_json_fragment)
+
+# MCP server list. Orchestrator emits OPENCLAW_MCP_SERVERS_JSON when the
+# agent template declared mcpServers. Shape matches openclaw.json's
+# mcp.servers block exactly (object keyed by server name, each value a
+# server config). Empty / unset → omit the mcp block so no servers load.
+if [[ -n "${OPENCLAW_MCP_SERVERS_JSON:-}" ]]; then
+  # Validate the JSON up front — a malformed blob silently skipping
+  # would be worse than crashing; the orchestrator promised these servers.
+  if ! echo "${OPENCLAW_MCP_SERVERS_JSON}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    echo "[entrypoint] ERROR: OPENCLAW_MCP_SERVERS_JSON is not a JSON object" >&2
+    exit 1
+  fi
+  MCP_JSON="${OPENCLAW_MCP_SERVERS_JSON}"
+else
+  MCP_JSON='null'
+fi
+
 # Assemble the base config with jq (no string-escaping footguns). The
 # models.providers.<plugin-id> block that Category B providers need (moonshot,
 # deepseek, qwen, etc.) is populated by apply-provider-config.mjs after this
@@ -148,6 +213,8 @@ jq -n \
   --argjson port       "${OPENCLAW_GATEWAY_PORT}" \
   --argjson tools      "${TOOLS_JSON}" \
   --argjson denied     "${DENIED_TOOLS_JSON}" \
+  --argjson otel       "${OTEL_JSON}" \
+  --argjson mcp        "${MCP_JSON}" \
 '
 {
   gateway: {
@@ -187,6 +254,8 @@ jq -n \
     )
   }
 }
++ (if $otel != null then { diagnostics: { otel: $otel } } else {} end)
++ (if $mcp != null then { mcp: { servers: $mcp } } else {} end)
 ' > "${CONFIG_PATH}"
 
 # Populate models.providers.<id> for Category B providers from the bundled

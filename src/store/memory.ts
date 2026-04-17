@@ -4,12 +4,15 @@ import type {
   CreateAgentRequest,
   CreateEnvironmentRequest,
   EnvironmentConfig,
+  McpServers,
   PermissionPolicy,
   Session,
   UpdateAgentRequest,
 } from "../orchestrator/types.js";
 import type {
   AgentStore,
+  AuditRecord,
+  AuditStore,
   EnvironmentStore,
   QueuedEvent,
   QueueStore,
@@ -42,6 +45,8 @@ class InMemoryAgentStore implements AgentStore {
       version: 1,
       callableAgents: req.callableAgents,
       maxSubagentDepth: req.maxSubagentDepth,
+      mcpServers: req.mcpServers,
+      quota: req.quota,
     };
     this.agents.set(agent.agentId, agent);
     this.versions.set(agent.agentId, [{ ...agent }]);
@@ -74,6 +79,8 @@ class InMemoryAgentStore implements AgentStore {
       name: req.name === null ? undefined : (req.name ?? current.name),
       callableAgents: req.callableAgents === null ? [] : (req.callableAgents ?? current.callableAgents),
       maxSubagentDepth: req.maxSubagentDepth ?? current.maxSubagentDepth,
+      mcpServers: req.mcpServers === null ? {} : (req.mcpServers ?? current.mcpServers),
+      quota: req.quota === null ? undefined : (req.quota ?? current.quota),
       updatedAt: now,
       version: current.version + 1,
     };
@@ -84,7 +91,9 @@ class InMemoryAgentStore implements AgentStore {
       JSON.stringify(updated.permissionPolicy) === JSON.stringify(current.permissionPolicy) &&
       updated.name === current.name &&
       JSON.stringify(updated.callableAgents) === JSON.stringify(current.callableAgents) &&
-      updated.maxSubagentDepth === current.maxSubagentDepth
+      updated.maxSubagentDepth === current.maxSubagentDepth &&
+      JSON.stringify(updated.mcpServers) === JSON.stringify(current.mcpServers) &&
+      JSON.stringify(updated.quota) === JSON.stringify(current.quota)
     ) {
       return current;
     }
@@ -294,6 +303,61 @@ class InMemoryQueueStore implements QueueStore {
   }
 }
 
+// ---------- Audit ----------
+
+class InMemoryAuditStore implements AuditStore {
+  private readonly events: AuditRecord[] = [];
+  private nextId = 1;
+
+  record(event: Omit<AuditRecord, "id">): void {
+    this.events.push({ ...event, id: this.nextId++ });
+  }
+
+  list(filters: {
+    since?: number;
+    until?: number;
+    action?: string;
+    target?: string;
+    limit?: number;
+  }): AuditRecord[] {
+    const limit = Math.min(Math.max(filters.limit ?? 100, 1), 1000);
+    let out: AuditRecord[] = [];
+    for (const e of this.events) {
+      if (filters.since !== undefined && e.ts < filters.since) continue;
+      if (filters.until !== undefined && e.ts > filters.until) continue;
+      if (filters.action !== undefined) {
+        if (filters.action.includes("%")) {
+          // Naïve LIKE: convert %...% to a regex.
+          const re = new RegExp(
+            `^${filters.action.replace(/[.+*?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*")}$`,
+          );
+          if (!re.test(e.action)) continue;
+        } else if (e.action !== filters.action) {
+          continue;
+        }
+      }
+      if (filters.target !== undefined && e.target !== filters.target) continue;
+      out.push(e);
+    }
+    // Newest first, cap to limit.
+    out = out.sort((a, b) => (b.ts - a.ts) || (b.id - a.id)).slice(0, limit);
+    return out;
+  }
+
+  deleteOlderThan(ts: number): number {
+    const before = this.events.length;
+    let i = 0;
+    while (i < this.events.length) {
+      if (this.events[i]!.ts < ts) {
+        this.events.splice(i, 1);
+      } else {
+        i++;
+      }
+    }
+    return before - this.events.length;
+  }
+}
+
 // ---------- Bundle ----------
 
 export class InMemoryStore implements Store {
@@ -302,6 +366,7 @@ export class InMemoryStore implements Store {
   readonly sessions: SessionStore;
   readonly secrets: SecretStore;
   readonly queue: QueueStore;
+  readonly audit: AuditStore;
 
   constructor() {
     this.agents = new InMemoryAgentStore();
@@ -309,6 +374,7 @@ export class InMemoryStore implements Store {
     this.sessions = new InMemorySessionStore();
     this.secrets = new InMemorySecretStore();
     this.queue = new InMemoryQueueStore();
+    this.audit = new InMemoryAuditStore();
   }
 
   close(): void {

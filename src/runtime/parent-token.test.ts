@@ -33,12 +33,23 @@ describe("ParentTokenMinter", () => {
     expect(minter2.verify(token)).toBeUndefined();
   });
 
+  // Flip the FIRST char, not the last: base64url's last character can
+  // be in the "padding" position (low bits ignored on decode) for some
+  // payload lengths, so changing it doesn't always change the decoded
+  // bytes — which made the naïve "append A" version flaky. The first
+  // char always encodes data bits, so flipping it reliably tampers the
+  // decoded MAC/payload.
+  function flipFirstChar(s: string): string {
+    const first = s[0];
+    const replacement = first === "A" ? "B" : "A";
+    return `${replacement}${s.slice(1)}`;
+  }
+
   it("rejects tokens with tampered payload", () => {
     const minter = new ParentTokenMinter();
     const token = minter.mint(sampleInput());
     const [payloadB64, macB64] = token.split(".");
-    // Flip one character in the payload half.
-    const tampered = `${payloadB64?.slice(0, -1)}A.${macB64}`;
+    const tampered = `${flipFirstChar(payloadB64!)}.${macB64}`;
     expect(minter.verify(tampered)).toBeUndefined();
   });
 
@@ -46,7 +57,7 @@ describe("ParentTokenMinter", () => {
     const minter = new ParentTokenMinter();
     const token = minter.mint(sampleInput());
     const [payloadB64, macB64] = token.split(".");
-    const tampered = `${payloadB64}.${macB64?.slice(0, -1)}A`;
+    const tampered = `${payloadB64}.${flipFirstChar(macB64!)}`;
     expect(minter.verify(tampered)).toBeUndefined();
   });
 

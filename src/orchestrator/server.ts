@@ -3,6 +3,7 @@ import { serve } from "@hono/node-server";
 import { type Context, Hono, type MiddlewareHandler } from "hono";
 import { streamSSE } from "hono/streaming";
 import { createAuthMiddleware } from "../auth.js";
+import { writeAudit } from "../audit.js";
 import { addContext, getLogger, withContext } from "../log.js";
 import { createRateLimitMiddleware } from "../rate-limit.js";
 import {
@@ -14,7 +15,12 @@ import {
 } from "../metrics.js";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
-import type { AgentStore, EnvironmentStore, SessionStore } from "../store/types.js";
+import type {
+  AgentStore,
+  AuditStore,
+  EnvironmentStore,
+  SessionStore,
+} from "../store/types.js";
 import { AgentRouter, RouterError } from "./router.js";
 import {
   CreateAgentRequestSchema,
@@ -87,6 +93,7 @@ export type ServerDeps = {
   environments: EnvironmentStore;
   sessions: SessionStore;
   events: PiJsonlEventReader;
+  audit: AuditStore;
   router: AgentRouter;
   /**
    * Baseline bearer-token auth. Undefined or empty string → auth
@@ -125,6 +132,8 @@ function agentResponse(agent: AgentConfig) {
     name: agent.name,
     callable_agents: agent.callableAgents,
     max_subagent_depth: agent.maxSubagentDepth,
+    mcp_servers: agent.mcpServers,
+    quota: agent.quota,
     version: agent.version,
     created_at: agent.createdAt,
     updated_at: agent.updatedAt,
@@ -195,6 +204,9 @@ function handleRouterError(err: unknown, c: Context): Response {
     }
     if (err.code === "session_busy" || err.code === "session_not_running") {
       return c.json({ error: err.code, message: err.message }, 409);
+    }
+    if (err.code === "quota_exceeded") {
+      return c.json({ error: err.code, message: err.message }, 429);
     }
     return c.json({ error: err.code, message: err.message }, 500);
   }
@@ -268,6 +280,9 @@ export function buildApp(deps: ServerDeps): Hono {
         openai_compat: {
           chat_completions: "POST /v1/chat/completions",
         },
+        audit: {
+          list: "GET /v1/audit?since=<ts>&action=<verb>&target=<id>&limit=<n>",
+        },
         health: {
           liveness: "GET /healthz",
           metrics: "GET /metrics",
@@ -284,11 +299,22 @@ export function buildApp(deps: ServerDeps): Hono {
     const body = await c.req.json().catch(() => ({}));
     const parsed = CreateAgentRequestSchema.safeParse(body);
     if (!parsed.success) {
+      writeAudit(deps.audit, c, {
+        action: "agent.create",
+        target: null,
+        outcome: "invalid_request",
+      });
       return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
     }
     const agent = deps.agents.create(parsed.data);
     agentsCreatedTotal.inc();
     addContext({ agentId: agent.agentId });
+    writeAudit(deps.audit, c, {
+      action: "agent.create",
+      target: agent.agentId,
+      outcome: "ok",
+      metadata: { model: agent.model, name: agent.name },
+    });
     // Pre-warm a container for this agent so the first session's cold-start
     // is eliminated. Fire-and-forget — failure is non-fatal.
     void deps.router.warmForAgent(agent.agentId).catch((err) => {
@@ -314,6 +340,11 @@ export function buildApp(deps: ServerDeps): Hono {
   app.delete("/v1/agents/:agentId", (c) => {
     const agentId = c.req.param("agentId");
     const existed = deps.agents.delete(agentId);
+    writeAudit(deps.audit, c, {
+      action: "agent.delete",
+      target: agentId,
+      outcome: existed ? "ok" : "agent_not_found",
+    });
     if (!existed) {
       return c.json({ error: "agent_not_found" }, 404);
     }
@@ -334,7 +365,20 @@ export function buildApp(deps: ServerDeps): Hono {
       return c.json({ error: "version_conflict", message: `expected version ${agent.version}, got ${parsed.data.version}` }, 409);
     }
     const updated = deps.agents.update(agentId, parsed.data);
-    if (!updated) return c.json({ error: "version_conflict" }, 409);
+    if (!updated) {
+      writeAudit(deps.audit, c, {
+        action: "agent.update",
+        target: agentId,
+        outcome: "version_conflict",
+      });
+      return c.json({ error: "version_conflict" }, 409);
+    }
+    writeAudit(deps.audit, c, {
+      action: "agent.update",
+      target: agentId,
+      outcome: "ok",
+      metadata: { new_version: updated.version },
+    });
     return c.json(agentResponse(updated));
   });
 
@@ -349,6 +393,11 @@ export function buildApp(deps: ServerDeps): Hono {
   app.post("/v1/agents/:agentId/archive", (c) => {
     const agentId = c.req.param("agentId");
     const archived = deps.agents.archive(agentId);
+    writeAudit(deps.audit, c, {
+      action: "agent.archive",
+      target: agentId,
+      outcome: archived ? "ok" : "agent_not_found",
+    });
     if (!archived) return c.json({ error: "agent_not_found" }, 404);
     return c.json(agentResponse(archived));
   });
@@ -462,11 +511,27 @@ export function buildApp(deps: ServerDeps): Hono {
       // so it's ready (or nearly ready) by the time the first event arrives.
       // Fire-and-forget — failure is non-fatal; the first event cold-spawns.
       addContext({ agentId: parsed.data.agentId, sessionId: session.sessionId });
+      writeAudit(deps.audit, c, {
+        action: "session.create",
+        target: session.sessionId,
+        outcome: "ok",
+        metadata: {
+          agent_id: session.agentId,
+          environment_id: session.environmentId,
+          is_subagent: remainingSubagentDepthOverride !== undefined,
+        },
+      });
       void deps.router.warmSession(session.sessionId).catch((err) => {
         log.warn({ err, session_id: session.sessionId }, "background warm-up failed (non-fatal)");
       });
       return c.json(sessionResponse(session, deps.events));
     } catch (err) {
+      writeAudit(deps.audit, c, {
+        action: "session.create",
+        target: null,
+        outcome: err instanceof RouterError ? err.code : "error",
+        metadata: { agent_id: parsed.data.agentId },
+      });
       return handleRouterError(err, c);
     }
   });
@@ -489,12 +554,23 @@ export function buildApp(deps: ServerDeps): Hono {
     const sessionId = c.req.param("sessionId");
     const session = deps.sessions.get(sessionId);
     if (!session) {
+      writeAudit(deps.audit, c, {
+        action: "session.delete",
+        target: sessionId,
+        outcome: "session_not_found",
+      });
       return c.json({ error: "session_not_found" }, 404);
     }
     // Drop the Pi JSONL + sessions.json entry on disk first, then the
     // orchestrator-side metadata row.
     deps.events.deleteBySession(session.agentId, session.sessionId);
     deps.sessions.delete(sessionId);
+    writeAudit(deps.audit, c, {
+      action: "session.delete",
+      target: sessionId,
+      outcome: "ok",
+      metadata: { agent_id: session.agentId },
+    });
     return c.json({ deleted: true });
   });
 
@@ -552,12 +628,22 @@ export function buildApp(deps: ServerDeps): Hono {
     const sessionId = c.req.param("sessionId");
     try {
       const session = await deps.router.cancel(sessionId);
+      writeAudit(deps.audit, c, {
+        action: "session.cancel",
+        target: sessionId,
+        outcome: "ok",
+      });
       return c.json({
         session_id: session.sessionId,
         session_status: session.status,
         cancelled: true,
       });
     } catch (err) {
+      writeAudit(deps.audit, c, {
+        action: "session.cancel",
+        target: sessionId,
+        outcome: err instanceof RouterError ? err.code : "error",
+      });
       return handleRouterError(err, c);
     }
   });
@@ -1071,6 +1157,52 @@ export function buildApp(deps: ServerDeps): Hono {
         },
       ],
       usage,
+    });
+  });
+
+  // ---------- Audit log ----------
+
+  // Filtered list of audit events. Useful for ops questions like "which
+  // caller deleted agt_X last Tuesday" or "show me every session
+  // created against agent Y". Auth-gated by the same bearer token as
+  // the rest of the API — operators with access to mutating routes
+  // can already do anything, so there's no point putting a second
+  // authentication surface in front of read-only audit.
+  app.get("/v1/audit", (c) => {
+    const sinceStr = c.req.query("since");
+    const untilStr = c.req.query("until");
+    const limitStr = c.req.query("limit");
+    const action = c.req.query("action") ?? undefined;
+    const target = c.req.query("target") ?? undefined;
+    const since = sinceStr ? Number.parseInt(sinceStr, 10) : undefined;
+    const until = untilStr ? Number.parseInt(untilStr, 10) : undefined;
+    const limit = limitStr ? Number.parseInt(limitStr, 10) : undefined;
+    if (
+      (since !== undefined && Number.isNaN(since)) ||
+      (until !== undefined && Number.isNaN(until)) ||
+      (limit !== undefined && Number.isNaN(limit))
+    ) {
+      return c.json(
+        {
+          error: "invalid_request",
+          message: "since, until, and limit must be integers",
+        },
+        400,
+      );
+    }
+    const events = deps.audit.list({ since, until, action, target, limit });
+    return c.json({
+      events: events.map((e) => ({
+        id: e.id,
+        ts: e.ts,
+        request_id: e.requestId,
+        actor: e.actor,
+        action: e.action,
+        target: e.target,
+        outcome: e.outcome,
+        metadata: e.metadata,
+      })),
+      count: events.length,
     });
   });
 

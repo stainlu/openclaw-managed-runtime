@@ -188,6 +188,68 @@ describe("AgentRouter.streamEvent — pre-container decision tree", () => {
   });
 });
 
+describe("AgentRouter quota enforcement", () => {
+  // Quotas fire from runEvent / streamEvent's pre-dispatch checks, so we
+  // can exercise them without needing a live pool — same shape as the
+  // other router decision-tree tests above.
+  function seedAgentWithQuota(
+    store: InMemoryStore,
+    quota: NonNullable<ReturnType<InMemoryStore["agents"]["get"]>>["quota"],
+  ) {
+    return store.agents.create({
+      model: "m",
+      tools: [],
+      instructions: "",
+      permissionPolicy: { type: "always_allow" },
+      callableAgents: [],
+      maxSubagentDepth: 0,
+      mcpServers: {},
+      quota,
+    });
+  }
+
+  it("rejects with quota_exceeded when the session's rolling cost >= maxCostUsdPerSession", async () => {
+    const { router, store } = makeRouter();
+    const agent = seedAgentWithQuota(store, { maxCostUsdPerSession: 1.0 });
+    const session = router.createSession(agent.agentId);
+    // Simulate a prior turn that brought us to the cap.
+    store.sessions.addUsage(session.sessionId, {
+      tokensIn: 0,
+      tokensOut: 0,
+      costUsd: 1.0,
+    });
+    await expect(
+      router.runEvent({ sessionId: session.sessionId, content: "another turn" }),
+    ).rejects.toMatchObject({ name: "RouterError", code: "quota_exceeded" });
+    // Session stayed idle — quota check must not flip state.
+    expect(store.sessions.get(session.sessionId)?.status).toBe("idle");
+  });
+
+  it("rejects with quota_exceeded when tokens_in + tokens_out >= maxTokensPerSession", async () => {
+    const { router, store } = makeRouter();
+    const agent = seedAgentWithQuota(store, { maxTokensPerSession: 100 });
+    const session = router.createSession(agent.agentId);
+    store.sessions.addUsage(session.sessionId, {
+      tokensIn: 80,
+      tokensOut: 20,
+      costUsd: 0,
+    });
+    await expect(
+      router.runEvent({ sessionId: session.sessionId, content: "hi" }),
+    ).rejects.toMatchObject({ name: "RouterError", code: "quota_exceeded" });
+  });
+
+  it("rejects with quota_exceeded when the session age has passed maxWallDurationMs", async () => {
+    const { router, store } = makeRouter();
+    const agent = seedAgentWithQuota(store, { maxWallDurationMs: 10 });
+    const session = router.createSession(agent.agentId);
+    await new Promise((r) => setTimeout(r, 20));
+    await expect(
+      router.runEvent({ sessionId: session.sessionId, content: "hi" }),
+    ).rejects.toMatchObject({ name: "RouterError", code: "quota_exceeded" });
+  });
+});
+
 describe("AgentRouter.runEvent — decision tree", () => {
   it("throws session_not_found for an unknown session", async () => {
     const { router } = makeRouter();

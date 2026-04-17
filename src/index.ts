@@ -4,6 +4,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getLogger, rootLogger } from "./log.js";
 import {
+  sessionJsonlBytesMax,
+  sessionJsonlBytesSum,
+  sessionJsonlOverThreshold,
   startupAdoptionsTotal,
   startupQueueDrainedTotal,
 } from "./metrics.js";
@@ -96,6 +99,17 @@ function collectPassthroughEnv(): Record<string, string> {
     "OPENROUTER_API_KEY",
     "FIREWORKS_API_KEY",
     "GROQ_API_KEY",
+    // OpenTelemetry — forwarded verbatim so operators can point openclaw's
+    // built-in OTEL exporter at their collector via the standard env vars.
+    // docker/entrypoint.sh reads these and emits diagnostics.otel into
+    // openclaw.json when OTEL_EXPORTER_OTLP_ENDPOINT is present.
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_SERVICE_NAME",
+    "OPENCLAW_OTEL_SAMPLE_RATE",
+    "OPENCLAW_OTEL_FLUSH_INTERVAL_MS",
   ];
   const extraKeys = (process.env.OPENCLAW_PASSTHROUGH_ENV ?? "")
     .split(",")
@@ -361,6 +375,23 @@ async function main(): Promise<void> {
     orphanedRunningSessions += 1;
   }
 
+  // For every adopted session that was `running`, wire the observer so
+  // the WS `chat` broadcast (or a post-crash JSONL fast-path) finalizes
+  // the in-flight turn. Without this the session stays `running`
+  // indefinitely after a mid-turn restart — the turn completes
+  // server-side but our orchestrator never sees it. Fire-and-forget:
+  // observeAdoptedSession is self-unsubscribing once the first terminal
+  // event lands, and new HTTP-driven runs have their own finalization
+  // path inside executeInBackground/streamEvent.
+  for (const sessionId of adopted) {
+    void router.observeAdoptedSession(sessionId).catch((err) => {
+      log.warn(
+        { err, session_id: sessionId },
+        "adopted-session observer failed to attach",
+      );
+    });
+  }
+
   // Drain queued events for idle sessions. Normal operation makes this
   // set empty (idle + non-empty queue violates the invariant that the
   // drain loop either dequeues or flips to idle). The only way to see
@@ -436,12 +467,38 @@ async function main(): Promise<void> {
     );
   }
 
+  // Audit-log retention. Configurable via OPENCLAW_AUDIT_RETENTION_DAYS;
+  // 0 disables (keep forever, useful for compliance archives). Cleanup
+  // runs once on boot + hourly thereafter, so recovered rows always
+  // reflect the current window.
+  const auditRetentionDays = envInt("OPENCLAW_AUDIT_RETENTION_DAYS", 30);
+  if (auditRetentionDays > 0) {
+    const runAuditCleanup = (): void => {
+      const cutoff = Date.now() - auditRetentionDays * 24 * 60 * 60 * 1000;
+      try {
+        const removed = store.audit.deleteOlderThan(cutoff);
+        if (removed > 0) {
+          log.info(
+            { removed, retention_days: auditRetentionDays },
+            "audit log retention pass deleted old rows",
+          );
+        }
+      } catch (err) {
+        log.warn({ err }, "audit retention cleanup failed");
+      }
+    };
+    runAuditCleanup();
+    const auditRetentionHandle = setInterval(runAuditCleanup, 60 * 60_000);
+    auditRetentionHandle.unref();
+  }
+
   await startServer(
     {
       agents: store.agents,
       environments: store.environments,
       sessions: store.sessions,
       events: eventReader,
+      audit: store.audit,
       router,
       tokenMinter,
       version,
@@ -450,6 +507,60 @@ async function main(): Promise<void> {
     },
     { port },
   );
+
+  // JSONL size sampler. Pi's compaction only shrinks the CONTEXT window
+  // the model sees — it appends a compaction entry to the JSONL and
+  // moves on, so the file keeps growing on disk. One verbose tool-use
+  // session can silently eat a host's disk. This sampler walks every
+  // session's JSONL on an interval, updates gauges for dashboards, and
+  // emits a WARN log when any single session exceeds the configured
+  // threshold so operators can archive or delete before the host
+  // wedges. Intentionally simple — stat-only, no contents read, no
+  // rotation (rotation is a Pi concern, not ours). Operators who want
+  // hard eviction should wire an external cron on top of the metrics.
+  const jsonlWarnBytes = envInt(
+    "OPENCLAW_JSONL_WARN_BYTES",
+    100 * 1024 * 1024, // 100 MiB per session
+  );
+  const jsonlSampleIntervalMs = envInt(
+    "OPENCLAW_JSONL_SAMPLE_INTERVAL_MS",
+    5 * 60_000, // 5 min
+  );
+  const warnedSessions = new Set<string>();
+  const sampleJsonl = (): void => {
+    let total = 0;
+    let max = 0;
+    let overThreshold = 0;
+    for (const session of store.sessions.list()) {
+      const stat = eventReader.statJsonl(session.agentId, session.sessionId);
+      if (!stat) continue;
+      total += stat.bytes;
+      if (stat.bytes > max) max = stat.bytes;
+      if (stat.bytes >= jsonlWarnBytes) {
+        overThreshold += 1;
+        if (!warnedSessions.has(session.sessionId)) {
+          warnedSessions.add(session.sessionId);
+          log.warn(
+            {
+              session_id: session.sessionId,
+              agent_id: session.agentId,
+              bytes: stat.bytes,
+              threshold_bytes: jsonlWarnBytes,
+            },
+            "session JSONL exceeds warn threshold — archive or delete before host disk wedges",
+          );
+        }
+      } else {
+        warnedSessions.delete(session.sessionId);
+      }
+    }
+    sessionJsonlBytesSum.set(total);
+    sessionJsonlBytesMax.set(max);
+    sessionJsonlOverThreshold.set(overThreshold);
+  };
+  sampleJsonl();
+  const jsonlSamplerHandle = setInterval(sampleJsonl, jsonlSampleIntervalMs);
+  jsonlSamplerHandle.unref();
 
   // Graceful shutdown: tear down all pool-managed containers (best-effort)
   // and close the SQLite store so WAL checkpoints flush cleanly. The HTTP

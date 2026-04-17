@@ -18,6 +18,49 @@ export const PermissionPolicySchema = z.discriminatedUnion("type", [
 
 export type PermissionPolicy = z.infer<typeof PermissionPolicySchema>;
 
+// Per-session quotas attached to an agent template. Enforced by the
+// router BEFORE each turn (runEvent + streamEvent): cost is checked
+// against the session's rolling cost_usd, tokens against the combined
+// input+output totals, and duration against wall time since
+// session.createdAt. A session that trips any quota rejects with
+// `quota_exceeded` and must be recreated. Left undefined = no cap.
+// Values are per-session, not per-agent: the agent template defines
+// the limits, every session derived from it gets its own budget.
+export const QuotaSchema = z
+  .object({
+    maxCostUsdPerSession: z.number().positive().optional(),
+    maxTokensPerSession: z.number().int().positive().optional(),
+    maxWallDurationMs: z.number().int().positive().optional(),
+  })
+  .strict();
+
+export type Quota = z.infer<typeof QuotaSchema>;
+
+// MCP server declaration attached to an agent template. Shape passes
+// through to openclaw's mcp.servers block verbatim (see
+// openclaw/src/config/zod-schema.ts:209 McpServerSchema). We accept
+// both stdio (command + args + env) and streamable-HTTP (url +
+// headers) transports. `passthrough()` so upstream can add new
+// transport fields without requiring a release on our side.
+export const McpServerConfigSchema = z
+  .object({
+    command: z.string().optional(),
+    args: z.array(z.string()).optional(),
+    env: z
+      .record(
+        z.string(),
+        z.union([z.string(), z.number(), z.boolean()]),
+      )
+      .optional(),
+    cwd: z.string().optional(),
+    url: z.string().url().optional(),
+    headers: z.record(z.string(), z.string()).optional(),
+  })
+  .passthrough();
+
+export type McpServerConfig = z.infer<typeof McpServerConfigSchema>;
+export type McpServers = Record<string, McpServerConfig>;
+
 export const CreateAgentRequestSchema = z.object({
   model: z.string().min(1, "model is required"),
   tools: z.array(z.string()).default([]),
@@ -41,6 +84,17 @@ export const CreateAgentRequestSchema = z.object({
    * further POST /v1/sessions calls carrying that token.
    */
   maxSubagentDepth: z.number().int().min(0).default(0),
+  /**
+   * Object of MCP servers this agent exposes to Claude. Keyed by server
+   * name — the key is what the agent refers to the server as in tool
+   * calls. Value is the transport-specific config. Empty object = no
+   * MCP servers (default). Forwarded verbatim to the container via
+   * OPENCLAW_MCP_SERVERS_JSON, which the entrypoint writes into
+   * openclaw.json's `mcp.servers` block.
+   */
+  mcpServers: z.record(z.string(), McpServerConfigSchema).default({}),
+  /** Optional per-session budget caps. Absent = no cap. */
+  quota: QuotaSchema.optional(),
 });
 
 export type CreateAgentRequest = z.infer<typeof CreateAgentRequestSchema>;
@@ -54,6 +108,11 @@ export const UpdateAgentRequestSchema = z.object({
   name: z.string().nullable().optional(),
   callableAgents: z.array(z.string()).nullable().optional(),
   maxSubagentDepth: z.number().int().min(0).optional(),
+  mcpServers: z
+    .record(z.string(), McpServerConfigSchema)
+    .nullable()
+    .optional(),
+  quota: QuotaSchema.nullable().optional(),
 });
 
 export type UpdateAgentRequest = z.infer<typeof UpdateAgentRequestSchema>;
@@ -71,6 +130,8 @@ export type AgentConfig = {
   version: number;
   callableAgents: string[];
   maxSubagentDepth: number;
+  mcpServers: McpServers;
+  quota?: Quota;
 };
 
 // ---------- Environment (container configuration template) ----------
