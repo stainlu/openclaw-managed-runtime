@@ -1,6 +1,6 @@
 # Design: `networking: limited` enforcement
 
-**Status.** Draft — not yet implemented.
+**Status.** Deferred. A full runtime implementation shipped across three commits (`82088c6..fc52e7a`, April 17) but was reverted shortly after because the multi-network topology + per-session sidecar lifecycle added more surface than we want to carry right now. The schema now rejects `{type: "limited"}` so nothing fail-opens while the feature is between implementations; the egress-proxy package (`docker/egress-proxy/`) stays in tree so the re-implementation doesn't start from scratch. The rest of this document is the design we'd pick up when the feature returns.
 **Scope.** Per-session container network egress restriction via allowlist.
 **Corresponds to.** Item 3 of the April 17 production-hardening pass.
 

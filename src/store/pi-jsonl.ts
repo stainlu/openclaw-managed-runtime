@@ -150,6 +150,16 @@ export class PiJsonlEventReader {
    *     for `idleTimeoutMs` — a grace period so clients can still stream
    *     across multiple turns without having to reconnect.
    *
+   * When `afterEventId` is set, phase 1 skips every event up to and
+   * including the one with that id. Used by the SSE resume path so a
+   * reconnecting client doesn't re-receive events it already saw; the
+   * event id is whatever the last successful `id: ...` SSE frame carried
+   * (which, thanks to the browser's `EventSource`, comes back to us as
+   * the `Last-Event-ID` request header on reconnect). If the id cannot be
+   * found in the current catch-up (e.g. the client missed older events
+   * AND the JSONL was truncated), we replay everything from the start —
+   * safer to over-send than to silently drop history.
+   *
    * Intentionally simple: each poll re-reads and re-parses the whole file
    * (sessions are a few KB in practice). A byte-offset tail is a
    * straightforward future optimization if this shows up on a profile.
@@ -162,15 +172,31 @@ export class PiJsonlEventReader {
       pollIntervalMs?: number;
       idleTimeoutMs?: number;
       isSessionRunning?: () => boolean;
+      afterEventId?: string;
     } = {},
   ): AsyncGenerator<Event> {
     const pollMs = opts.pollIntervalMs ?? 250;
     const idleTimeoutMs = opts.idleTimeoutMs ?? 30_000;
     const seen = new Set<string>();
 
-    // Phase 1: catch-up.
-    for (const e of this.listBySession(agentId, sessionId)) {
+    // Phase 1: catch-up. When a resume cursor is supplied, skip every
+    // event up to and including it. We pass 1 if the cursor id appears
+    // in the file; if not, we replay everything (the cursor may be
+    // stale / invalid — losing client context to safety beats losing
+    // events to a wrong cursor).
+    const catchUp = this.listBySession(agentId, sessionId);
+    const afterId = opts.afterEventId;
+    let cursorSeen = afterId === undefined;
+    if (afterId !== undefined && !catchUp.some((e) => e.eventId === afterId)) {
+      cursorSeen = true; // cursor not present → treat as no cursor
+    }
+    for (const e of catchUp) {
       if (opts.signal?.aborted) return;
+      if (!cursorSeen) {
+        if (e.eventId === afterId) cursorSeen = true;
+        seen.add(e.eventId);
+        continue;
+      }
       seen.add(e.eventId);
       yield e;
     }

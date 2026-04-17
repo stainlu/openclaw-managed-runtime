@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { Event } from "../orchestrator/types.js";
 import { PiJsonlEventReader } from "./pi-jsonl.js";
 
 // Pi's JSONL uses a canonical session-key scheme in sessions.json:
@@ -101,6 +102,69 @@ describe("PiJsonlEventReader", () => {
       tokensOut: 7,
       costUsd: 0.00012,
       model: "moonshot/kimi-k2.5",
+    });
+  });
+
+  describe("follow() resume cursor", () => {
+    function threeEventFixture(): Fixture {
+      return makeFixture([
+        {
+          type: "message",
+          id: "evt-1",
+          timestamp: "2026-04-17T10:00:00.000Z",
+          message: { role: "user", content: [{ type: "text", text: "a" }] },
+        },
+        {
+          type: "message",
+          id: "evt-2",
+          timestamp: "2026-04-17T10:00:01.000Z",
+          message: { role: "assistant", content: [{ type: "text", text: "b" }] },
+        },
+        {
+          type: "message",
+          id: "evt-3",
+          timestamp: "2026-04-17T10:00:02.000Z",
+          message: { role: "user", content: [{ type: "text", text: "c" }] },
+        },
+      ]);
+    }
+
+    async function drain(gen: AsyncGenerator<Event>): Promise<Event[]> {
+      const out: Event[] = [];
+      for await (const e of gen) out.push(e);
+      return out;
+    }
+
+    it("skips events up to and including the cursor", async () => {
+      const f = threeEventFixture();
+      fixtures.push(f);
+      const reader = new PiJsonlEventReader(f.root);
+      const events = await drain(
+        reader.follow(f.agentId, f.sessionId, {
+          afterEventId: "evt-2",
+          isSessionRunning: () => false,
+          idleTimeoutMs: 0,
+          pollIntervalMs: 10,
+        }),
+      );
+      expect(events.map((e) => e.eventId)).toEqual(["evt-3"]);
+    });
+
+    it("replays everything when the cursor isn't found (cursor stale / unknown)", async () => {
+      const f = threeEventFixture();
+      fixtures.push(f);
+      const reader = new PiJsonlEventReader(f.root);
+      const events = await drain(
+        reader.follow(f.agentId, f.sessionId, {
+          afterEventId: "evt-does-not-exist",
+          isSessionRunning: () => false,
+          idleTimeoutMs: 0,
+          pollIntervalMs: 10,
+        }),
+      );
+      // Losing client context is preferable to silently dropping events —
+      // the reconnecting client will dedupe on its side via eventId.
+      expect(events.map((e) => e.eventId)).toEqual(["evt-1", "evt-2", "evt-3"]);
     });
   });
 

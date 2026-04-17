@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { ParentTokenMinter, type MintInput } from "./parent-token.js";
 
@@ -94,5 +95,26 @@ describe("ParentTokenMinter", () => {
     const token = minter.mint(sampleInput({ remainingDepth: 0 }));
     const payload = minter.verify(token);
     expect(payload?.remainingDepth).toBe(0);
+  });
+
+  it("accepts an injected secret and survives across instances with the same secret", () => {
+    const secret = randomBytes(32);
+    const minterA = new ParentTokenMinter(secret);
+    const token = minterA.mint(sampleInput());
+    // A brand-new minter that doesn't share the secret must reject it —
+    // baseline for the next assertion.
+    expect(new ParentTokenMinter().verify(token)).toBeUndefined();
+    // Second minter re-constructed with the SAME secret (as happens across
+    // an orchestrator restart when the secret is loaded from SecretStore)
+    // accepts tokens minted by the first instance. This is the property
+    // that keeps long-running subagent delegation chains safe across
+    // deploys.
+    const minterB = new ParentTokenMinter(secret);
+    const payload = minterB.verify(token);
+    expect(payload?.parentSessionId).toBe(sampleInput().parentSessionId);
+  });
+
+  it("rejects a secret shorter than 16 bytes", () => {
+    expect(() => new ParentTokenMinter(Buffer.alloc(8))).toThrow(/too short/);
   });
 });

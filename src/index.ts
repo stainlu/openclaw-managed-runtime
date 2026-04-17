@@ -1,8 +1,12 @@
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getLogger, rootLogger } from "./log.js";
-import { SessionEventQueue } from "./orchestrator/event-queue.js";
+import {
+  startupAdoptionsTotal,
+  startupQueueDrainedTotal,
+} from "./metrics.js";
 import { AgentRouter, type RouterConfig } from "./orchestrator/router.js";
 import { startServer } from "./orchestrator/server.js";
 import { DockerContainerRuntime } from "./runtime/docker.js";
@@ -136,23 +140,6 @@ async function main(): Promise<void> {
   // local dev (pnpm dev) both must be set to the host directory.
   const stateRoot = env("OPENCLAW_STATE_ROOT", "/var/openclaw/sessions");
   const network = env("OPENCLAW_DOCKER_NETWORK", "openclaw-net");
-  // Internal Docker network carrying orchestrator↔agent control-plane
-  // traffic for `networking: limited` sessions. Must be reachable by
-  // the orchestrator container AND agent containers whose environments
-  // are configured with limited networking. docker-compose declares
-  // this network and attaches the orchestrator to both; for bespoke
-  // deploys, `ensureNetwork` creates it on startup with internal=true
-  // so it has no external egress.
-  const controlPlaneNetwork = env(
-    "OPENCLAW_CONTROL_PLANE_NETWORK",
-    "openclaw-control-plane",
-  );
-  // Image used for the per-session egress-proxy sidecar when an
-  // environment is configured with networking.type === "limited".
-  const egressProxyImage = env(
-    "OPENCLAW_EGRESS_PROXY_IMAGE",
-    "ghcr.io/stainlu/openclaw-managed-agents-egress-proxy:latest",
-  );
   const gatewayPort = envInt("OPENCLAW_GATEWAY_PORT", 18789);
   const readyTimeoutMs = envInt("OPENCLAW_READY_TIMEOUT_MS", 60_000);
   const runTimeoutMs = envInt("OPENCLAW_RUN_TIMEOUT_MS", 10 * 60_000);
@@ -182,15 +169,6 @@ async function main(): Promise<void> {
 
   const runtime = new DockerContainerRuntime({ network });
   await runtime.ensureNetwork();
-  // Control-plane network for limited-networking sessions. Internal so
-  // it has no external egress; only the orchestrator and limited-
-  // session agents join it. Safe no-op when no limited sessions exist.
-  await runtime.ensureNetwork(controlPlaneNetwork, { internal: true });
-
-  // Reap any containers left behind by a previous orchestrator instance.
-  // Matched by the `managed-by=openclaw-managed-agents` label so we do not
-  // touch anything else running on the host's Docker daemon.
-  const orphanedContainers = await runtime.cleanupOrphaned();
 
   const storeBackendRaw = env("OPENCLAW_STORE", "sqlite");
   if (storeBackendRaw !== "memory" && storeBackendRaw !== "sqlite") {
@@ -204,12 +182,6 @@ async function main(): Promise<void> {
       ? env("OPENCLAW_STORE_PATH", "/var/openclaw/state/managed-runtime.db")
       : undefined;
   const store = buildStore({ backend: storeBackend, path: storePath });
-
-  // Post-restart rehydration: any session still marked "running" after a
-  // restart was, by definition, orphaned — its container was torn down or
-  // is no longer tracked by this process. Flip them to "failed" so the
-  // client sees a terminal state instead of a stuck session.
-  const orphaned = store.sessions.failRunningSessions("orchestrator restarted mid-run");
 
   const passthroughEnv = collectPassthroughEnv();
   const passthroughEnvKeys = Object.keys(passthroughEnv).sort();
@@ -231,10 +203,6 @@ async function main(): Promise<void> {
     sweepIntervalMs,
     maxWarmContainers,
     warmIdleTimeoutMs,
-    limitedNetworking: {
-      sidecarImage: egressProxyImage,
-      controlPlaneNetwork,
-    },
     isBusy: (sessionId) => store.sessions.get(sessionId)?.status === "running",
     cleanupOnReap: async (sessionId) => {
       const session = store.sessions.get(sessionId);
@@ -252,11 +220,23 @@ async function main(): Promise<void> {
     },
   });
 
-  // Item 12-14: one minter per orchestrator process. Signed by an in-memory
-  // random secret generated in the constructor. Restart regenerates the
-  // secret, invalidating every outstanding token — consistent with the
-  // runtime's other "restart drops ephemeral state" invariants.
-  const tokenMinter = new ParentTokenMinter();
+  // One minter per orchestrator process. The HMAC secret is loaded from
+  // SecretStore so it survives restart — that's what keeps outstanding
+  // subagent tokens valid across an orchestrator deploy or crash, which
+  // is load-bearing for long-running delegation chains. On first boot
+  // we generate a fresh 32-byte secret and persist it; on every boot
+  // after that we reuse the persisted bytes. The secret never leaves
+  // the process; rotating it requires explicit operator action
+  // (delete the row) and invalidates every outstanding token.
+  const PARENT_TOKEN_SECRET_KEY = "parent_token_hmac_secret";
+  let parentSecret = store.secrets.get(PARENT_TOKEN_SECRET_KEY);
+  let generatedParentSecret = false;
+  if (!parentSecret) {
+    parentSecret = randomBytes(32);
+    store.secrets.set(PARENT_TOKEN_SECRET_KEY, parentSecret);
+    generatedParentSecret = true;
+  }
+  const tokenMinter = new ParentTokenMinter(parentSecret);
 
   const routerCfg: RouterConfig = {
     runtimeImage,
@@ -269,25 +249,155 @@ async function main(): Promise<void> {
     tokenMinter,
   };
 
-  const eventQueue = new SessionEventQueue();
-
   const router = new AgentRouter(
     store.agents,
     store.environments,
     store.sessions,
     eventReader,
     pool,
-    eventQueue,
+    store.queue,
     routerCfg,
   );
+
+  // ---- Post-restart reattach + drain ----
+  //
+  // Before this block existed, startup was blunt: `cleanupOrphaned()`
+  // stop-and-removed every labelled container, and `failRunningSessions()`
+  // flipped every running session to failed. That threw away a lot of
+  // correct state: idle-but-warm containers (forcing the next turn to
+  // cold-spawn), and in-flight runs whose Pi sessions can actually be
+  // resumed from the JSONL. The new flow preserves what can be preserved.
+  //
+  // Policy:
+  //   - For every labelled container on the host, look up its session.
+  //       * Session missing / archived / already failed → stop the container.
+  //       * Session exists → try to adopt (readyz + WS handshake). On
+  //         success the pool holds it just like a fresh spawn; on failure
+  //         we stop the container and move on.
+  //   - After adoption: any session that was `running` but whose container
+  //     we could not adopt is an interrupted in-flight run. Mark it failed
+  //     with a clear recoverable message and drop its queued events (they
+  //     were predicated on the run we just failed continuing).
+  //   - Idle sessions with queued events are an inconsistency only possible
+  //     when the orchestrator crashed between endRunSuccess and queue.shift
+  //     in the drain loop. Re-kick the first event so the commitment is
+  //     honored — subsequent events drain naturally through the normal
+  //     queue path.
+  //
+  // Warm containers are deliberately NOT adopted: the only thing that
+  // identifies a warm container is its agentId label, but re-populating
+  // the warm bucket with `spawnOptions` would require a matching agent
+  // template, and the bound parent token in its env was minted for the
+  // previous process's secret. Simpler and safer to stop them; the next
+  // POST /v1/agents won't re-warm, so warmth is only lost until the
+  // operator recreates the agent or issues the first session.
+  const adopted = new Set<string>();
+  let adoptionAttempts = 0;
+  let adoptionReattached = 0;
+  let adoptionStoppedOrphan = 0;
+  let adoptionFailed = 0;
+  const managedContainers = await runtime.listManaged();
+  for (const info of managedContainers) {
+    adoptionAttempts += 1;
+    // Containers without a session-id label are legacy (pre-rename) or
+    // unclaimed warm containers. Stop them — nothing durable to rebuild.
+    const sessionId = info.sessionId;
+    if (!sessionId || sessionId === "__warm__") {
+      await runtime.stop(info.id).catch(() => { /* best-effort */ });
+      adoptionStoppedOrphan += 1;
+      startupAdoptionsTotal.labels({ outcome: "stopped_orphan" }).inc();
+      continue;
+    }
+    const session = store.sessions.get(sessionId);
+    if (!session || session.status === "failed") {
+      await runtime.stop(info.id).catch(() => { /* best-effort */ });
+      adoptionStoppedOrphan += 1;
+      startupAdoptionsTotal.labels({ outcome: "stopped_orphan" }).inc();
+      continue;
+    }
+    if (!info.running) {
+      await runtime.stop(info.id).catch(() => { /* best-effort */ });
+      adoptionStoppedOrphan += 1;
+      startupAdoptionsTotal.labels({ outcome: "stopped_orphan" }).inc();
+      continue;
+    }
+    try {
+      await pool.adopt({
+        sessionId,
+        container: {
+          id: info.id,
+          name: info.name,
+          baseUrl: info.baseUrl,
+          token: info.token,
+        },
+      });
+      adopted.add(sessionId);
+      adoptionReattached += 1;
+      startupAdoptionsTotal.labels({ outcome: "reattached" }).inc();
+    } catch (err) {
+      log.warn(
+        { err, session_id: sessionId, container_id: info.id },
+        "adopt failed; stopping container",
+      );
+      await runtime.stop(info.id).catch(() => { /* best-effort */ });
+      adoptionFailed += 1;
+      startupAdoptionsTotal.labels({ outcome: "reattach_failed" }).inc();
+    }
+  }
+
+  // Selectively fail the running sessions we could not recover. These had
+  // an HTTP request in flight at the moment the prior process died — we
+  // can't reconstruct that request context, so the client has to re-post.
+  // JSONL history is intact, so re-posting just continues the conversation.
+  let orphanedRunningSessions = 0;
+  for (const session of store.sessions.list()) {
+    if (session.status !== "running") continue;
+    if (adopted.has(session.sessionId)) continue;
+    store.sessions.endRunFailure(
+      session.sessionId,
+      "orchestrator restarted mid-run; post a new message to resume",
+    );
+    store.queue.clear(session.sessionId);
+    orphanedRunningSessions += 1;
+  }
+
+  // Drain queued events for idle sessions. Normal operation makes this
+  // set empty (idle + non-empty queue violates the invariant that the
+  // drain loop either dequeues or flips to idle). The only way to see
+  // entries here is a crash between endRunSuccess and shift. Re-kick:
+  // runEvent handles the "session is idle" branch by starting a fresh
+  // run, which naturally drains any additional queued events.
+  let drainedEvents = 0;
+  for (const sessionId of store.queue.listSessionsWithQueued()) {
+    const session = store.sessions.get(sessionId);
+    if (!session) {
+      store.queue.clear(sessionId);
+      continue;
+    }
+    if (session.status !== "idle") continue;
+    const head = store.queue.shift(sessionId);
+    if (!head) continue;
+    try {
+      await router.runEvent({
+        sessionId,
+        content: head.content,
+        model: head.model,
+      });
+      drainedEvents += 1;
+      startupQueueDrainedTotal.inc();
+    } catch (err) {
+      log.warn(
+        { err, session_id: sessionId },
+        "startup queue drain failed; leaving remaining events for next boot",
+      );
+    }
+  }
 
   log.info(
     {
       version,
       runtime_image: runtimeImage,
       docker_network: network,
-      control_plane_network: controlPlaneNetwork,
-      egress_proxy_image: egressProxyImage,
       host_state_root: hostStateRoot,
       state_root: stateRoot,
       orchestrator_url: orchestratorUrl,
@@ -300,11 +410,18 @@ async function main(): Promise<void> {
         warm_max: maxWarmContainers,
         warm_idle_timeout_ms: warmIdleTimeoutMs,
       },
-      orphaned_containers_reaped: orphanedContainers,
-      orphaned_sessions_failed: orphaned,
+      adoption: {
+        attempts: adoptionAttempts,
+        reattached: adoptionReattached,
+        stopped_orphan: adoptionStoppedOrphan,
+        reattach_failed: adoptionFailed,
+        orphaned_running_sessions_failed: orphanedRunningSessions,
+        drained_queued_events: drainedEvents,
+      },
       passthrough_env_keys: passthroughEnvKeys,
       api_auth: apiToken ? "bearer-token" : "disabled",
       rate_limit_rpm: rateLimitRpm > 0 ? rateLimitRpm : "disabled",
+      parent_token_secret: generatedParentSecret ? "generated" : "restored",
     },
     `OpenClaw Managed Agents v${version} starting`,
   );

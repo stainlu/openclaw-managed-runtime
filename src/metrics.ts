@@ -57,7 +57,22 @@ export const poolWarmContainers = new Gauge({
 export const poolAcquireTotal = new Counter({
   name: "pool_acquire_total",
   help: "Total pool acquisitions, by serving source.",
-  labelNames: ["source"] as const, // "active" | "warm" | "spawn"
+  labelNames: ["source"] as const, // "active" | "warm" | "spawn" | "adopt"
+  registers: [registry],
+});
+
+/** Containers adopted on orchestrator startup (previously-running sessions reattached). */
+export const startupAdoptionsTotal = new Counter({
+  name: "startup_adoptions_total",
+  help: "Containers adopted at startup, by outcome.",
+  labelNames: ["outcome"] as const, // "reattached" | "stopped_orphan" | "reattach_failed"
+  registers: [registry],
+});
+
+/** Events drained from the durable queue at startup. */
+export const startupQueueDrainedTotal = new Counter({
+  name: "startup_queue_drained_total",
+  help: "Queued events re-dispatched at orchestrator startup.",
   registers: [registry],
 });
 

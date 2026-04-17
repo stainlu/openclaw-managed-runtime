@@ -36,4 +36,13 @@ export function buildStore(opts: BuildStoreOptions): Store {
 export { InMemoryStore } from "./memory.js";
 export { PiJsonlEventReader } from "./pi-jsonl.js";
 export { SqliteStore } from "./sqlite.js";
-export type { AgentStore, RunUsage, SessionStore, Store } from "./types.js";
+export type {
+  AgentStore,
+  EnvironmentStore,
+  QueuedEvent,
+  QueueStore,
+  RunUsage,
+  SecretStore,
+  SessionStore,
+  Store,
+} from "./types.js";

@@ -8,7 +8,16 @@ import type {
   Session,
   UpdateAgentRequest,
 } from "../orchestrator/types.js";
-import type { AgentStore, EnvironmentStore, RunUsage, SessionStore, Store } from "./types.js";
+import type {
+  AgentStore,
+  EnvironmentStore,
+  QueuedEvent,
+  QueueStore,
+  RunUsage,
+  SecretStore,
+  SessionStore,
+  Store,
+} from "./types.js";
 
 const nanoid = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
 
@@ -234,17 +243,72 @@ class InMemorySessionStore implements SessionStore {
   }
 }
 
+// ---------- Secrets ----------
+
+class InMemorySecretStore implements SecretStore {
+  private readonly bytes = new Map<string, Buffer>();
+
+  get(key: string): Buffer | undefined {
+    return this.bytes.get(key);
+  }
+
+  set(key: string, value: Buffer): void {
+    this.bytes.set(key, Buffer.from(value));
+  }
+}
+
+// ---------- Queue ----------
+
+class InMemoryQueueStore implements QueueStore {
+  private readonly bySession = new Map<string, QueuedEvent[]>();
+
+  enqueue(sessionId: string, event: QueuedEvent): void {
+    const existing = this.bySession.get(sessionId);
+    if (existing) {
+      existing.push(event);
+    } else {
+      this.bySession.set(sessionId, [event]);
+    }
+  }
+
+  shift(sessionId: string): QueuedEvent | undefined {
+    const queue = this.bySession.get(sessionId);
+    if (!queue || queue.length === 0) return undefined;
+    const next = queue.shift();
+    if (queue.length === 0) this.bySession.delete(sessionId);
+    return next;
+  }
+
+  size(sessionId: string): number {
+    return this.bySession.get(sessionId)?.length ?? 0;
+  }
+
+  clear(sessionId: string): number {
+    const dropped = this.bySession.get(sessionId)?.length ?? 0;
+    this.bySession.delete(sessionId);
+    return dropped;
+  }
+
+  listSessionsWithQueued(): string[] {
+    return Array.from(this.bySession.keys()).sort();
+  }
+}
+
 // ---------- Bundle ----------
 
 export class InMemoryStore implements Store {
   readonly agents: AgentStore;
   readonly environments: EnvironmentStore;
   readonly sessions: SessionStore;
+  readonly secrets: SecretStore;
+  readonly queue: QueueStore;
 
   constructor() {
     this.agents = new InMemoryAgentStore();
     this.environments = new InMemoryEnvironmentStore();
     this.sessions = new InMemorySessionStore();
+    this.secrets = new InMemorySecretStore();
+    this.queue = new InMemoryQueueStore();
   }
 
   close(): void {

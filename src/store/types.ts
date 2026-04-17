@@ -17,6 +17,20 @@ import type {
 // orchestrator reads them via PiJsonlEventReader (src/store/pi-jsonl.ts) at
 // query time; there is no orchestrator-side event log to keep in sync.
 
+/**
+ * Small orchestrator-private key/value store. Today this has exactly one
+ * caller: the HMAC secret for `ParentTokenMinter` must survive restart so
+ * subagent delegation chains can run across deploys without 403-ing.
+ * Kept narrow on purpose — if a second use case appears, re-evaluate
+ * whether it belongs here or in its own table.
+ */
+export interface SecretStore {
+  /** Return the bytes stored under `key`, or undefined if unset. */
+  get(key: string): Buffer | undefined;
+  /** Overwrite (or insert) the bytes stored under `key`. */
+  set(key: string, value: Buffer): void;
+}
+
 export interface AgentStore {
   create(req: CreateAgentRequest): AgentConfig;
   get(agentId: string): AgentConfig | undefined;
@@ -112,6 +126,43 @@ export interface Store {
   readonly agents: AgentStore;
   readonly environments: EnvironmentStore;
   readonly sessions: SessionStore;
+  readonly secrets: SecretStore;
+  /** Queue backend — durable on SQLite, in-memory on memory. */
+  readonly queue: QueueStore;
   /** Closes any backing file handles or connections. Safe to call more than once. */
   close(): void;
 }
+
+/**
+ * Backing store for the session event queue. Returned from buildStore so the
+ * queue shares SQLite durability with agents/sessions on the default backend,
+ * or stays in-memory for the test backend. Callers (router, startup drain)
+ * use only this surface — the queue's identity as "durable" lives in the
+ * store backend choice, not in router logic.
+ */
+export interface QueueStore {
+  /** Append an event to the given session's queue. Ordered by enqueue time. */
+  enqueue(sessionId: string, event: QueuedEvent): void;
+  /** Remove and return the head event for the session, or undefined if empty. */
+  shift(sessionId: string): QueuedEvent | undefined;
+  /** Non-destructive count of queued events for a session. */
+  size(sessionId: string): number;
+  /** Remove every queued event for a session. Returns the number removed. */
+  clear(sessionId: string): number;
+  /**
+   * Return every session id that currently has at least one queued event.
+   * Used at orchestrator startup to resume interrupted drain loops.
+   */
+  listSessionsWithQueued(): string[];
+}
+
+/**
+ * In-flight event payload — what a client POSTed while the session was busy.
+ * The router shapes it; the store persists it verbatim.
+ */
+export type QueuedEvent = {
+  content: string;
+  /** Optional per-event model override. */
+  model?: string;
+  enqueuedAt: number;
+};

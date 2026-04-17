@@ -10,14 +10,17 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 // and recursion depth, and mints a new token for the child container.
 //
 // The token is a compact `<base64url-payload>.<base64url-hmac>` string,
-// signed with HMAC-SHA256 over the payload bytes using a secret generated
-// at orchestrator startup. Restart regenerates the secret, invalidating
-// every outstanding token — consistent with the runtime's other
-// "restart drops ephemeral state" invariants (post-restart running
-// sessions become failed in Item 3, queued events are lost in Item 7).
+// signed with HMAC-SHA256 over the payload bytes.
+//
+// Secret lifetime: the secret is supplied by the caller (the startup code
+// in src/index.ts loads it from SecretStore, generating one on first boot
+// and persisting it). A restart that reads the same stored secret keeps
+// every outstanding token valid — which is what makes long-running
+// subagent delegation chains survive orchestrator deploys. Callers that
+// need pre-persistence semantics can omit the secret and the minter will
+// generate a fresh one (still useful in tests).
 //
 // What's NOT here:
-//   - Persistence: by design, tokens don't survive orchestrator restart.
 //   - JWT/PASETO libraries: overkill for an internal signed envelope. A
 //     flat HMAC over JSON is trivial to reason about, trivial to
 //     audit, and has no external crypto dependency.
@@ -72,8 +75,24 @@ function base64urlDecode(str: string): Buffer {
 export class ParentTokenMinter {
   private readonly secret: Buffer;
 
-  constructor() {
-    this.secret = randomBytes(32);
+  /**
+   * Construct a minter. When `secret` is provided, it is used verbatim
+   * for signing and verification — the caller is responsible for
+   * persistence (see src/index.ts, which loads from SecretStore). When
+   * omitted, a fresh 32-byte random secret is generated and lives for
+   * the minter's lifetime only.
+   */
+  constructor(secret?: Buffer) {
+    if (secret !== undefined) {
+      if (secret.length < 16) {
+        throw new Error(
+          `ParentTokenMinter secret is too short (got ${secret.length} bytes, need >=16)`,
+        );
+      }
+      this.secret = Buffer.from(secret);
+    } else {
+      this.secret = randomBytes(32);
+    }
   }
 
   /** Produce a signed token string for injection into a container's env. */

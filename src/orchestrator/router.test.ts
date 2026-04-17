@@ -5,7 +5,7 @@ import { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { SessionContainerPool } from "../runtime/pool.js";
 import { InMemoryStore } from "../store/memory.js";
 import { PiJsonlEventReader } from "../store/pi-jsonl.js";
-import { SessionEventQueue } from "./event-queue.js";
+import type { QueueStore } from "../store/types.js";
 import { AgentRouter, RouterError, type RouterConfig } from "./router.js";
 
 // These tests cover the decision-tree logic that doesn't require a live
@@ -18,11 +18,11 @@ function makeRouter(opts: {
 } = {}): {
   router: AgentRouter;
   store: InMemoryStore;
-  queue: SessionEventQueue;
+  queue: QueueStore;
   pool: Partial<SessionContainerPool>;
 } {
   const store = new InMemoryStore();
-  const queue = new SessionEventQueue();
+  const queue = store.queue;
   // Minimal pool stub: in tests that shouldn't reach the pool we leave
   // methods undefined so any accidental call throws TypeError and fails
   // loudly. Tests that DO want to exercise a pool interaction provide

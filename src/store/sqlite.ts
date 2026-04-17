@@ -12,7 +12,16 @@ import type {
   SessionStatus,
   UpdateAgentRequest,
 } from "../orchestrator/types.js";
-import type { AgentStore, EnvironmentStore, RunUsage, SessionStore, Store } from "./types.js";
+import type {
+  AgentStore,
+  EnvironmentStore,
+  QueuedEvent,
+  QueueStore,
+  RunUsage,
+  SecretStore,
+  SessionStore,
+  Store,
+} from "./types.js";
 
 const nanoid = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
 
@@ -175,6 +184,33 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id);
+
+-- Small key/value table for orchestrator-private bytes. Today holds exactly
+-- the ParentTokenMinter HMAC secret so subagent tokens survive restart.
+-- Kept deliberately narrow — not a general config store.
+CREATE TABLE IF NOT EXISTS kv_secrets (
+  k TEXT PRIMARY KEY,
+  v BLOB NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- Durable event queue. When POST /v1/sessions/:id/events lands on a running
+-- session, the payload is persisted here instead of held in a Map. The
+-- router drains it between turns; the startup-drain pass in src/index.ts
+-- resumes any work a crashed process left behind.
+--
+-- ROWID ordering gives us FIFO for free — SQLite's auto-INTEGER PRIMARY KEY
+-- is monotonic within a database, so the lowest ROWID per session is the
+-- head. No explicit per-session seq column needed.
+CREATE TABLE IF NOT EXISTS queued_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  content TEXT NOT NULL,
+  model TEXT,
+  enqueued_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_queued_events_session ON queued_events(session_id, id);
 `;
 
 // ---------- Agent store ----------
@@ -575,12 +611,113 @@ class SqliteSessionStore implements SessionStore {
   }
 }
 
+// ---------- Secret store ----------
+
+class SqliteSecretStore implements SecretStore {
+  private readonly getStmt: Database.Statement;
+  private readonly upsertStmt: Database.Statement;
+
+  constructor(db: Database.Database) {
+    this.getStmt = db.prepare(`SELECT v FROM kv_secrets WHERE k = ?`);
+    // INSERT OR REPLACE so set() is idempotent — callers don't need to
+    // distinguish "first boot, generate" from "rotate, overwrite".
+    this.upsertStmt = db.prepare(
+      `INSERT INTO kv_secrets (k, v, updated_at) VALUES (@k, @v, @now)
+       ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at`,
+    );
+  }
+
+  get(key: string): Buffer | undefined {
+    const row = this.getStmt.get(key) as { v: Buffer } | undefined;
+    return row?.v;
+  }
+
+  set(key: string, value: Buffer): void {
+    this.upsertStmt.run({ k: key, v: value, now: Date.now() });
+  }
+}
+
+// ---------- Queue store ----------
+
+class SqliteQueueStore implements QueueStore {
+  private readonly insertStmt: Database.Statement;
+  private readonly peekStmt: Database.Statement;
+  private readonly deleteByIdStmt: Database.Statement;
+  private readonly countStmt: Database.Statement;
+  private readonly clearStmt: Database.Statement;
+  private readonly listSessionsStmt: Database.Statement;
+
+  constructor(db: Database.Database) {
+    this.insertStmt = db.prepare(
+      `INSERT INTO queued_events (session_id, content, model, enqueued_at)
+       VALUES (@session_id, @content, @model, @enqueued_at)`,
+    );
+    // Head-of-queue is the lowest id for a session. Peek-then-delete is a
+    // two-statement shift; both run inside the same sync better-sqlite3
+    // call stack, so concurrent shifts from a single orchestrator process
+    // are naturally serialized. Cross-process contention is out of scope
+    // (the orchestrator is still single-process by design).
+    this.peekStmt = db.prepare(
+      `SELECT id, content, model, enqueued_at
+       FROM queued_events WHERE session_id = ?
+       ORDER BY id ASC LIMIT 1`,
+    );
+    this.deleteByIdStmt = db.prepare(`DELETE FROM queued_events WHERE id = ?`);
+    this.countStmt = db.prepare(
+      `SELECT COUNT(*) as n FROM queued_events WHERE session_id = ?`,
+    );
+    this.clearStmt = db.prepare(`DELETE FROM queued_events WHERE session_id = ?`);
+    this.listSessionsStmt = db.prepare(
+      `SELECT DISTINCT session_id FROM queued_events ORDER BY session_id ASC`,
+    );
+  }
+
+  enqueue(sessionId: string, event: QueuedEvent): void {
+    this.insertStmt.run({
+      session_id: sessionId,
+      content: event.content,
+      model: event.model ?? null,
+      enqueued_at: event.enqueuedAt,
+    });
+  }
+
+  shift(sessionId: string): QueuedEvent | undefined {
+    const row = this.peekStmt.get(sessionId) as
+      | { id: number; content: string; model: string | null; enqueued_at: number }
+      | undefined;
+    if (!row) return undefined;
+    this.deleteByIdStmt.run(row.id);
+    return {
+      content: row.content,
+      model: row.model ?? undefined,
+      enqueuedAt: row.enqueued_at,
+    };
+  }
+
+  size(sessionId: string): number {
+    const row = this.countStmt.get(sessionId) as { n: number };
+    return row.n;
+  }
+
+  clear(sessionId: string): number {
+    const info = this.clearStmt.run(sessionId);
+    return info.changes;
+  }
+
+  listSessionsWithQueued(): string[] {
+    const rows = this.listSessionsStmt.all() as Array<{ session_id: string }>;
+    return rows.map((r) => r.session_id);
+  }
+}
+
 // ---------- Bundle ----------
 
 export class SqliteStore implements Store {
   readonly agents: AgentStore;
   readonly environments: EnvironmentStore;
   readonly sessions: SessionStore;
+  readonly secrets: SecretStore;
+  readonly queue: QueueStore;
   private readonly db: Database.Database;
   private closed = false;
 
@@ -657,6 +794,8 @@ export class SqliteStore implements Store {
     this.agents = new SqliteAgentStore(this.db);
     this.environments = new SqliteEnvironmentStore(this.db);
     this.sessions = new SqliteSessionStore(this.db);
+    this.secrets = new SqliteSecretStore(this.db);
+    this.queue = new SqliteQueueStore(this.db);
   }
 
   close(): void {

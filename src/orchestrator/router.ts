@@ -5,18 +5,18 @@ import {
   sessionRunDurationSeconds,
   sessionRunFailuresTotal,
 } from "../metrics.js";
-import type {
-  Container,
-  Mount,
-  NetworkingSpec,
-  SpawnOptions,
-} from "../runtime/container.js";
+import type { Container, Mount, SpawnOptions } from "../runtime/container.js";
 import { GatewayWsError } from "../runtime/gateway-ws.js";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { SessionContainerPool } from "../runtime/pool.js";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
-import type { AgentStore, EnvironmentStore, RunUsage, SessionStore } from "../store/types.js";
-import type { SessionEventQueue } from "./event-queue.js";
+import type {
+  AgentStore,
+  EnvironmentStore,
+  QueueStore,
+  RunUsage,
+  SessionStore,
+} from "../store/types.js";
 import type { AgentConfig, Session } from "./types.js";
 
 const log = getLogger("router");
@@ -99,35 +99,13 @@ export class AgentRouter {
     private readonly sessions: SessionStore,
     private readonly events: PiJsonlEventReader,
     private readonly pool: SessionContainerPool,
-    private readonly queue: SessionEventQueue,
+    private readonly queue: QueueStore,
     private readonly cfg: RouterConfig,
   ) {}
 
   /** Return any pending approval requests for a session (non-destructive). */
   getPendingApprovals(sessionId: string): PendingApproval[] {
     return this.pendingApprovals.get(sessionId) ?? [];
-  }
-
-  /**
-   * Look up the session's environment and return the networking policy
-   * the pool should apply. Returns undefined for unrestricted (pool
-   * treats that the same as no config — legacy single-network path).
-   *
-   * Session argument is nullable because runEvent's safety path can
-   * call this when the session was freshly looked up and might be gone
-   * by the time we reach here. In that case, default to unrestricted.
-   */
-  private resolveNetworking(session: Session | null): NetworkingSpec | undefined {
-    if (!session?.environmentId) return undefined;
-    const env = this.environments.get(session.environmentId);
-    if (!env) return undefined;
-    if (env.networking.type === "limited") {
-      return {
-        type: "limited",
-        allowedHosts: env.networking.allowedHosts,
-      };
-    }
-    return undefined;
   }
 
   /**
@@ -179,18 +157,7 @@ export class AgentRouter {
       return;
     }
     const spawnOptions = this.buildSpawnOptions(sessionId, agent, session);
-    const networking = this.resolveNetworking(session);
-    // Limited networking sessions aren't warm-pool eligible (each one
-    // gets fresh per-session networks + sidecar); `warmSession` is
-    // effectively a no-op for them, matching how `acquireForSession`
-    // bypasses the warm pool for limited. Still call acquireForSession
-    // so the spawn happens in the background.
-    await this.pool.acquireForSession({
-      sessionId,
-      spawnOptions,
-      agentId: agent.agentId,
-      networking,
-    });
+    await this.pool.acquireForSession({ sessionId, spawnOptions, agentId: agent.agentId });
   }
 
   /**
@@ -475,7 +442,6 @@ export class AgentRouter {
       sessionId,
       spawnOptions,
       agentId: agent.agentId,
-      networking: this.resolveNetworking(currentSession ?? null),
     });
 
     // Subscribe to approval broadcasts when the agent has always_ask.

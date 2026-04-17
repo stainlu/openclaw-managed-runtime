@@ -575,6 +575,15 @@ export function buildApp(deps: ServerDeps): Hono {
     //                   session goes idle for ~30s.
     //   default       — one-shot JSON array of every event in order.
     if (c.req.query("stream") === "true") {
+      // Resume cursor for a reconnecting client. The browser's native
+      // EventSource re-sends the last `id:` frame it saw as the
+      // `Last-Event-ID` request header when it auto-reconnects after a
+      // dropped socket. We ALSO accept `?after=<event_id>` for clients
+      // (the Node + Python SDKs) that can't set a custom header on SSE
+      // requests. `Last-Event-ID` header wins if both are present —
+      // matches the SSE spec's intent.
+      const afterEventId =
+        c.req.header("last-event-id") || c.req.query("after") || undefined;
       return streamSSE(c, async (sse) => {
         // Propagate client-disconnect through an AbortController so the
         // follow generator can bail out of its poll loop.
@@ -655,6 +664,7 @@ export function buildApp(deps: ServerDeps): Hono {
               signal: abort.signal,
               isSessionRunning: () =>
                 deps.sessions.get(sessionId)?.status === "running",
+              afterEventId,
             },
           )) {
             if (sse.aborted || sse.closed) break;
