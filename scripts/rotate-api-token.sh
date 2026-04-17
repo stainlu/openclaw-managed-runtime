@@ -177,17 +177,27 @@ if [[ "${SSH_MODE}" == "local" ]]; then
   printf 'OPENCLAW_API_TOKEN=%s\n' "${TOKEN}" >> "${tmp}"
   mv "${tmp}" "${LOCAL_ENV_PATH}"
 
-  log "running docker compose up -d"
-  ( cd "$(dirname "${LOCAL_ENV_PATH}")" && docker compose up -d >/dev/null )
+  # `--build` forces a rebuild from the local source tree, so a brand-new
+  # auth middleware or any other src/ change is picked up. Without --build,
+  # compose would reuse the cached image and silently skip the feature.
+  log "running docker compose up --build -d"
+  ( cd "$(dirname "${LOCAL_ENV_PATH}")" && docker compose up --build -d >/dev/null )
 else
   log "rewriting /opt/openclaw/.env on remote"
   # Generate the remote script locally so ${TOKEN} expands here and
   # the remote bash receives a concrete literal. The remote script
   # uses `${REMOTE_SUDO}` for the write (Lightsail + GCP need sudo
   # because cloud-init ran as root; Hetzner doesn't).
+  #
+  # `docker compose pull` before `up -d` is load-bearing: the remote's
+  # cached orchestrator image may predate the auth middleware (or any
+  # other shipped feature) and `up -d` alone would silently reuse the
+  # stale cache. Pulling first ensures the rotated token lands on a
+  # build that actually enforces the header.
   cat <<REMOTE_SCRIPT | run_remote
 set -euo pipefail
 ${REMOTE_SUDO} sh -c "grep -v '^OPENCLAW_API_TOKEN=' /opt/openclaw/.env > /opt/openclaw/.env.tmp 2>/dev/null || true; printf 'OPENCLAW_API_TOKEN=%s\n' '${TOKEN}' >> /opt/openclaw/.env.tmp; mv /opt/openclaw/.env.tmp /opt/openclaw/.env; chmod 0600 /opt/openclaw/.env"
+cd /opt/openclaw && ${REMOTE_SUDO} docker compose pull >/dev/null 2>&1 || true
 cd /opt/openclaw && ${REMOTE_SUDO} docker compose up -d >/dev/null
 REMOTE_SCRIPT
 fi
