@@ -6,7 +6,12 @@ import {
   sessionRunDurationSeconds,
   sessionRunFailuresTotal,
 } from "../metrics.js";
-import type { Container, Mount, SpawnOptions } from "../runtime/container.js";
+import type {
+  Container,
+  Mount,
+  NetworkingSpec,
+  SpawnOptions,
+} from "../runtime/container.js";
 import { GatewayWsError } from "../runtime/gateway-ws.js";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { SessionContainerPool } from "../runtime/pool.js";
@@ -225,7 +230,13 @@ export class AgentRouter {
       return;
     }
     const spawnOptions = this.buildSpawnOptions(sessionId, agent, session);
-    await this.pool.acquireForSession({ sessionId, spawnOptions, agentId: agent.agentId });
+    const networking = this.resolveNetworking(session);
+    await this.pool.acquireForSession({
+      sessionId,
+      spawnOptions,
+      agentId: agent.agentId,
+      networking,
+    });
   }
 
   /**
@@ -377,10 +388,12 @@ export class AgentRouter {
 
     try {
       const spawnOptions = this.buildSpawnOptions(args.sessionId, agent, running);
+      const networking = this.resolveNetworking(running);
       const container = await this.pool.acquireForSession({
         sessionId: args.sessionId,
         spawnOptions,
         agentId: agent.agentId,
+        networking,
       });
 
       if (args.model) {
@@ -589,6 +602,27 @@ export class AgentRouter {
     }
   }
 
+  /**
+   * Resolve the networking spec for a session from its bound environment.
+   * Returns undefined when there's no environment, no networking config,
+   * or when networking is "unrestricted" (the pool uses the default
+   * single-network path in that case — no per-session confined topology
+   * needs to spin up). When the environment is `networking: "limited"`,
+   * returns the NetworkingSpec the pool's doLimitedSpawn path consumes.
+   */
+  private resolveNetworking(session: Session): NetworkingSpec | undefined {
+    if (!session.environmentId) return undefined;
+    const env = this.environments.get(session.environmentId);
+    if (!env) return undefined;
+    if (env.networking.type === "limited") {
+      return {
+        type: "limited",
+        allowedHosts: env.networking.allowedHosts,
+      };
+    }
+    return undefined;
+  }
+
   private buildSpawnOptions(
     sessionId: string,
     agent: AgentConfig,
@@ -697,6 +731,7 @@ export class AgentRouter {
       sessionId,
       spawnOptions,
       agentId: agent.agentId,
+      networking: currentSession ? this.resolveNetworking(currentSession) : undefined,
     });
 
     // Subscribe to approval broadcasts when the agent has always_ask.

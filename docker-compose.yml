@@ -38,7 +38,14 @@ services:
     environment:
       PORT: "8080"
       OPENCLAW_DOCKER_NETWORK: openclaw-net
+      # Internal-only network for orchestrator↔agent traffic on
+      # networking:limited sessions. Declared in the networks block
+      # below with internal: true so it has no external egress.
+      OPENCLAW_CONTROL_PLANE_NETWORK: openclaw-control-plane
       OPENCLAW_RUNTIME_IMAGE: ghcr.io/stainlu/openclaw-managed-agents-agent:latest
+      # Egress-proxy sidecar image for networking:limited sessions.
+      # Override to pin a sha-tagged release instead of latest.
+      OPENCLAW_EGRESS_PROXY_IMAGE: ghcr.io/stainlu/openclaw-managed-agents-egress-proxy:latest
       # HOST-side path to data/sessions (not the orchestrator's in-container
       # view). The orchestrator passes this to dockerode when it spawns
       # agent containers; the Docker daemon resolves the path against the
@@ -106,6 +113,7 @@ services:
       - ./data/state:/var/openclaw/state
     networks:
       - openclaw-net
+      - openclaw-control-plane
     depends_on:
       - ensure-agent-image
 
@@ -127,3 +135,13 @@ networks:
   openclaw-net:
     name: openclaw-net
     driver: bridge
+  # Internal-only network for orchestrator↔agent traffic on
+  # networking:limited sessions. `internal: true` means Docker drops
+  # every packet headed off-network, so an agent container on this
+  # network plus a --internal confined network has zero direct path to
+  # the internet. The only route out is the per-session egress-proxy
+  # sidecar which orchestrates its own hostname allowlist.
+  openclaw-control-plane:
+    name: openclaw-control-plane
+    driver: bridge
+    internal: true

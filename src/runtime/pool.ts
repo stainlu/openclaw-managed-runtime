@@ -5,7 +5,12 @@ import {
   poolSpawnDurationSeconds,
   poolWarmContainers,
 } from "../metrics.js";
-import type { Container, ContainerRuntime, SpawnOptions } from "./container.js";
+import type {
+  Container,
+  ContainerRuntime,
+  NetworkingSpec,
+  SpawnOptions,
+} from "./container.js";
 import { GatewayWebSocketClient, GatewayWsError } from "./gateway-ws.js";
 
 const log = getLogger("pool");
@@ -74,6 +79,28 @@ export type PoolConfig = {
    * and lets the caller decide what to clean up.
    */
   cleanupOnReap?: (sessionId: string) => Promise<void>;
+  /**
+   * Config for `networking: limited` sessions. When this is unset,
+   * limited networking is effectively disabled (schema still accepts
+   * it but spawn will throw). In practice, index.ts always wires this
+   * in production — tests can opt out by omitting it.
+   */
+  limitedNetworking?: {
+    /** Image reference for the egress-proxy sidecar. */
+    sidecarImage: string;
+    /**
+     * Internal Docker network carrying orchestrator ↔ limited-agent
+     * traffic. Must exist and be marked internal before the pool
+     * spawns any limited-networking session.
+     */
+    controlPlaneNetwork: string;
+    /** DNS port the proxy sidecar listens on. Default 53. */
+    proxyDnsPort?: number;
+    /** HTTP proxy port on the sidecar. Default 8118. */
+    proxyHttpPort?: number;
+    /** Healthz port on the sidecar. Default 8119. */
+    proxyHealthzPort?: number;
+  };
 };
 
 type ActiveContainer = {
@@ -83,6 +110,17 @@ type ActiveContainer = {
   wsClient: GatewayWebSocketClient;
   spawnedAt: number;
   lastUsedAt: number;
+  /**
+   * Resources that belong to this session ONLY and must be cleaned up
+   * when the session's container is evicted. Populated only for
+   * `networking: limited` sessions.
+   */
+  ownedResources?: {
+    /** Egress-proxy sidecar container. Stop alongside the agent. */
+    sidecar: Container;
+    /** Per-session Docker networks. Remove after both containers stop. */
+    networks: string[];
+  };
 };
 
 /** A pre-warmed container waiting to be claimed by a session. */
@@ -170,12 +208,30 @@ export class SessionContainerPool {
     spawnOptions: SpawnOptions;
     /** Agent ID for warm-pool matching. */
     agentId?: string;
+    /**
+     * Per-session networking policy. Unset or {type:"unrestricted"}
+     * uses the legacy single-network path. {type:"limited"} spawns an
+     * egress-proxy sidecar on per-session networks and confines the
+     * agent to them.
+     */
+    networking?: NetworkingSpec;
   }): Promise<Container> {
     const existing = this.active.get(args.sessionId);
     if (existing) {
       existing.lastUsedAt = Date.now();
       poolAcquireTotal.labels({ source: "active" }).inc();
       return existing.container;
+    }
+
+    // Limited networking forks off to its own spawn path — warm pool
+    // reuse doesn't apply (the per-session confined network + sidecar
+    // are minted fresh per session).
+    if (args.networking?.type === "limited") {
+      return await this.doLimitedSpawn({
+        sessionId: args.sessionId,
+        spawnOptions: args.spawnOptions,
+        allowedHosts: args.networking.allowedHosts,
+      });
     }
 
     // Check the warm pool for a matching pre-warmed container.
@@ -270,6 +326,239 @@ export class SessionContainerPool {
   }
 
   /**
+   * Spawn path for `networking: limited` sessions. Topology:
+   *
+   *   - Two per-session networks are created fresh:
+   *     `openclaw-sess-<sid>-confined` (--internal, no egress) and
+   *     `openclaw-sess-<sid>-egress` (normal bridge, external egress).
+   *   - Egress-proxy sidecar spawns on the confined network and is
+   *     connected to the egress network after boot. Receives HTTP+DNS
+   *     on the confined side, forwards allowed traffic out the egress
+   *     side.
+   *   - Agent spawns on the confined network, is additionally connected
+   *     to the orchestrator's internal control-plane network so the
+   *     orchestrator can still reach its gateway for WS + /readyz.
+   *     The confined network has no external egress, and the control-
+   *     plane network is also internal — so the agent has no direct
+   *     path to the internet. The sidecar is the only route out.
+   *   - Agent env gets HTTP_PROXY/HTTPS_PROXY pointing at the sidecar's
+   *     confined-side address. HTTP/HTTPS clients (`fetch`, `requests`,
+   *     `curl`) route through it automatically. Raw `socket.connect()`
+   *     calls from inside the agent can't leave either because no
+   *     network attached to the agent has external egress.
+   *
+   * On any failure, every resource created so far is torn down before
+   * the throw so the caller doesn't have to.
+   */
+  private async doLimitedSpawn(args: {
+    sessionId: string;
+    spawnOptions: SpawnOptions;
+    allowedHosts: string[];
+  }): Promise<Container> {
+    if (!this.cfg.limitedNetworking) {
+      throw new Error(
+        "networking: limited requested but pool was not configured with limitedNetworking; " +
+          "wire cfg.limitedNetworking in index.ts before spawning a confined session",
+      );
+    }
+    const netCfg = this.cfg.limitedNetworking;
+    const spawnEnd = poolSpawnDurationSeconds.startTimer();
+
+    // Full session id, sanitized to Docker's name rules ([a-z0-9-_]).
+    // Do NOT truncate: nanoid session ids are 12 chars and prefix
+    // truncation would let two sessions with the same prefix collide
+    // on the same network + sidecar (`ensureNetwork` is idempotent so
+    // it wouldn't error — it would silently share the sidecar).
+    // Underscores in nanoids do not occur (alphabet is a-z0-9), but
+    // test ids may have them; replace to keep Docker's parser happy.
+    const safeId = args.sessionId
+      .replace(/^ses_/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, "-");
+    const confinedNet = `openclaw-sess-${safeId}-confined`;
+    const egressNet = `openclaw-sess-${safeId}-egress`;
+    const sidecarName = `openclaw-sess-${safeId}-proxy`;
+    const dnsPort = netCfg.proxyDnsPort ?? 53;
+    const httpPort = netCfg.proxyHttpPort ?? 8118;
+    const healthzPort = netCfg.proxyHealthzPort ?? 8119;
+
+    /** Tracks what we've already created so the error path can undo it. */
+    const created = {
+      confinedNet: false,
+      egressNet: false,
+      sidecar: undefined as Container | undefined,
+      sidecarWs: undefined as undefined,
+      agent: undefined as Container | undefined,
+      agentWs: undefined as GatewayWebSocketClient | undefined,
+    };
+
+    const rollback = async (err: unknown): Promise<never> => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log.warn(
+        { err: errMsg, session_id: args.sessionId },
+        "limited-spawn failed — rolling back",
+      );
+      if (created.agentWs) {
+        await created.agentWs.close().catch(() => {});
+      }
+      if (created.agent) {
+        await this.runtime.stop(created.agent.id).catch(() => {});
+      }
+      if (created.sidecar) {
+        await this.runtime.stop(created.sidecar.id).catch(() => {});
+      }
+      if (created.confinedNet) {
+        await this.runtime.removeNetwork(confinedNet).catch(() => {});
+      }
+      if (created.egressNet) {
+        await this.runtime.removeNetwork(egressNet).catch(() => {});
+      }
+      throw err instanceof Error ? err : new Error(errMsg);
+    };
+
+    try {
+      // 1. Per-session networks.
+      await this.runtime.ensureNetwork(confinedNet, { internal: true });
+      created.confinedNet = true;
+      await this.runtime.ensureNetwork(egressNet, { internal: false });
+      created.egressNet = true;
+
+      // 2. Egress-proxy sidecar — spawn on confined (so the agent can
+      //    reach it), additionally connect to egress (for the forward
+      //    path out). Allowed hosts delivered via env as a JSON array,
+      //    matching the schema proxy.mjs expects.
+      const sidecar = await this.runtime.spawn({
+        image: netCfg.sidecarImage,
+        name: sidecarName,
+        containerPort: httpPort,
+        network: confinedNet,
+        additionalNetworks: [egressNet],
+        mounts: [],
+        env: {
+          OPENCLAW_EGRESS_ALLOWED_HOSTS: JSON.stringify(args.allowedHosts),
+          OPENCLAW_EGRESS_SESSION_ID: args.sessionId,
+          OPENCLAW_EGRESS_HTTP_PORT: String(httpPort),
+          OPENCLAW_EGRESS_HEALTHZ_PORT: String(healthzPort),
+          OPENCLAW_EGRESS_DNS_PORT: String(dnsPort),
+        },
+        labels: {
+          "managed-by": "openclaw-managed-agents",
+          "openclaw-role": "egress-proxy",
+          "openclaw-session-id": args.sessionId,
+        },
+      });
+      created.sidecar = sidecar;
+      // Poll the sidecar's healthz. waitForReady already hits /readyz
+      // but the egress-proxy serves /healthz on a different port; we
+      // synthesize a Container pointing at that port so the existing
+      // helper works.
+      await this.runtime.waitForReady(
+        {
+          ...sidecar,
+          baseUrl: `http://${sidecar.name}:${healthzPort}`,
+        },
+        this.cfg.readyTimeoutMs,
+      );
+
+      // 3. Agent container: boot on confined network, then attach to
+      //    control-plane so the orchestrator can reach its gateway.
+      //    Two layers of confinement wire up here:
+      //
+      //    a) HTTP_PROXY / HTTPS_PROXY → sidecar's name on the confined
+      //       network. HTTP clients (Node fetch, Python requests, curl,
+      //       git) route through it automatically.
+      //    b) Dns: [sidecarIp] → sidecar's IP on the confined network,
+      //       written into /etc/resolv.conf. Catches the gap where a
+      //       caller doesn't respect HTTP_PROXY (raw sockets, direct
+      //       getaddrinfo). With the filter at DNS layer, a denied
+      //       hostname returns NXDOMAIN; with the --internal network
+      //       topology, there's no egress for an IP-literal either.
+      //
+      //    NO_PROXY excludes localhost + the orchestrator (reached via
+      //    control-plane, not the sidecar).
+      const sidecarConfinedIp =
+        sidecar.networks?.[confinedNet] ??
+        // Fallback: use the sidecar name. Docker's per-network alias
+        // resolution makes this work via /etc/hosts inside containers
+        // on the same network, but only for hostname lookups — Dns
+        // only accepts IPs. The name here is effectively a smoke-test
+        // fallback for the FakeRuntime in unit tests; production
+        // paths always have a real IP from the post-spawn inspect.
+        sidecarName;
+      const agentEnv: Record<string, string> = {
+        ...args.spawnOptions.env,
+        HTTP_PROXY: `http://${sidecarName}:${httpPort}`,
+        HTTPS_PROXY: `http://${sidecarName}:${httpPort}`,
+        http_proxy: `http://${sidecarName}:${httpPort}`,
+        https_proxy: `http://${sidecarName}:${httpPort}`,
+        NO_PROXY: "localhost,127.0.0.1,openclaw-orchestrator",
+        no_proxy: "localhost,127.0.0.1,openclaw-orchestrator",
+      };
+      const agent = await this.runtime.spawn({
+        ...args.spawnOptions,
+        env: agentEnv,
+        network: confinedNet,
+        additionalNetworks: [netCfg.controlPlaneNetwork],
+        dns: [sidecarConfinedIp],
+      });
+      created.agent = agent;
+      await this.runtime.waitForReady(agent, this.cfg.readyTimeoutMs);
+
+      // 4. WS handshake from the orchestrator over the control-plane
+      //    network. The agent's container name is reachable on both
+      //    confined and control-plane; the orchestrator is only on
+      //    control-plane, so traffic flows through there.
+      const wsClient = new GatewayWebSocketClient({
+        baseUrl: agent.baseUrl,
+        token: agent.token,
+        clientName: "openclaw-managed-agents",
+      });
+      try {
+        await wsClient.connect();
+        created.agentWs = wsClient;
+      } catch (err) {
+        await wsClient.close().catch(() => {});
+        const code = err instanceof GatewayWsError ? err.code : "ws_connect_failed";
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new GatewayWsError(
+          code,
+          `gateway ws handshake failed (limited session): ${msg}`,
+        );
+      }
+
+      const now = Date.now();
+      this.active.set(args.sessionId, {
+        sessionId: args.sessionId,
+        container: agent,
+        wsClient,
+        spawnedAt: now,
+        lastUsedAt: now,
+        ownedResources: {
+          sidecar,
+          networks: [confinedNet, egressNet],
+        },
+      });
+      poolActiveContainers.set(this.active.size);
+      poolAcquireTotal.labels({ source: "spawn" }).inc();
+      spawnEnd();
+      log.info(
+        {
+          session_id: args.sessionId,
+          confined_network: confinedNet,
+          egress_network: egressNet,
+          allowed_hosts: args.allowedHosts.length,
+        },
+        "spawned limited-networking session",
+      );
+      return agent;
+    } catch (err) {
+      await rollback(err);
+      // rollback always throws, but TS needs a return.
+      throw err;
+    }
+  }
+
+  /**
    * Get the operator-role WS client for an active session, if one exists.
    * Returns undefined when the session has no live container in the pool
    * (e.g., it was reaped by the idle sweeper or was never acquired).
@@ -300,6 +589,23 @@ export class SessionContainerPool {
     await this.runtime.stop(entry.container.id).catch((err) => {
       log.warn({ err, container_id: entry.container.id }, "pool stop failed");
     });
+    // Tear down limited-networking resources owned by this session.
+    // Agent must be stopped FIRST (above) so the sidecar + networks
+    // have no attached containers when we remove them.
+    if (entry.ownedResources) {
+      const owned = entry.ownedResources;
+      await this.runtime.stop(owned.sidecar.id).catch((err) => {
+        log.warn(
+          { err, container_id: owned.sidecar.id },
+          "sidecar stop failed during evict",
+        );
+      });
+      for (const net of owned.networks) {
+        await this.runtime.removeNetwork(net).catch((err) => {
+          log.warn({ err, network: net }, "per-session network remove failed");
+        });
+      }
+    }
   }
 
   /**
@@ -308,11 +614,7 @@ export class SessionContainerPool {
    * spawn but skips the create+start. On success the session is
    * registered in the active pool exactly as if we had spawned it
    * ourselves; on failure the caller is responsible for stopping the
-   * container (this method never stops what it couldn't adopt — letting
-   * the startup flow decide whether the failure is "this container is
-   * dead" or "the WS token rotated, take the warm respawn cost").
-   *
-   * Throws if the session already has an active entry (caller bug).
+   * container. Throws if the session already has an active entry.
    */
   async adopt(args: { sessionId: string; container: Container }): Promise<void> {
     if (this.active.has(args.sessionId)) {
@@ -339,8 +641,6 @@ export class SessionContainerPool {
       sessionId: args.sessionId,
       container: args.container,
       wsClient,
-      // spawnedAt reflects "adopted at" — we don't know the original
-      // spawn time. For sweeper semantics what matters is lastUsedAt.
       spawnedAt: now,
       lastUsedAt: now,
     });
@@ -374,10 +674,28 @@ export class SessionContainerPool {
     const warmEntries = Array.from(this.warm.values());
     this.active.clear();
     this.warm.clear();
-    const all = [...entries.map((e) => ({ ws: e.wsClient, id: e.container.id })),
-      ...warmEntries.map((e) => ({ ws: e.wsClient, id: e.container.id }))];
-    await Promise.allSettled(all.map((e) => e.ws.close()));
-    await Promise.allSettled(all.map((e) => this.runtime.stop(e.id)));
+    // Close WS clients first so the agents see a clean disconnect.
+    await Promise.allSettled([
+      ...entries.map((e) => e.wsClient.close()),
+      ...warmEntries.map((e) => e.wsClient.close()),
+    ]);
+    // Stop every container (agents + sidecars + warm).
+    const containerIds = [
+      ...entries.map((e) => e.container.id),
+      ...entries.flatMap((e) =>
+        e.ownedResources ? [e.ownedResources.sidecar.id] : [],
+      ),
+      ...warmEntries.map((e) => e.container.id),
+    ];
+    await Promise.allSettled(containerIds.map((id) => this.runtime.stop(id)));
+    // Remove any per-session networks owned by limited-networking sessions.
+    // Best-effort — Docker will GC lingering networks eventually anyway.
+    const networksToRemove = entries.flatMap((e) =>
+      e.ownedResources ? e.ownedResources.networks : [],
+    );
+    await Promise.allSettled(
+      networksToRemove.map((n) => this.runtime.removeNetwork(n)),
+    );
   }
 
   private async reapIdle(): Promise<void> {
@@ -405,6 +723,23 @@ export class SessionContainerPool {
       await this.runtime.stop(entry.container.id).catch((err) => {
         log.warn({ err, container_id: entry.container.id }, "reap stop failed");
       });
+      // Limited-networking sessions have per-session resources to drop
+      // alongside the agent container. Stop sidecar first (it's still
+      // attached to the per-session networks), then remove the networks.
+      if (entry.ownedResources) {
+        const owned = entry.ownedResources;
+        await this.runtime.stop(owned.sidecar.id).catch((err) => {
+          log.warn(
+            { err, container_id: owned.sidecar.id },
+            "sidecar reap stop failed",
+          );
+        });
+        for (const net of owned.networks) {
+          await this.runtime.removeNetwork(net).catch((err) => {
+            log.warn({ err, network: net }, "per-session network reap failed");
+          });
+        }
+      }
       // Notify the caller so it can clean up any per-session resources that
       // should NOT outlive the container. Item 8 uses this for ephemeral
       // session cleanup (delete Pi JSONL + SQLite row).

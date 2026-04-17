@@ -169,6 +169,23 @@ async function main(): Promise<void> {
     "OPENCLAW_WARM_IDLE_TIMEOUT_MS",
     idleTimeoutMs,
   );
+  // networking: "limited" — per-session confined network + egress-proxy
+  // sidecar. Both env vars must be set or the pool treats limited
+  // networking as disabled. Any session whose environment declares
+  // networking: "limited" but lands on a pool configured without these
+  // will fail-hard at spawn time, which is the right behavior: fail
+  // loud, don't silently downgrade to unrestricted.
+  const egressProxyImage = (process.env.OPENCLAW_EGRESS_PROXY_IMAGE ?? "").trim();
+  const controlPlaneNetwork = (
+    process.env.OPENCLAW_CONTROL_PLANE_NETWORK ?? ""
+  ).trim();
+  const limitedNetworking =
+    egressProxyImage && controlPlaneNetwork
+      ? {
+          sidecarImage: egressProxyImage,
+          controlPlaneNetwork,
+        }
+      : undefined;
   // Optional baseline bearer-token auth for the public HTTP API. When
   // unset or empty, every route (except /healthz and /metrics) is open
   // — fine for `docker compose up` on localhost. Set on any deploy
@@ -232,7 +249,18 @@ async function main(): Promise<void> {
       store.sessions.delete(sessionId);
       log.info({ session_id: sessionId }, "reaped ephemeral session");
     },
+    limitedNetworking,
   });
+
+  // The control-plane network must exist + be internal before any
+  // limited-networking agent spawns on it. Create it here once at
+  // startup so every subsequent limited spawn finds it ready. When
+  // limited networking is disabled (env vars unset) this is a no-op.
+  if (limitedNetworking) {
+    await runtime.ensureNetwork(limitedNetworking.controlPlaneNetwork, {
+      internal: true,
+    });
+  }
 
   // One minter per orchestrator process. The HMAC secret is loaded from
   // SecretStore so it survives restart — that's what keeps outstanding

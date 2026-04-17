@@ -79,6 +79,30 @@ jobs:
         working-directory: docker/egress-proxy
         run: node --test allowlist.test.mjs dns.test.mjs
 
+  # Dedicated job for the networking: limited E2E so a failure here
+  # doesn't mask the unit suite above. Runs on ubuntu-latest because
+  # Docker Desktop on macOS has subtly different --internal semantics —
+  # the canonical enforcement claim is proven on native Linux. Keeps
+  # the whole flow under 3 minutes (egress-proxy image build is tiny).
+  networking-e2e:
+    name: networking:limited E2E
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build egress-proxy image
+        run: docker build -t openclaw-egress-proxy:e2e docker/egress-proxy
+
+      - name: Run E2E (9 cases including raw-socket + AWS IMDS SSRF)
+        run: bash test/e2e-networking.sh
+        env:
+          EGRESS_PROXY_IMAGE: openclaw-egress-proxy:e2e
+          SKIP_BUILD: "1"
+
       # TypeScript SDK lives in its own package with its own deps (vitest,
       # typescript). Install via npm (not pnpm workspaces) so it stays
       # self-contained and can be published independently.

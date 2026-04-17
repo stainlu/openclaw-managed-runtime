@@ -150,19 +150,52 @@ export const PackagesSchema = z
 
 // Egress networking policy.
 //
-// Today only "unrestricted" is accepted. The agent container joins the
-// shared bridge network and can reach any host on the internet.
+// - "unrestricted" (default): agent container joins the shared bridge
+//   network and can reach any host on the internet. Legacy behavior.
 //
-// A `limited` variant previously shipped (per-session --internal network
-// + egress-proxy sidecar filtering HTTP/HTTPS + DNS; see
-// docs/designs/networking-limited.md) but the runtime-layer topology has
-// been reverted to keep the surface minimal. The schema deliberately
-// REJECTS {type: "limited"} now so no client gets the false-security
-// case where the schema accepts a hostname allowlist but the pool
-// silently ignores it. The design doc stays in tree so the feature can
-// return behind a coherent implementation without re-inventing it.
+// - "limited": agent container is spawned on a --internal Docker
+//   network (no direct egress) paired with an egress-proxy sidecar
+//   that filters outbound connections against `allowedHosts`. Proxy-
+//   layer check on HTTP/HTTPS + DNS-layer check on UDP 53, so raw-
+//   socket and DNS exfiltration paths are both closed. Enforcement
+//   is at the Docker bridge / sidecar level, not inside the agent
+//   container — the agent cannot bypass it even with arbitrary code
+//   execution. See `docs/designs/networking-limited.md` for the full
+//   design and `test/e2e-networking.sh` for the 9-case enforcement
+//   proof (run on native Linux in CI).
+//
+// Allowed-hosts format:
+//   - Plain hostname: "api.openai.com"
+//   - Wildcard prefix: "*.googleapis.com" matches any hostname ending
+//     in ".googleapis.com" (at any depth). `googleapis.com` bare is
+//     NOT matched — list it separately.
+//   - No IPs, no CIDRs, no ports, no schemes. Hostnames only.
+const HOSTNAME_PATTERN_RE = /^[a-z0-9*](?:[a-z0-9.*-]{0,253}[a-z0-9])?$/i;
+// IPv4 literals are rejected — a real hostname has at least one
+// non-digit character in at least one label, so anything matching
+// `\d+(\.\d+)*` is unambiguously an IP.
+const IPV4_LIKE_RE = /^\d+(\.\d+)*$/;
 export const NetworkingSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("unrestricted") }),
+  z.object({
+    type: z.literal("limited"),
+    allowedHosts: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(253, "allowedHost entry must be <= 253 characters")
+          .regex(
+            HOSTNAME_PATTERN_RE,
+            'allowedHost entries must be hostnames (e.g. "api.example.com" or "*.example.com"); IPs, ports, and URL schemes are not allowed',
+          )
+          .refine((v) => !IPV4_LIKE_RE.test(v), {
+            message: "allowedHost entries must be hostnames, not IP literals",
+          }),
+      )
+      .min(1, "allowedHosts must contain at least one entry")
+      .max(256, "allowedHosts supports at most 256 entries"),
+  }),
 ]);
 
 export const CreateEnvironmentRequestSchema = z.object({
