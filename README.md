@@ -214,7 +214,7 @@ The SSE stream emits an initial status event on connect and checks for status tr
 
 **Per-turn cost.** Each session tracks rolling `tokens_in`, `tokens_out`, and `cost_usd` from the provider's own billing data — cache-aware, not a static price sheet. Anthropic, OpenAI, Google, xAI, Mistral, OpenRouter, and Bedrock auto-report non-zero cost with no config. Moonshot's upstream catalog currently ships zero prices (real prices tracked in [openclaw/openclaw#67928](https://github.com/openclaw/openclaw/pull/67928)); once that PR lands and the openclaw pin bumps, Moonshot reports real cost via the same path with zero runtime changes.
 
-**OpenAI SDK drop-in.** Point any OpenAI SDK at `http://<host>:8080/v1` with an `x-openclaw-agent-id` header. Sticky sessions via the `user` field. Emulated streaming (`stream: true`).
+**OpenAI SDK drop-in.** Point any OpenAI SDK at `http://<host>:8080/v1` with an `x-openclaw-agent-id` header. Sticky sessions via the `user` field. `stream: true` pipes real token-level SSE chunks from the provider through the container's OpenClaw gateway straight to the client (OpenAI-compatible `ChatCompletionChunk` frames with `[DONE]` terminator) — a busy session returns HTTP 409 `session_busy` so streaming doesn't interleave with the event queue.
 
 **Persistent state.** SQLite (WAL mode) for agent templates, environments, and session metadata. Pi's JSONL files for the event log. Both survive orchestrator restarts. Pre-built multi-arch images (amd64 + arm64) published to GHCR on every push to `main`.
 

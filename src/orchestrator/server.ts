@@ -719,9 +719,13 @@ export function buildApp(deps: ServerDeps): Hono {
   //   - Only the trailing `role: "user"` message is read. Pi's
   //     SessionManager owns history on sticky sessions; for ephemeral
   //     sessions only the final user message defines the turn.
-  //   - `stream: true` is EMULATED — the handler blocks until the run
-  //     completes, then emits three chunks (role / content / finish) +
-  //     `[DONE]`. Real token-by-token delta streaming is deferred.
+  //   - `stream: true` pipes the container's real SSE chunks through to
+  //     the caller byte-for-byte (OpenAI-compatible ChatCompletionChunk
+  //     format, terminator `[DONE]`). The run cannot be queued in this
+  //     mode: a busy session returns 409 `session_busy` and the client
+  //     retries. Client disconnect aborts our relay but the container's
+  //     turn continues server-side — Pi's JSONL retains truth, and the
+  //     session is rolled back to idle so the next event isn't blocked.
   //
   // Session resolution:
   //   - `x-openclaw-session-key` header or body `user` field → sticky
@@ -884,7 +888,68 @@ export function buildApp(deps: ServerDeps): Hono {
       }
     };
 
-    // Stale-detection snapshot.
+    // Streaming path: relay the container's SSE chunks to the caller
+    // byte-for-byte (the inner payload is already an OpenAI-compatible
+    // ChatCompletionChunk with `data: [DONE]` as terminator, so the
+    // client sees exactly what it'd see from the OpenAI SDK). The
+    // non-streaming path below keeps the run-in-background + poll
+    // shape because callers of stream:false expect a single blocking
+    // JSON response.
+    if (body.stream === true) {
+      let handle: Awaited<ReturnType<typeof deps.router.streamEvent>>;
+      try {
+        handle = await deps.router.streamEvent({
+          sessionId: session.sessionId,
+          content: lastUserContent,
+        });
+      } catch (err) {
+        cleanupEphemeralOnError();
+        if (err instanceof RouterError) {
+          const status = err.code === "session_busy" ? 409 : 500;
+          return c.json({ error: { message: err.message, type: err.code } }, status);
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        return c.json({ error: { message: msg, type: "internal_error" } }, 500);
+      }
+
+      return streamSSE(c, async (sse) => {
+        let finalized = false;
+        try {
+          for await (const data of handle.chunks) {
+            if (sse.aborted || sse.closed) break;
+            await sse.writeSSE({ data });
+          }
+          await handle.finalize({ ok: true });
+          finalized = true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await handle.finalize({ ok: false, error: msg });
+          finalized = true;
+          cleanupEphemeralOnError();
+          if (!sse.aborted && !sse.closed) {
+            try {
+              await sse.writeSSE({
+                event: "error",
+                data: JSON.stringify({ error: { message: msg, type: "stream_error" } }),
+              });
+            } catch {
+              /* client gone */
+            }
+          }
+        } finally {
+          if (!finalized) {
+            // Client aborted mid-stream. The container's turn continues
+            // server-side; we roll up whatever made it to the JSONL and
+            // flip the session idle so subsequent events aren't blocked.
+            await handle.finalize({ ok: true }).catch(() => {
+              /* best-effort */
+            });
+          }
+        }
+      });
+    }
+
+    // Stale-detection snapshot (non-streaming path).
     const beforeMsg = deps.events.latestAgentMessage(agentId, session.sessionId);
     const beforeEventId = beforeMsg?.eventId;
 
@@ -992,58 +1057,6 @@ export function buildApp(deps: ServerDeps): Hono {
       completion_tokens: afterMsg.tokensOut ?? 0,
       total_tokens: (afterMsg.tokensIn ?? 0) + (afterMsg.tokensOut ?? 0),
     };
-
-    if (body.stream === true) {
-      return streamSSE(c, async (sse) => {
-        const baseChunk = {
-          id: responseId,
-          object: "chat.completion.chunk",
-          created: createdUnix,
-          model: responseModel,
-        };
-        // Role chunk.
-        await sse.writeSSE({
-          data: JSON.stringify({
-            ...baseChunk,
-            choices: [
-              {
-                index: 0,
-                delta: { role: "assistant" },
-                finish_reason: null,
-              },
-            ],
-          }),
-        });
-        // Content chunk — full content in one frame. Emulated streaming.
-        await sse.writeSSE({
-          data: JSON.stringify({
-            ...baseChunk,
-            choices: [
-              {
-                index: 0,
-                delta: { content: afterMsg.content },
-                finish_reason: null,
-              },
-            ],
-          }),
-        });
-        // Finish chunk.
-        await sse.writeSSE({
-          data: JSON.stringify({
-            ...baseChunk,
-            choices: [
-              {
-                index: 0,
-                delta: {},
-                finish_reason: "stop",
-              },
-            ],
-          }),
-        });
-        // OpenAI's terminator.
-        await sse.writeSSE({ data: "[DONE]" });
-      });
-    }
 
     return c.json({
       id: responseId,

@@ -78,6 +78,30 @@ export type RunEventResult = {
   queued: boolean;
 };
 
+export type StreamOutcome = { ok: true } | { ok: false; error: string };
+
+/**
+ * Handle returned from `streamEvent`. The HTTP handler pipes `chunks` to
+ * the client's SSE output, then calls `finalize` — success path rolls
+ * cost up from the JSONL and flips the session idle; error path evicts
+ * the container and records the failure. `finalize` is idempotent and
+ * guarded against external-cancel races (it no-ops if another path has
+ * already transitioned the session out of "running"), so the caller
+ * doesn't need a status check of its own.
+ */
+export type StreamingRunHandle = {
+  session: Session;
+  /**
+   * Async iterator of raw SSE `data:` payload strings from the
+   * container's `/v1/chat/completions` response. Each yielded string is
+   * the inner body of one SSE frame (no `data: ` prefix). The iterator
+   * terminates after yielding the final `"[DONE]"` sentinel OR when the
+   * underlying socket closes.
+   */
+  chunks: AsyncGenerator<string, void, void>;
+  finalize(outcome: StreamOutcome): Promise<void>;
+};
+
 export type PendingApproval = {
   approvalId: string;
   sessionId: string;
@@ -262,6 +286,185 @@ export class AgentRouter {
     void runInBackground().catch(handleFailure);
 
     return { session: runningSession, queued: false };
+  }
+
+  /**
+   * Streaming variant of runEvent. Commits to the HTTP handler's lifetime:
+   * the container's `/v1/chat/completions` is called with `stream: true`,
+   * the resulting SSE frames are surfaced through `chunks` for the caller
+   * to pipe to its client, and `finalize` closes out the session.
+   *
+   * Rejects with `session_busy` when the session already has a run in
+   * flight — streaming cannot interleave with the queue-drain path the
+   * non-streaming runEvent uses, so the caller's contract is "either the
+   * session is idle and you own the whole run, or retry after it drains".
+   * Returns after acquiring the container + opening the upstream stream;
+   * `chunks` is already live at that point.
+   */
+  async streamEvent(args: RunEventArgs): Promise<StreamingRunHandle> {
+    const session = this.sessions.get(args.sessionId);
+    if (!session) {
+      throw new RouterError(
+        "session_not_found",
+        `session ${args.sessionId} does not exist`,
+      );
+    }
+    const agent = this.agents.get(session.agentId);
+    if (!agent) {
+      throw new RouterError(
+        "agent_not_found",
+        `agent ${session.agentId} does not exist`,
+      );
+    }
+    if (session.status === "running") {
+      throw new RouterError(
+        "session_busy",
+        `session ${args.sessionId} is busy; wait for the current run to complete before streaming`,
+      );
+    }
+
+    const running = this.sessions.beginRun(args.sessionId) ?? session;
+    addContext({ sessionId: args.sessionId, agentId: agent.agentId });
+
+    try {
+      const spawnOptions = this.buildSpawnOptions(args.sessionId, agent, running);
+      const container = await this.pool.acquireForSession({
+        sessionId: args.sessionId,
+        spawnOptions,
+        agentId: agent.agentId,
+      });
+
+      if (args.model) {
+        const wsClient = this.pool.getWsClient(args.sessionId);
+        if (!wsClient) {
+          throw new RouterError(
+            "no_active_container",
+            `session ${args.sessionId} has no WS client for model patch`,
+          );
+        }
+        try {
+          await wsClient.patch(`agent:main:${args.sessionId}`, { model: args.model });
+        } catch (err) {
+          throw wrapWsError(err, "patch_failed");
+        }
+      }
+
+      const canonicalSessionKey = `agent:main:${args.sessionId}`;
+      const runEnd = sessionRunDurationSeconds.startTimer();
+      const res = await fetch(`${container.baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          Authorization: `Bearer ${container.token}`,
+          "x-openclaw-agent-id": "main",
+          "x-openclaw-session-key": canonicalSessionKey,
+        },
+        body: JSON.stringify({
+          model: "openclaw/main",
+          user: args.sessionId,
+          messages: [{ role: "user", content: args.content }],
+          stream: true,
+        }),
+        signal: AbortSignal.timeout(this.cfg.runTimeoutMs),
+      });
+
+      if (!res.ok) {
+        runEnd();
+        const text = await res.text().catch(() => "");
+        throw new RouterError(
+          "chat_completions_failed",
+          `/v1/chat/completions returned ${res.status}: ${text}`,
+        );
+      }
+      if (!res.body) {
+        runEnd();
+        throw new RouterError(
+          "chat_completions_failed",
+          "/v1/chat/completions returned empty body",
+        );
+      }
+
+      const reader = res.body.getReader();
+      const chunks = (async function* (): AsyncGenerator<string, void, void> {
+        const decoder = new TextDecoder("utf-8");
+        let buf = "";
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            // SSE frames are separated by a blank line. We split eagerly
+            // so we can yield each complete frame the moment it arrives —
+            // partial frames stay in buf until the next read. This is the
+            // only parsing we do: the rest of the SSE body (the inner
+            // ChatCompletionChunk JSON) is opaque to the orchestrator;
+            // the client speaks OpenAI's chunk schema, we just relay it.
+            let sep: number;
+            // eslint-disable-next-line no-cond-assign
+            while ((sep = buf.indexOf("\n\n")) !== -1) {
+              const frame = buf.slice(0, sep);
+              buf = buf.slice(sep + 2);
+              const dataLines: string[] = [];
+              for (const line of frame.split("\n")) {
+                if (line.startsWith("data:")) {
+                  dataLines.push(line.slice(5).replace(/^ /, ""));
+                }
+              }
+              if (dataLines.length === 0) continue;
+              const data = dataLines.join("\n");
+              yield data;
+              if (data === "[DONE]") return;
+            }
+          }
+        } finally {
+          runEnd();
+          try {
+            reader.releaseLock();
+          } catch {
+            /* reader already released */
+          }
+        }
+      })();
+
+      const router = this;
+      const finalize = async (outcome: StreamOutcome): Promise<void> => {
+        // External-cancel race guard: another path may have already flipped
+        // status (cancel + drain). Don't overwrite that with our outcome.
+        const current = router.sessions.get(args.sessionId);
+        if (current?.status !== "running") return;
+        if (outcome.ok) {
+          const latest = router.events.latestAgentMessage(agent.agentId, args.sessionId);
+          const tokensIn = latest?.tokensIn ?? 0;
+          const tokensOut = latest?.tokensOut ?? 0;
+          const costUsd = latest?.costUsd ?? 0;
+          router.sessions.endRunSuccess(args.sessionId, { tokensIn, tokensOut, costUsd });
+          return;
+        }
+        sessionRunFailuresTotal.inc();
+        log.error(
+          { session_id: args.sessionId, error: outcome.error },
+          "streaming run failed",
+        );
+        await router.pool.evictSession(args.sessionId).catch(() => {
+          /* best-effort */
+        });
+        router.sessions.endRunFailure(args.sessionId, outcome.error);
+      };
+
+      return { session: running, chunks, finalize };
+    } catch (err) {
+      // Failure BEFORE we handed the stream to the caller — unwind the
+      // beginRun transition ourselves. Evict the container because the
+      // WS patch / initial HTTP may have left it in a bad state.
+      const msg = err instanceof Error ? err.message : String(err);
+      sessionRunFailuresTotal.inc();
+      await this.pool.evictSession(args.sessionId).catch(() => {
+        /* best-effort */
+      });
+      this.sessions.endRunFailure(args.sessionId, msg);
+      throw err;
+    }
   }
 
   /**

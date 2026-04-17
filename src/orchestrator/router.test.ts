@@ -132,6 +132,62 @@ describe("AgentRouter.createSession", () => {
   });
 });
 
+describe("AgentRouter.streamEvent — pre-container decision tree", () => {
+  // These tests exercise the parts of streamEvent that run BEFORE we hit
+  // the pool / WS / fetch to the container — that surface is covered by
+  // the existing e2e (test/e2e.sh) against a real container. The
+  // pre-dispatch checks (session_not_found, agent_not_found,
+  // session_busy) don't need a live container and are what we want to
+  // lock against regressions.
+  it("rejects unknown sessions with session_not_found", async () => {
+    const { router } = makeRouter();
+    await expect(
+      router.streamEvent({ sessionId: "ses_nope", content: "hi" }),
+    ).rejects.toMatchObject({ name: "RouterError", code: "session_not_found" });
+  });
+
+  it("rejects busy sessions with session_busy (streaming cannot interleave with the queue)", async () => {
+    const { router, store } = makeRouter();
+    const agent = store.agents.create({
+      model: "m",
+      tools: [],
+      instructions: "",
+      permissionPolicy: { type: "always_allow" },
+      callableAgents: [],
+      maxSubagentDepth: 0,
+    });
+    const session = router.createSession(agent.agentId);
+    // Flip to running directly to simulate a turn in flight.
+    store.sessions.beginRun(session.sessionId);
+    await expect(
+      router.streamEvent({ sessionId: session.sessionId, content: "hi" }),
+    ).rejects.toMatchObject({ name: "RouterError", code: "session_busy" });
+    // Session must still be running — a rejection must NOT inadvertently
+    // transition state (a bug where we beginRun before checking status
+    // would leave it "running" forever on the rejection path).
+    expect(store.sessions.get(session.sessionId)?.status).toBe("running");
+  });
+
+  it("rejects when the agent template was deleted after session creation", async () => {
+    const { router, store } = makeRouter();
+    const agent = store.agents.create({
+      model: "m",
+      tools: [],
+      instructions: "",
+      permissionPolicy: { type: "always_allow" },
+      callableAgents: [],
+      maxSubagentDepth: 0,
+    });
+    const session = router.createSession(agent.agentId);
+    store.agents.delete(agent.agentId);
+    await expect(
+      router.streamEvent({ sessionId: session.sessionId, content: "hi" }),
+    ).rejects.toMatchObject({ name: "RouterError", code: "agent_not_found" });
+    // Session must be idle since we never got past validation.
+    expect(store.sessions.get(session.sessionId)?.status).toBe("idle");
+  });
+});
+
 describe("AgentRouter.runEvent — decision tree", () => {
   it("throws session_not_found for an unknown session", async () => {
     const { router } = makeRouter();
