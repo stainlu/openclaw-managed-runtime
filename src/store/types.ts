@@ -75,6 +75,73 @@ export interface SecretStore {
   set(key: string, value: Buffer): void;
 }
 
+/**
+ * End-user credential bundle. Scoped to a single user in the developer's
+ * app (identified by `userId` — arbitrary opaque string the developer
+ * owns). Contains zero or more credentials that get injected into MCP
+ * server requests at session spawn time when the vault is bound.
+ *
+ * Single-tenant-by-deployment: a vault lives in this orchestrator's
+ * SQLite. No cross-orchestrator vault lookup. Cloud-provider OEMs
+ * implementing their own multi-tenant SKU layer their identity stack on
+ * top (one orchestrator per customer).
+ */
+export type Vault = {
+  vaultId: string;
+  userId: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+/**
+ * One credential inside a vault. v1 supports `static_bearer` only —
+ * when a session's MCP server URL has `matchUrl` as a prefix, we
+ * inject `Authorization: Bearer <token>`.
+ *
+ * `mcp_oauth` with auto-refresh is a planned v2. Its shape will add
+ * refreshToken / tokenEndpoint / clientId / clientSecret / expiresAt
+ * plus a refresh path on session spawn. The type discriminator is
+ * called `type` (not `kind`) so it maps directly onto CMA's JSON shape.
+ */
+export type VaultCredential = {
+  credentialId: string;
+  vaultId: string;
+  name: string;
+  type: "static_bearer";
+  matchUrl: string;
+  /** Secret material — NEVER returned to API callers. Only used at spawn. */
+  token: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+/**
+ * Shape returned by the HTTP API for a credential — the secret is
+ * stripped. Consumers never see `token`. The only way to retrieve the
+ * secret is inside the spawn path where the orchestrator reads it from
+ * the VaultStore to inject into MCP headers.
+ */
+export type VaultCredentialSansSecret = Omit<VaultCredential, "token">;
+
+export interface VaultStore {
+  createVault(args: { userId: string; name: string }): Vault;
+  getVault(vaultId: string): Vault | undefined;
+  listVaults(filter?: { userId?: string }): Vault[];
+  deleteVault(vaultId: string): boolean;
+
+  addCredential(args: {
+    vaultId: string;
+    name: string;
+    type: "static_bearer";
+    matchUrl: string;
+    token: string;
+  }): VaultCredential | undefined;
+  getCredential(credentialId: string): VaultCredential | undefined;
+  listCredentials(vaultId: string): VaultCredential[];
+  deleteCredential(credentialId: string): boolean;
+}
+
 export interface AgentStore {
   create(req: CreateAgentRequest): AgentConfig;
   get(agentId: string): AgentConfig | undefined;
@@ -128,6 +195,7 @@ export interface SessionStore {
     environmentId?: string;
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
+    vaultId?: string;
   }): Session;
   get(sessionId: string): Session | undefined;
   list(): Session[];
@@ -171,6 +239,7 @@ export interface Store {
   readonly environments: EnvironmentStore;
   readonly sessions: SessionStore;
   readonly secrets: SecretStore;
+  readonly vaults: VaultStore;
   /** Queue backend — durable on SQLite, in-memory on memory. */
   readonly queue: QueueStore;
   readonly audit: AuditStore;

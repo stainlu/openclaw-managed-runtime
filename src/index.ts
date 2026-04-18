@@ -298,6 +298,7 @@ async function main(): Promise<void> {
     eventReader,
     pool,
     store.queue,
+    store.vaults,
     routerCfg,
   );
 
@@ -527,6 +528,7 @@ async function main(): Promise<void> {
       sessions: store.sessions,
       events: eventReader,
       audit: store.audit,
+      vaults: store.vaults,
       router,
       tokenMinter,
       version,

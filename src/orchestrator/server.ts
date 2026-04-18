@@ -20,13 +20,18 @@ import type {
   AuditStore,
   EnvironmentStore,
   SessionStore,
+  Vault,
+  VaultCredential,
+  VaultStore,
 } from "../store/types.js";
 import { portalHtml } from "./portal.js";
 import { AgentRouter, RouterError } from "./router.js";
 import {
+  AddCredentialRequestSchema,
   CreateAgentRequestSchema,
   CreateEnvironmentRequestSchema,
   CreateSessionRequestSchema,
+  CreateVaultRequestSchema,
   OpenAIChatCompletionRequestSchema,
   PostEventRequestSchema,
   RunAgentRequestSchema,
@@ -95,6 +100,7 @@ export type ServerDeps = {
   sessions: SessionStore;
   events: PiJsonlEventReader;
   audit: AuditStore;
+  vaults: VaultStore;
   router: AgentRouter;
   /**
    * Baseline bearer-token auth. Undefined or empty string → auth
@@ -140,6 +146,30 @@ function agentResponse(agent: AgentConfig) {
     created_at: agent.createdAt,
     updated_at: agent.updatedAt,
     archived_at: agent.archivedAt,
+  };
+}
+
+function vaultResponse(vault: Vault) {
+  return {
+    vault_id: vault.vaultId,
+    user_id: vault.userId,
+    name: vault.name,
+    created_at: vault.createdAt,
+    updated_at: vault.updatedAt,
+  };
+}
+
+function credentialResponse(cred: VaultCredential) {
+  // Deliberately omits `token` — secrets are write-only. Clients rotate
+  // by deleting and re-adding.
+  return {
+    credential_id: cred.credentialId,
+    vault_id: cred.vaultId,
+    name: cred.name,
+    type: cred.type,
+    match_url: cred.matchUrl,
+    created_at: cred.createdAt,
+    updated_at: cred.updatedAt,
   };
 }
 
@@ -198,7 +228,12 @@ function eventResponse(event: Event) {
 
 function handleRouterError(err: unknown, c: Context): Response {
   if (err instanceof RouterError) {
-    if (err.code === "agent_not_found" || err.code === "session_not_found" || err.code === "file_not_found") {
+    if (
+      err.code === "agent_not_found" ||
+      err.code === "session_not_found" ||
+      err.code === "file_not_found" ||
+      err.code === "vault_not_found"
+    ) {
       return c.json({ error: err.code, message: err.message }, 404);
     }
     if (err.code === "agent_archived") {
@@ -283,6 +318,15 @@ export function buildApp(deps: ServerDeps): Hono {
           list: "GET /v1/environments",
           get: "GET /v1/environments/:environmentId",
           delete: "DELETE /v1/environments/:environmentId",
+        },
+        vaults: {
+          create: "POST /v1/vaults",
+          list: "GET /v1/vaults?user_id=<id>",
+          get: "GET /v1/vaults/:vaultId",
+          delete: "DELETE /v1/vaults/:vaultId",
+          add_credential: "POST /v1/vaults/:vaultId/credentials",
+          list_credentials: "GET /v1/vaults/:vaultId/credentials",
+          delete_credential: "DELETE /v1/vaults/:vaultId/credentials/:credentialId",
         },
         sessions: {
           create: "POST /v1/sessions",
@@ -555,6 +599,111 @@ export function buildApp(deps: ServerDeps): Hono {
     return c.json({ deleted: true });
   });
 
+  // ---------- Vaults (per-end-user credential bundles) ----------
+  //
+  // Vault shape matches Claude MA's so migration is a rename. Secrets
+  // are write-only: the `token` on a credential is never returned from
+  // any GET/LIST endpoint. The only path that reads the plaintext token
+  // is the session-spawn injection, internal to the router.
+
+  app.post("/v1/vaults", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = CreateVaultRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
+    }
+    const vault = deps.vaults.createVault(parsed.data);
+    writeAudit(deps.audit, c, {
+      action: "vault.create",
+      target: vault.vaultId,
+      outcome: "ok",
+      metadata: { user_id: vault.userId },
+    });
+    return c.json(vaultResponse(vault));
+  });
+
+  app.get("/v1/vaults", (c) => {
+    const userId = c.req.query("user_id") ?? c.req.query("userId");
+    const vaults = deps.vaults.listVaults(userId ? { userId } : undefined).map(vaultResponse);
+    return c.json({ vaults, count: vaults.length });
+  });
+
+  app.get("/v1/vaults/:vaultId", (c) => {
+    const vaultId = c.req.param("vaultId");
+    const vault = deps.vaults.getVault(vaultId);
+    if (!vault) return c.json({ error: "vault_not_found" }, 404);
+    return c.json(vaultResponse(vault));
+  });
+
+  app.delete("/v1/vaults/:vaultId", (c) => {
+    const vaultId = c.req.param("vaultId");
+    const deleted = deps.vaults.deleteVault(vaultId);
+    writeAudit(deps.audit, c, {
+      action: "vault.delete",
+      target: vaultId,
+      outcome: deleted ? "ok" : "vault_not_found",
+    });
+    if (!deleted) return c.json({ error: "vault_not_found" }, 404);
+    return c.json({ vault_id: vaultId, deleted: true });
+  });
+
+  app.post("/v1/vaults/:vaultId/credentials", async (c) => {
+    const vaultId = c.req.param("vaultId");
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = AddCredentialRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
+    }
+    const cred = deps.vaults.addCredential({ vaultId, ...parsed.data });
+    if (!cred) {
+      writeAudit(deps.audit, c, {
+        action: "vault.credential.create",
+        target: vaultId,
+        outcome: "vault_not_found",
+      });
+      return c.json({ error: "vault_not_found" }, 404);
+    }
+    writeAudit(deps.audit, c, {
+      action: "vault.credential.create",
+      target: cred.credentialId,
+      outcome: "ok",
+      metadata: { vault_id: vaultId, match_url: cred.matchUrl, type: cred.type },
+    });
+    return c.json(credentialResponse(cred));
+  });
+
+  app.get("/v1/vaults/:vaultId/credentials", (c) => {
+    const vaultId = c.req.param("vaultId");
+    if (!deps.vaults.getVault(vaultId)) {
+      return c.json({ error: "vault_not_found" }, 404);
+    }
+    const creds = deps.vaults.listCredentials(vaultId).map(credentialResponse);
+    return c.json({ vault_id: vaultId, credentials: creds, count: creds.length });
+  });
+
+  app.delete("/v1/vaults/:vaultId/credentials/:credentialId", (c) => {
+    const vaultId = c.req.param("vaultId");
+    const credentialId = c.req.param("credentialId");
+    const existing = deps.vaults.getCredential(credentialId);
+    if (!existing || existing.vaultId !== vaultId) {
+      writeAudit(deps.audit, c, {
+        action: "vault.credential.delete",
+        target: credentialId,
+        outcome: "not_found",
+        metadata: { vault_id: vaultId },
+      });
+      return c.json({ error: "credential_not_found" }, 404);
+    }
+    deps.vaults.deleteCredential(credentialId);
+    writeAudit(deps.audit, c, {
+      action: "vault.credential.delete",
+      target: credentialId,
+      outcome: "ok",
+      metadata: { vault_id: vaultId },
+    });
+    return c.json({ credential_id: credentialId, deleted: true });
+  });
+
   // ---------- Sessions (long-lived, session-centric API) ----------
 
   app.post("/v1/sessions", async (c) => {
@@ -614,6 +763,7 @@ export function buildApp(deps: ServerDeps): Hono {
       const session = deps.router.createSession(parsed.data.agentId, {
         environmentId: parsed.data.environmentId,
         remainingSubagentDepth: remainingSubagentDepthOverride,
+        vaultId: parsed.data.vaultId,
       });
       // Proactive warm-up: start booting the container in the background
       // so it's ready (or nearly ready) by the time the first event arrives.

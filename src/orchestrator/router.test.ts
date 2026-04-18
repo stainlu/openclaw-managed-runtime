@@ -46,6 +46,7 @@ function makeRouter(opts: {
     eventReader,
     pool as SessionContainerPool,
     queue,
+    store.vaults,
     cfg,
   );
   return { router, store, queue, pool };

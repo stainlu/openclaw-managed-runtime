@@ -20,6 +20,9 @@ import type {
   SecretStore,
   SessionStore,
   Store,
+  Vault,
+  VaultCredential,
+  VaultStore,
 } from "./types.js";
 
 const nanoid = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
@@ -161,6 +164,7 @@ class InMemorySessionStore implements SessionStore {
     environmentId?: string;
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
+    vaultId?: string;
   }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
     const session: Session = {
@@ -176,6 +180,7 @@ class InMemorySessionStore implements SessionStore {
       error: null,
       createdAt: Date.now(),
       lastEventAt: null,
+      vaultId: args.vaultId ?? null,
     };
     this.sessions.set(sessionId, session);
     return session;
@@ -361,6 +366,84 @@ class InMemoryAuditStore implements AuditStore {
   }
 }
 
+class InMemoryVaultStore implements VaultStore {
+  private readonly vaults = new Map<string, Vault>();
+  private readonly credentials = new Map<string, VaultCredential>();
+
+  createVault(args: { userId: string; name: string }): Vault {
+    const now = Date.now();
+    const vault: Vault = {
+      vaultId: `vlt_${nanoid()}`,
+      userId: args.userId,
+      name: args.name,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.vaults.set(vault.vaultId, vault);
+    return vault;
+  }
+
+  getVault(vaultId: string): Vault | undefined {
+    return this.vaults.get(vaultId);
+  }
+
+  listVaults(filter?: { userId?: string }): Vault[] {
+    const all = Array.from(this.vaults.values());
+    const filtered = filter?.userId ? all.filter((v) => v.userId === filter.userId) : all;
+    return filtered.sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  deleteVault(vaultId: string): boolean {
+    const removed = this.vaults.delete(vaultId);
+    if (removed) {
+      // Cascade: drop matching credentials.
+      for (const [cid, cred] of this.credentials) {
+        if (cred.vaultId === vaultId) this.credentials.delete(cid);
+      }
+    }
+    return removed;
+  }
+
+  addCredential(args: {
+    vaultId: string;
+    name: string;
+    type: "static_bearer";
+    matchUrl: string;
+    token: string;
+  }): VaultCredential | undefined {
+    if (!this.vaults.has(args.vaultId)) return undefined;
+    const now = Date.now();
+    const cred: VaultCredential = {
+      credentialId: `crd_${nanoid()}`,
+      vaultId: args.vaultId,
+      name: args.name,
+      type: args.type,
+      matchUrl: args.matchUrl,
+      token: args.token,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.credentials.set(cred.credentialId, cred);
+    const vault = this.vaults.get(args.vaultId);
+    if (vault) this.vaults.set(args.vaultId, { ...vault, updatedAt: now });
+    return cred;
+  }
+
+  getCredential(credentialId: string): VaultCredential | undefined {
+    return this.credentials.get(credentialId);
+  }
+
+  listCredentials(vaultId: string): VaultCredential[] {
+    return Array.from(this.credentials.values())
+      .filter((c) => c.vaultId === vaultId)
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  deleteCredential(credentialId: string): boolean {
+    return this.credentials.delete(credentialId);
+  }
+}
+
 // ---------- Bundle ----------
 
 export class InMemoryStore implements Store {
@@ -370,6 +453,7 @@ export class InMemoryStore implements Store {
   readonly secrets: SecretStore;
   readonly queue: QueueStore;
   readonly audit: AuditStore;
+  readonly vaults: VaultStore;
 
   constructor() {
     this.agents = new InMemoryAgentStore();
@@ -378,6 +462,7 @@ export class InMemoryStore implements Store {
     this.secrets = new InMemorySecretStore();
     this.queue = new InMemoryQueueStore();
     this.audit = new InMemoryAuditStore();
+    this.vaults = new InMemoryVaultStore();
   }
 
   close(): void {

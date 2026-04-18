@@ -22,6 +22,7 @@ import type {
   QueueStore,
   RunUsage,
   SessionStore,
+  VaultStore,
 } from "../store/types.js";
 import type { AgentConfig, Session } from "./types.js";
 
@@ -136,6 +137,7 @@ export class AgentRouter {
     private readonly events: PiJsonlEventReader,
     private readonly pool: SessionContainerPool,
     private readonly queue: QueueStore,
+    private readonly vaults: VaultStore,
     private readonly cfg: RouterConfig,
   ) {}
 
@@ -200,7 +202,7 @@ export class AgentRouter {
    */
   createSession(
     agentId: string,
-    opts?: { environmentId?: string; remainingSubagentDepth?: number },
+    opts?: { environmentId?: string; remainingSubagentDepth?: number; vaultId?: string },
   ): Session {
     const agent = this.agents.get(agentId);
     if (!agent) {
@@ -209,12 +211,19 @@ export class AgentRouter {
     if (agent.archivedAt) {
       throw new RouterError("agent_archived", `agent ${agentId} is archived`);
     }
+    if (opts?.vaultId && !this.vaults.getVault(opts.vaultId)) {
+      throw new RouterError(
+        "vault_not_found",
+        `vault ${opts.vaultId} does not exist`,
+      );
+    }
     const remainingSubagentDepth =
       opts?.remainingSubagentDepth ?? agent.maxSubagentDepth;
     return this.sessions.create({
       agentId,
       environmentId: opts?.environmentId,
       remainingSubagentDepth,
+      vaultId: opts?.vaultId,
     });
   }
 
@@ -409,6 +418,7 @@ export class AgentRouter {
         spawnOptions,
         agentId: agent.agentId,
         networking,
+        bypassWarmPool: Boolean(running.vaultId),
       });
 
       // Same patch rules as executeInBackground — see the note there.
@@ -788,6 +798,59 @@ export class AgentRouter {
     return { fullPath, relNormalized };
   }
 
+  /**
+   * Merge vault credentials into an agent's MCP server config for a
+   * specific session. Pure function over store reads — no side effects.
+   *
+   * For each HTTP MCP server (one with a `url`), match the server's URL
+   * prefix against every credential's `matchUrl`. The longest matching
+   * prefix wins (so more-specific credentials override more-general
+   * ones). The credential's bearer token becomes
+   * `Authorization: Bearer <token>` in the server's headers, preserving
+   * any other headers the agent template declared.
+   *
+   * stdio MCP servers (those without a URL) are passed through
+   * untouched — their credentials live in the server's `env` field,
+   * which the agent template owner controls directly.
+   */
+  private injectVaultCredentials(
+    agentMcpServers: AgentConfig["mcpServers"],
+    vaultId: string | null,
+  ): AgentConfig["mcpServers"] {
+    if (!vaultId) return agentMcpServers;
+    if (!agentMcpServers || Object.keys(agentMcpServers).length === 0) {
+      return agentMcpServers;
+    }
+    const creds = this.vaults.listCredentials(vaultId);
+    if (creds.length === 0) return agentMcpServers;
+    const out: AgentConfig["mcpServers"] = {};
+    for (const [name, server] of Object.entries(agentMcpServers)) {
+      const url = typeof server.url === "string" ? server.url : undefined;
+      if (!url) {
+        out[name] = server;
+        continue;
+      }
+      // Longest-prefix wins — lets operators declare a generic
+      // org-wide credential plus narrower per-service overrides.
+      const match = creds
+        .filter((c) => url.startsWith(c.matchUrl))
+        .sort((a, b) => b.matchUrl.length - a.matchUrl.length)[0];
+      if (!match) {
+        out[name] = server;
+        continue;
+      }
+      const existingHeaders = (server.headers ?? {}) as Record<string, string>;
+      out[name] = {
+        ...server,
+        headers: {
+          ...existingHeaders,
+          Authorization: `Bearer ${match.token}`,
+        },
+      };
+    }
+    return out;
+  }
+
   async cancel(sessionId: string): Promise<Session> {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -942,8 +1005,12 @@ export class AgentRouter {
     if (envConfig?.packages) {
       env.OPENCLAW_PACKAGES_JSON = JSON.stringify(envConfig.packages);
     }
-    if (agent.mcpServers && Object.keys(agent.mcpServers).length > 0) {
-      env.OPENCLAW_MCP_SERVERS_JSON = JSON.stringify(agent.mcpServers);
+    const effectiveMcpServers = this.injectVaultCredentials(
+      agent.mcpServers,
+      session.vaultId ?? null,
+    );
+    if (effectiveMcpServers && Object.keys(effectiveMcpServers).length > 0) {
+      env.OPENCLAW_MCP_SERVERS_JSON = JSON.stringify(effectiveMcpServers);
     }
     if (agent.permissionPolicy.type === "deny") {
       env.OPENCLAW_DENIED_TOOLS = agent.permissionPolicy.tools.join(",");
@@ -992,6 +1059,7 @@ export class AgentRouter {
       spawnOptions,
       agentId: agent.agentId,
       networking: currentSession ? this.resolveNetworking(currentSession) : undefined,
+      bypassWarmPool: Boolean(currentSession?.vaultId),
     });
 
     // Subscribe to approval broadcasts when the agent has always_ask.
@@ -1392,7 +1460,8 @@ export type RouterErrorCode =
   | "confirm_tool_failed"
   | "quota_exceeded"
   | "file_not_found"
-  | "invalid_path";
+  | "invalid_path"
+  | "vault_not_found";
 
 export class RouterError extends Error {
   constructor(

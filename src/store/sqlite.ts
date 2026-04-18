@@ -26,6 +26,9 @@ import type {
   SecretStore,
   SessionStore,
   Store,
+  Vault,
+  VaultCredential,
+  VaultStore,
 } from "./types.js";
 
 const nanoid = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
@@ -71,6 +74,7 @@ type SessionRow = {
   error: string | null;
   created_at: number;
   last_event_at: number | null;
+  vault_id: string | null;
 };
 
 function rowToAgent(r: AgentRow): AgentConfig {
@@ -123,6 +127,7 @@ function rowToSession(r: SessionRow): Session {
     error: r.error,
     createdAt: r.created_at,
     lastEventAt: r.last_event_at,
+    vaultId: r.vault_id,
   };
 }
 
@@ -199,7 +204,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   cost_usd REAL NOT NULL DEFAULT 0,
   error TEXT,
   created_at INTEGER NOT NULL,
-  last_event_at INTEGER
+  last_event_at INTEGER,
+  vault_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id);
@@ -249,6 +255,35 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS idx_audit_target_ts ON audit_events(target, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_action_ts ON audit_events(action, ts);
+
+-- Vaults: per-end-user credential bundles. Same shape concept as
+-- Claude MA's vaults (each vault belongs to ONE of the developer's
+-- app's end-users). Credentials live in vault_credentials keyed by
+-- vault_id with ON DELETE CASCADE so deleting a vault drops its secrets.
+-- user_id is indexed because listing-by-user is the common query
+-- (developer maps their user to a vault in their own DB).
+CREATE TABLE IF NOT EXISTS vaults (
+  vault_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vaults_user ON vaults(user_id);
+
+CREATE TABLE IF NOT EXISTS vault_credentials (
+  credential_id TEXT PRIMARY KEY,
+  vault_id TEXT NOT NULL REFERENCES vaults(vault_id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  cred_type TEXT NOT NULL,
+  match_url TEXT NOT NULL,
+  token TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_credentials_vault ON vault_credentials(vault_id);
 `;
 
 // ---------- Agent store ----------
@@ -518,11 +553,11 @@ class SqliteSessionStore implements SessionStore {
         session_id, agent_id, environment_id, status, ephemeral,
         remaining_subagent_depth,
         tokens_in, tokens_out, cost_usd,
-        error, created_at, last_event_at
+        error, created_at, last_event_at, vault_id
        ) VALUES (
         @session_id, @agent_id, @environment_id, 'idle', @ephemeral,
         @remaining_subagent_depth,
-        0, 0, 0, NULL, @created_at, NULL
+        0, 0, 0, NULL, @created_at, NULL, @vault_id
        )`,
     );
     this.getStmt = db.prepare(`SELECT * FROM sessions WHERE session_id = ?`);
@@ -573,11 +608,13 @@ class SqliteSessionStore implements SessionStore {
     environmentId?: string;
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
+    vaultId?: string;
   }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
     const environmentId = args.environmentId ?? null;
     const ephemeral = args.ephemeral ?? false;
     const remainingSubagentDepth = args.remainingSubagentDepth ?? 0;
+    const vaultId = args.vaultId ?? null;
     const createdAt = Date.now();
     this.insertStmt.run({
       session_id: sessionId,
@@ -586,6 +623,7 @@ class SqliteSessionStore implements SessionStore {
       ephemeral: ephemeral ? 1 : 0,
       remaining_subagent_depth: remainingSubagentDepth,
       created_at: createdAt,
+      vault_id: vaultId,
     });
     return {
       sessionId,
@@ -600,6 +638,7 @@ class SqliteSessionStore implements SessionStore {
       error: null,
       createdAt,
       lastEventAt: null,
+      vaultId,
     };
   }
 
@@ -674,6 +713,201 @@ class SqliteSessionStore implements SessionStore {
 }
 
 // ---------- Secret store ----------
+
+// ---------- Vault store ----------
+//
+// Stores per-end-user credential bundles that sessions can bind to at
+// spawn time. The token column holds the secret in plaintext; at-rest
+// encryption is a follow-up tied to KMS integration (either env-derived
+// AES-GCM as a first pass, or a cloud-OEM KMS plug via the same
+// VaultStore interface). The data IS protected by file-system
+// permissions on the orchestrator's state dir — a compromised SQLite
+// file is still a compromise.
+class SqliteVaultStore implements VaultStore {
+  private readonly insertVaultStmt: Database.Statement;
+  private readonly getVaultStmt: Database.Statement;
+  private readonly listVaultsStmt: Database.Statement;
+  private readonly listVaultsByUserStmt: Database.Statement;
+  private readonly deleteVaultStmt: Database.Statement;
+  private readonly insertCredStmt: Database.Statement;
+  private readonly getCredStmt: Database.Statement;
+  private readonly listCredsStmt: Database.Statement;
+  private readonly deleteCredStmt: Database.Statement;
+  private readonly touchVaultStmt: Database.Statement;
+
+  constructor(db: Database.Database) {
+    this.insertVaultStmt = db.prepare(
+      `INSERT INTO vaults (vault_id, user_id, name, created_at, updated_at)
+       VALUES (@vault_id, @user_id, @name, @now, @now)`,
+    );
+    this.getVaultStmt = db.prepare(`SELECT * FROM vaults WHERE vault_id = ?`);
+    this.listVaultsStmt = db.prepare(`SELECT * FROM vaults ORDER BY created_at DESC`);
+    this.listVaultsByUserStmt = db.prepare(
+      `SELECT * FROM vaults WHERE user_id = ? ORDER BY created_at DESC`,
+    );
+    this.deleteVaultStmt = db.prepare(`DELETE FROM vaults WHERE vault_id = ?`);
+    this.insertCredStmt = db.prepare(
+      `INSERT INTO vault_credentials (
+        credential_id, vault_id, name, cred_type, match_url, token,
+        created_at, updated_at
+       ) VALUES (
+        @credential_id, @vault_id, @name, @cred_type, @match_url, @token,
+        @now, @now
+       )`,
+    );
+    this.getCredStmt = db.prepare(`SELECT * FROM vault_credentials WHERE credential_id = ?`);
+    this.listCredsStmt = db.prepare(
+      `SELECT * FROM vault_credentials WHERE vault_id = ? ORDER BY created_at ASC`,
+    );
+    this.deleteCredStmt = db.prepare(`DELETE FROM vault_credentials WHERE credential_id = ?`);
+    this.touchVaultStmt = db.prepare(
+      `UPDATE vaults SET updated_at = @now WHERE vault_id = @vault_id`,
+    );
+  }
+
+  createVault(args: { userId: string; name: string }): Vault {
+    const now = Date.now();
+    const vault: Vault = {
+      vaultId: `vlt_${nanoid()}`,
+      userId: args.userId,
+      name: args.name,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.insertVaultStmt.run({
+      vault_id: vault.vaultId,
+      user_id: vault.userId,
+      name: vault.name,
+      now,
+    });
+    return vault;
+  }
+
+  getVault(vaultId: string): Vault | undefined {
+    const row = this.getVaultStmt.get(vaultId) as
+      | { vault_id: string; user_id: string; name: string; created_at: number; updated_at: number }
+      | undefined;
+    if (!row) return undefined;
+    return {
+      vaultId: row.vault_id,
+      userId: row.user_id,
+      name: row.name,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  listVaults(filter?: { userId?: string }): Vault[] {
+    const rows = (filter?.userId
+      ? this.listVaultsByUserStmt.all(filter.userId)
+      : this.listVaultsStmt.all()) as Array<{
+      vault_id: string;
+      user_id: string;
+      name: string;
+      created_at: number;
+      updated_at: number;
+    }>;
+    return rows.map((r) => ({
+      vaultId: r.vault_id,
+      userId: r.user_id,
+      name: r.name,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  deleteVault(vaultId: string): boolean {
+    // Credentials cascade via FK ON DELETE CASCADE — see schema.
+    const info = this.deleteVaultStmt.run(vaultId);
+    return info.changes > 0;
+  }
+
+  addCredential(args: {
+    vaultId: string;
+    name: string;
+    type: "static_bearer";
+    matchUrl: string;
+    token: string;
+  }): VaultCredential | undefined {
+    if (!this.getVault(args.vaultId)) return undefined;
+    const now = Date.now();
+    const cred: VaultCredential = {
+      credentialId: `crd_${nanoid()}`,
+      vaultId: args.vaultId,
+      name: args.name,
+      type: args.type,
+      matchUrl: args.matchUrl,
+      token: args.token,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.insertCredStmt.run({
+      credential_id: cred.credentialId,
+      vault_id: cred.vaultId,
+      name: cred.name,
+      cred_type: cred.type,
+      match_url: cred.matchUrl,
+      token: cred.token,
+      now,
+    });
+    this.touchVaultStmt.run({ vault_id: cred.vaultId, now });
+    return cred;
+  }
+
+  getCredential(credentialId: string): VaultCredential | undefined {
+    const row = this.getCredStmt.get(credentialId) as
+      | {
+          credential_id: string;
+          vault_id: string;
+          name: string;
+          cred_type: string;
+          match_url: string;
+          token: string;
+          created_at: number;
+          updated_at: number;
+        }
+      | undefined;
+    if (!row) return undefined;
+    return {
+      credentialId: row.credential_id,
+      vaultId: row.vault_id,
+      name: row.name,
+      type: row.cred_type as "static_bearer",
+      matchUrl: row.match_url,
+      token: row.token,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  listCredentials(vaultId: string): VaultCredential[] {
+    const rows = this.listCredsStmt.all(vaultId) as Array<{
+      credential_id: string;
+      vault_id: string;
+      name: string;
+      cred_type: string;
+      match_url: string;
+      token: string;
+      created_at: number;
+      updated_at: number;
+    }>;
+    return rows.map((r) => ({
+      credentialId: r.credential_id,
+      vaultId: r.vault_id,
+      name: r.name,
+      type: r.cred_type as "static_bearer",
+      matchUrl: r.match_url,
+      token: r.token,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  deleteCredential(credentialId: string): boolean {
+    const info = this.deleteCredStmt.run(credentialId);
+    return info.changes > 0;
+  }
+}
 
 class SqliteSecretStore implements SecretStore {
   private readonly getStmt: Database.Statement;
@@ -882,6 +1116,7 @@ export class SqliteStore implements Store {
   readonly secrets: SecretStore;
   readonly queue: QueueStore;
   readonly audit: AuditStore;
+  readonly vaults: VaultStore;
   private readonly db: Database.Database;
   private closed = false;
 
@@ -924,6 +1159,11 @@ export class SqliteStore implements Store {
       this.db.exec(
         "ALTER TABLE sessions ADD COLUMN remaining_subagent_depth INTEGER NOT NULL DEFAULT 0",
       );
+    }
+    if (!sessionsCols.some((c) => c.name === "vault_id")) {
+      // Vault binding. Pre-migration rows default to NULL (no vault),
+      // which is the existing behavior — no credentials injected.
+      this.db.exec("ALTER TABLE sessions ADD COLUMN vault_id TEXT");
     }
     const agentsCols = this.db.pragma("table_info(agents)") as Array<{
       name: string;
@@ -988,6 +1228,7 @@ export class SqliteStore implements Store {
     this.secrets = new SqliteSecretStore(this.db);
     this.queue = new SqliteQueueStore(this.db);
     this.audit = new SqliteAuditStore(this.db);
+    this.vaults = new SqliteVaultStore(this.db);
   }
 
   close(): void {

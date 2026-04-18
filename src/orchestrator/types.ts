@@ -282,14 +282,59 @@ export type Session = {
   createdAt: number;
   /** Updated whenever any event is appended. Null for an empty session. */
   lastEventAt: number | null;
+  /**
+   * Optional vault bound to this session. When present, credentials in
+   * the vault are injected into the session's MCP server configs at
+   * spawn time (Authorization header on matching URLs). Null for
+   * sessions created without a vault.
+   */
+  vaultId: string | null;
 };
 
 export const CreateSessionRequestSchema = z.object({
   agentId: z.string().min(1, "agentId is required"),
   environmentId: z.string().min(1).optional(),
+  /**
+   * Optional vault binding — matches Claude MA's shape. When present,
+   * credentials in the vault are injected into MCP server requests by
+   * URL prefix match at session spawn time. Vault must already exist;
+   * an unknown vaultId returns vault_not_found.
+   */
+  vaultId: z.string().min(1).optional(),
 });
 
 export type CreateSessionRequest = z.infer<typeof CreateSessionRequestSchema>;
+
+// ---------- Vault (per-end-user credential bundle) ----------
+//
+// Mirrors Claude MA's vault shape so migration from CMA is a rename
+// rather than a remodel. The developer creates one vault per end-user
+// of their app, loads that end-user's outbound API credentials into it,
+// and binds the vault on session creation. The runtime injects matching
+// credentials into the session's MCP server config at spawn time.
+
+export const CreateVaultRequestSchema = z.object({
+  userId: z.string().min(1, "userId is required").max(256),
+  name: z.string().min(1).max(256).default(""),
+});
+
+export type CreateVaultRequest = z.infer<typeof CreateVaultRequestSchema>;
+
+export const AddCredentialRequestSchema = z.object({
+  name: z.string().min(1).max(256),
+  type: z.literal("static_bearer"),
+  /**
+   * URL prefix used to match against MCP server URLs at spawn time.
+   * When an MCP server's url in agent.mcpServers starts with this
+   * value, the credential's token is injected as
+   * `Authorization: Bearer <token>` in the server's headers.
+   */
+  matchUrl: z.string().min(1).max(2048),
+  /** Secret — write-only. Never returned in responses. */
+  token: z.string().min(1).max(65_536),
+});
+
+export type AddCredentialRequest = z.infer<typeof AddCredentialRequestSchema>;
 
 // ---------- Event (the interaction primitive) ----------
 

@@ -237,6 +237,15 @@ export class SessionContainerPool {
      * agent to them.
      */
     networking?: NetworkingSpec;
+    /**
+     * True when this session's spawn env embeds session-specific config
+     * that warm-pool containers (built with placeholder "__warm__"
+     * session context) cannot carry. Today that's: vault-bound
+     * sessions (MCP credentials injected into OPENCLAW_MCP_SERVERS_JSON).
+     * Bypass warm pool for those — same rationale as the networking:
+     * limited branch below.
+     */
+    bypassWarmPool?: boolean;
   }): Promise<Container> {
     const existing = this.active.get(args.sessionId);
     if (existing) {
@@ -261,7 +270,7 @@ export class SessionContainerPool {
     // parallel spawn would collide on the shared agent-workspace bind
     // mount and Pi's SessionManager would exit(1) one of them. The
     // pendingByAgent map makes warmForAgent idempotent.
-    if (args.agentId) {
+    if (args.agentId && !args.bypassWarmPool) {
       const inflight = this.pendingByAgent.get(args.agentId);
       if (inflight) {
         await inflight.catch(() => {
