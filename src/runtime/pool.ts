@@ -150,7 +150,7 @@ export class SessionContainerPool {
   private sweeperHandle: NodeJS.Timeout | undefined;
 
   constructor(
-    private readonly runtime: ContainerRuntime,
+    readonly runtime: ContainerRuntime,
     private readonly cfg: PoolConfig,
   ) {
     this.sweeperHandle = setInterval(() => {
@@ -597,6 +597,11 @@ export class SessionContainerPool {
    */
   getWsClient(sessionId: string): GatewayWebSocketClient | undefined {
     return this.active.get(sessionId)?.wsClient;
+  }
+
+  /** Returns the container id of this session's active container, if any. */
+  getContainerId(sessionId: string): string | undefined {
+    return this.active.get(sessionId)?.container.id;
   }
 
   /** Touch the lastUsedAt timestamp for a session so the sweeper doesn't reap it. */

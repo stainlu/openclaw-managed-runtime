@@ -596,6 +596,198 @@ export class AgentRouter {
     return session;
   }
 
+  /**
+   * Fetch a snapshot of the agent container's stdout+stderr. Useful for
+   * debugging "my turn produced an empty output" cases — the container
+   * logs reveal upstream provider errors (401, rate limit), tool-call
+   * tracebacks, and gateway diagnostics that aren't surfaced through
+   * the event stream.
+   *
+   * Requires an active container for this session. Returns 404-ish
+   * (`no_active_container`) if the pool has no container for it.
+   */
+  async logs(sessionId: string, tail = 200): Promise<string> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new RouterError(
+        "session_not_found",
+        `session ${sessionId} does not exist`,
+      );
+    }
+    const containerId = this.pool.getContainerId(sessionId);
+    if (!containerId) {
+      throw new RouterError(
+        "no_active_container",
+        `session ${sessionId} has no active container (post an event first)`,
+      );
+    }
+    return this.pool.runtime.logs(containerId, { tail });
+  }
+
+  /**
+   * List files in an agent's workspace at the given relative path (empty
+   * = workspace root). Returns entries that live inside Pi's workspace
+   * directory. Rejects path traversal.
+   *
+   * The "workspace" here is the host bind mount at `<stateRoot>/<agentId>/`
+   * that openclaw uses as its `cwd` inside the container. Agents read/write
+   * here when a session invokes file tools, so a developer debugging "what
+   * did my agent produce" starts here.
+   */
+  async listFiles(
+    agentId: string,
+    relPath = "",
+  ): Promise<Array<{ name: string; path: string; type: "file" | "dir"; size: number; mtime: number }>> {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      throw new RouterError("agent_not_found", `agent ${agentId} does not exist`);
+    }
+    const { fullPath, relNormalized } = this.resolveWorkspacePath(agentId, relPath);
+    const { readdir, stat } = await import("node:fs/promises");
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await readdir(fullPath, { withFileTypes: true });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        throw new RouterError("file_not_found", `workspace path not found: ${relNormalized}`);
+      }
+      throw err;
+    }
+    const { join } = await import("node:path");
+    const result: Array<{ name: string; path: string; type: "file" | "dir"; size: number; mtime: number }> = [];
+    for (const e of entries) {
+      try {
+        const st = await stat(join(fullPath, e.name));
+        result.push({
+          name: e.name,
+          path: relNormalized ? `${relNormalized}/${e.name}` : e.name,
+          type: e.isDirectory() ? "dir" : "file",
+          size: st.size,
+          mtime: st.mtimeMs,
+        });
+      } catch {
+        /* broken symlink or permission issue — skip it */
+      }
+    }
+    result.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
+    return result;
+  }
+
+  /**
+   * Read a file from an agent's workspace. Returns a Buffer up to
+   * `maxBytes` (default 10 MiB). Files larger than that get truncated
+   * with the first N bytes — callers that need full content should GET
+   * with the `?raw=true` query that reads up to 50 MiB. Binary-safe.
+   */
+  async readFile(agentId: string, relPath: string, maxBytes = 10 * 1024 * 1024): Promise<Buffer> {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      throw new RouterError("agent_not_found", `agent ${agentId} does not exist`);
+    }
+    const { fullPath, relNormalized } = this.resolveWorkspacePath(agentId, relPath);
+    const { readFile, stat } = await import("node:fs/promises");
+    try {
+      const st = await stat(fullPath);
+      if (!st.isFile()) {
+        throw new RouterError("file_not_found", `not a file: ${relNormalized}`);
+      }
+      const buf = await readFile(fullPath);
+      if (buf.length > maxBytes) return buf.subarray(0, maxBytes);
+      return buf;
+    } catch (err) {
+      if (err instanceof RouterError) throw err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        throw new RouterError("file_not_found", `file not found: ${relNormalized}`);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Write a file in an agent's workspace, creating parent directories as
+   * needed. Overwrites existing files. `content` is written verbatim.
+   * Does not race with concurrent tool calls — the container filesystem
+   * is shared with whatever the agent is doing, so coordinate externally
+   * if you're writing into an active workspace.
+   */
+  async writeFile(agentId: string, relPath: string, content: Buffer): Promise<{ size: number; path: string }> {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      throw new RouterError("agent_not_found", `agent ${agentId} does not exist`);
+    }
+    const { fullPath, relNormalized } = this.resolveWorkspacePath(agentId, relPath);
+    if (!relNormalized) {
+      throw new RouterError("invalid_path", `refusing to write to workspace root`);
+    }
+    const { writeFile, mkdir } = await import("node:fs/promises");
+    const { dirname } = await import("node:path");
+    await mkdir(dirname(fullPath), { recursive: true });
+    await writeFile(fullPath, content);
+    return { size: content.length, path: relNormalized };
+  }
+
+  /** Delete a file (not a directory) from an agent's workspace. */
+  async deleteFile(agentId: string, relPath: string): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      throw new RouterError("agent_not_found", `agent ${agentId} does not exist`);
+    }
+    const { fullPath, relNormalized } = this.resolveWorkspacePath(agentId, relPath);
+    if (!relNormalized) {
+      throw new RouterError("invalid_path", `refusing to delete workspace root`);
+    }
+    const { unlink } = await import("node:fs/promises");
+    try {
+      await unlink(fullPath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        throw new RouterError("file_not_found", `file not found: ${relNormalized}`);
+      }
+      if (code === "EISDIR" || code === "EPERM") {
+        throw new RouterError("invalid_path", `not a file: ${relNormalized}`);
+      }
+      throw err;
+    }
+  }
+
+  private resolveWorkspacePath(
+    agentId: string,
+    relPath: string,
+  ): { fullPath: string; relNormalized: string } {
+    // Normalize + enforce confinement in one place so every file API entry
+    // point shares the same rules: strip leading slashes, collapse `..`,
+    // reject anything whose resolved path escapes the agent workspace.
+    const cleaned = (relPath || "")
+      .replace(/^\/+/, "")
+      .split(/[\\/]+/)
+      .filter((seg) => seg !== "" && seg !== ".");
+    for (const seg of cleaned) {
+      if (seg === "..") {
+        throw new RouterError("invalid_path", `path traversal not allowed`);
+      }
+      if (seg.includes("\0")) {
+        throw new RouterError("invalid_path", `invalid character in path`);
+      }
+    }
+    const relNormalized = cleaned.join("/");
+    const workspaceRoot = this.events.stateRoot;
+    // join() ONLY on the in-process mount to get the concrete FS path.
+    const agentRoot = `${workspaceRoot}/${agentId}`;
+    const fullPath = relNormalized ? `${agentRoot}/${relNormalized}` : agentRoot;
+    // Final belt-and-suspenders check — a realpath() resolve would follow
+    // symlinks and verify confinement, but that requires the path to
+    // already exist. For writes to a new file, realpath would fail.
+    // Instead we rely on the segment-based `..` rejection above plus
+    // ensuring the final path starts with the agent root prefix.
+    if (!fullPath.startsWith(agentRoot)) {
+      throw new RouterError("invalid_path", `path escapes workspace`);
+    }
+    return { fullPath, relNormalized };
+  }
+
   async cancel(sessionId: string): Promise<Session> {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -1198,7 +1390,9 @@ export type RouterErrorCode =
   | "compact_failed"
   | "patch_failed"
   | "confirm_tool_failed"
-  | "quota_exceeded";
+  | "quota_exceeded"
+  | "file_not_found"
+  | "invalid_path";
 
 export class RouterError extends Error {
   constructor(

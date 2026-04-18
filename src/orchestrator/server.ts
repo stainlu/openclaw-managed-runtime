@@ -198,7 +198,7 @@ function eventResponse(event: Event) {
 
 function handleRouterError(err: unknown, c: Context): Response {
   if (err instanceof RouterError) {
-    if (err.code === "agent_not_found" || err.code === "session_not_found") {
+    if (err.code === "agent_not_found" || err.code === "session_not_found" || err.code === "file_not_found") {
       return c.json({ error: err.code, message: err.message }, 404);
     }
     if (err.code === "agent_archived") {
@@ -206,6 +206,9 @@ function handleRouterError(err: unknown, c: Context): Response {
     }
     if (err.code === "session_busy" || err.code === "session_not_running") {
       return c.json({ error: err.code, message: err.message }, 409);
+    }
+    if (err.code === "invalid_path") {
+      return c.json({ error: err.code, message: err.message }, 400);
     }
     if (err.code === "quota_exceeded") {
       return c.json({ error: err.code, message: err.message }, 429);
@@ -270,6 +273,10 @@ export function buildApp(deps: ServerDeps): Hono {
           list_versions: "GET /v1/agents/:agentId/versions",
           archive: "POST /v1/agents/:agentId/archive",
           run: "POST /v1/agents/:agentId/run",
+          list_files: "GET /v1/agents/:agentId/files?path=<rel>",
+          get_file: "GET /v1/agents/:agentId/files/<rel-path>",
+          put_file: "PUT /v1/agents/:agentId/files/<rel-path>",
+          delete_file: "DELETE /v1/agents/:agentId/files/<rel-path>",
         },
         environments: {
           create: "POST /v1/environments",
@@ -287,6 +294,7 @@ export function buildApp(deps: ServerDeps): Hono {
           stream_events: "GET /v1/sessions/:sessionId/events?stream=true",
           cancel: "POST /v1/sessions/:sessionId/cancel",
           compact: "POST /v1/sessions/:sessionId/compact",
+          logs: "GET /v1/sessions/:sessionId/logs?tail=<n>",
         },
         openai_compat: {
           chat_completions: "POST /v1/chat/completions",
@@ -411,6 +419,95 @@ export function buildApp(deps: ServerDeps): Hono {
     });
     if (!archived) return c.json({ error: "agent_not_found" }, 404);
     return c.json(agentResponse(archived));
+  });
+
+  // ---------- Agent workspace files ----------
+  //
+  // Exposes the per-agent workspace (host bind mount) over HTTP so
+  // developers can inspect what an agent produced, inject test fixtures,
+  // or clean up stale state. The resolveWorkspacePath() helper in the
+  // router handles path normalization and traversal rejection.
+
+  app.get("/v1/agents/:agentId/files", async (c) => {
+    const agentId = c.req.param("agentId");
+    const path = c.req.query("path") ?? "";
+    try {
+      const entries = await deps.router.listFiles(agentId, path);
+      return c.json({ agent_id: agentId, path, entries });
+    } catch (err) {
+      return handleRouterError(err, c);
+    }
+  });
+
+  app.get("/v1/agents/:agentId/files/*", async (c) => {
+    const agentId = c.req.param("agentId");
+    // Hono captures "*" into param "0" for legacy matchers and into the
+    // rest via req.path slicing. Build the relative path from the
+    // portion after `/files/`.
+    const url = new URL(c.req.url);
+    const prefix = `/v1/agents/${agentId}/files/`;
+    const relPath = decodeURIComponent(url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) : "");
+    try {
+      const buf = await deps.router.readFile(agentId, relPath);
+      return new Response(new Uint8Array(buf), {
+        status: 200,
+        headers: { "Content-Type": "application/octet-stream", "Content-Length": String(buf.length) },
+      });
+    } catch (err) {
+      return handleRouterError(err, c);
+    }
+  });
+
+  app.put("/v1/agents/:agentId/files/*", async (c) => {
+    const agentId = c.req.param("agentId");
+    const url = new URL(c.req.url);
+    const prefix = `/v1/agents/${agentId}/files/`;
+    const relPath = decodeURIComponent(url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) : "");
+    const body = await c.req.arrayBuffer();
+    const buf = Buffer.from(body);
+    try {
+      const result = await deps.router.writeFile(agentId, relPath, buf);
+      writeAudit(deps.audit, c, {
+        action: "agent.file.write",
+        target: agentId,
+        outcome: "ok",
+        metadata: { path: result.path, size: result.size },
+      });
+      return c.json({ agent_id: agentId, ...result });
+    } catch (err) {
+      writeAudit(deps.audit, c, {
+        action: "agent.file.write",
+        target: agentId,
+        outcome: err instanceof RouterError ? err.code : "error",
+        metadata: { path: relPath },
+      });
+      return handleRouterError(err, c);
+    }
+  });
+
+  app.delete("/v1/agents/:agentId/files/*", async (c) => {
+    const agentId = c.req.param("agentId");
+    const url = new URL(c.req.url);
+    const prefix = `/v1/agents/${agentId}/files/`;
+    const relPath = decodeURIComponent(url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) : "");
+    try {
+      await deps.router.deleteFile(agentId, relPath);
+      writeAudit(deps.audit, c, {
+        action: "agent.file.delete",
+        target: agentId,
+        outcome: "ok",
+        metadata: { path: relPath },
+      });
+      return c.json({ agent_id: agentId, path: relPath, deleted: true });
+    } catch (err) {
+      writeAudit(deps.audit, c, {
+        action: "agent.file.delete",
+        target: agentId,
+        outcome: err instanceof RouterError ? err.code : "error",
+        metadata: { path: relPath },
+      });
+      return handleRouterError(err, c);
+    }
   });
 
   // ---------- Environments (container configuration templates) ----------
@@ -656,6 +753,18 @@ export function buildApp(deps: ServerDeps): Hono {
         target: sessionId,
         outcome: err instanceof RouterError ? err.code : "error",
       });
+      return handleRouterError(err, c);
+    }
+  });
+
+  app.get("/v1/sessions/:sessionId/logs", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    const tailParam = c.req.query("tail");
+    const tail = tailParam ? Math.max(1, Math.min(10_000, Number(tailParam) || 200)) : 200;
+    try {
+      const text = await deps.router.logs(sessionId, tail);
+      return c.text(text);
+    } catch (err) {
       return handleRouterError(err, c);
     }
   });

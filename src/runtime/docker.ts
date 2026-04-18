@@ -156,6 +156,38 @@ export class DockerContainerRuntime implements ContainerRuntime {
     }
   }
 
+  async logs(containerId: string, opts?: { tail?: number }): Promise<string> {
+    const c = this.docker.getContainer(containerId);
+    const tail = opts?.tail ?? 200;
+    // dockerode returns a Buffer when follow=false, not a stream. That
+    // buffer is the Docker log multiplexed format (8-byte header + payload
+    // per frame). Call with stream=false so we get one buffer, then strip
+    // the frame headers. Each frame header is 8 bytes: [stream_type, 0, 0,
+    // 0, size_0, size_1, size_2, size_3] (BE size). stream_type: 1=stdout,
+    // 2=stderr. We flatten stdout+stderr into one chronological text blob;
+    // separate streams is out of scope for the snapshot endpoint.
+    const raw = await c.logs({
+      stdout: true,
+      stderr: true,
+      tail,
+      follow: false,
+      timestamps: false,
+    });
+    const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw));
+    const parts: string[] = [];
+    let i = 0;
+    while (i + 8 <= buf.length) {
+      const size = buf.readUInt32BE(i + 4);
+      if (i + 8 + size > buf.length) break;
+      parts.push(buf.slice(i + 8, i + 8 + size).toString("utf8"));
+      i += 8 + size;
+    }
+    // If no frame headers were detected (non-TTY-less containers, or
+    // edge cases), fall back to raw text.
+    if (parts.length === 0) return buf.toString("utf8");
+    return parts.join("");
+  }
+
   async waitForReady(container: Container, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     let lastError: unknown = null;

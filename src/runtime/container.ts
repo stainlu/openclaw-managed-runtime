@@ -91,6 +91,15 @@ export interface ContainerRuntime {
   /** Poll the container's /readyz until it returns 200 or the timeout is hit. */
   waitForReady(container: Container, timeoutMs: number): Promise<void>;
   /**
+   * Fetch a snapshot of the container's stdout+stderr. `tail` defaults to
+   * 200 and is bounded by the backend (Docker uses its configured log
+   * driver retention). Returns the raw text, newline-separated. Used by
+   * the orchestrator to expose agent logs for debugging via HTTP — the
+   * `/v1/sessions/:id/logs` endpoint. Does NOT stream — streaming support
+   * is a separate method if and when we need it.
+   */
+  logs(containerId: string, opts?: { tail?: number }): Promise<string>;
+  /**
    * Idempotently create a Docker network. If it already exists, no-op.
    *
    * Called with no args, creates the backend's default network
