@@ -184,6 +184,93 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
     padding: 10px 14px;
     min-height: 0;
   }
+  .tabbar {
+    display: flex;
+    gap: 0;
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .tabbar .tab {
+    padding: 8px 16px;
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    font-family: inherit;
+    background: transparent;
+    border-top: none;
+    border-left: none;
+    border-right: none;
+  }
+  .tabbar .tab:hover { color: var(--text); background: var(--border-muted); }
+  .tabbar .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  .tabbar .spacer { flex: 1; }
+  .tabbar .tab-action {
+    align-self: center;
+    margin-right: 10px;
+    padding: 4px 10px;
+    font-size: 11px;
+    background: var(--border);
+    color: var(--text);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .tabbar .tab-action:hover { background: var(--border-muted); }
+  .tabbar .tab-action:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .logs-view, .files-view {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 14px;
+    min-height: 0;
+  }
+  .logs-view pre {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text-muted);
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin: 0;
+  }
+  .files-view .crumb {
+    padding: 4px 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: ui-monospace, monospace;
+    margin-bottom: 6px;
+  }
+  .files-view .crumb a { color: var(--accent); cursor: pointer; }
+  .files-view .entry {
+    display: grid;
+    grid-template-columns: 20px 1fr 80px 100px;
+    gap: 8px;
+    padding: 4px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 12px;
+  }
+  .files-view .entry:hover { background: var(--border-muted); }
+  .files-view .entry .icon { color: var(--text-dim); font-family: ui-monospace, monospace; }
+  .files-view .entry .name { font-family: ui-monospace, monospace; color: var(--text); }
+  .files-view .entry .size, .files-view .entry .mtime { text-align: right; color: var(--text-dim); font-family: ui-monospace, monospace; }
+  .files-view .entry.dir .name { color: var(--accent); }
+  .files-view .file-content {
+    margin-top: 10px;
+    padding: 10px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 400px;
+    overflow: auto;
+  }
   .event {
     margin-bottom: 8px;
     padding: 8px 12px;
@@ -417,6 +504,17 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
           </select>
           <div class="hint">Tools that will run inside the container. Empty tools array = text-only (safest).</div>
         </div>
+        <div class="field">
+          <label>Thinking level <span class="muted">— Pi extended-thinking budget</span></label>
+          <select id="fld-thinking">
+            <option value="off">off (default; no thinking)</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+          </select>
+          <div class="hint">Only affects reasoning-capable models (e.g. <code>moonshot/kimi-k2-thinking</code>, <code>anthropic/claude-*</code>). Non-reasoning models silently ignore this.</div>
+        </div>
       </div>
       <div class="modal-footer">
         <button class="secondary" data-close="1">Cancel</button>
@@ -436,6 +534,9 @@ const S = {
   detailPollTimer: null,
   listPollTimer: null,
   sessionsPollTimer: null,
+  activeTab: "trace",   // "trace" | "logs" | "files"
+  filesPath: "",         // current directory in the files tab
+  filesContent: null,    // { path, text } when a file is open for preview
 };
 
 // ---------- fetch helpers ----------
@@ -610,20 +711,13 @@ function renderDetail(session, events) {
     ? (events[events.length - 1].created_at - events[0].created_at)
     : 0;
   const toolCount = rows.filter(r => r.kind === "tool").length;
+  const tab = S.activeTab || "trace";
 
-  const eventsHtml = rows.length
-    ? rows.map((r, i) => renderRow(r, i)).join("")
-    : '<div class="muted" style="padding: 20px; text-align: center;">No events yet. Send a message below.</div>';
-
-  const timelineHtml = rows.length
-    ? rows.map((r, i) => {
-        const cls = r.kind === "tool" && r.isError ? "tool-error" : r.kind;
-        const title = r.kind === "tool"
-          ? r.toolName + (r.duration != null ? \` · \${fmtDuration(r.duration)}\` : "")
-          : r.kind + (r.summary ? ": " + r.summary.slice(0, 60) : "");
-        return \`<div class="bead \${cls}" data-idx="\${i}" title="\${escapeAttr(title)}"></div>\`;
-      }).join("")
-    : "";
+  const tabBody = tab === "trace"
+    ? renderTraceTab(rows, isRunning)
+    : tab === "logs"
+      ? \`<div class="logs-view" id="logs-view"><div class="muted">Loading…</div></div>\`
+      : \`<div class="files-view" id="files-view"><div class="muted">Loading…</div></div>\`;
 
   pane.innerHTML = \`
     <div class="detail">
@@ -637,19 +731,66 @@ function renderDetail(session, events) {
         <span class="label">Tool calls</span><span class="value">\${toolCount}</span>
         <span class="label">Last event</span><span class="value">\${fmtMs(session.last_event_at)}</span>
       </div>
-      \${timelineHtml ? \`<div class="timeline">\${timelineHtml}</div>\` : ""}
-      <div class="detail-events" id="detail-events">\${eventsHtml}</div>
-      <div class="composer">
-        <textarea id="composer-text" placeholder="Type a message and press Enter (Shift+Enter for newline)" \${isRunning ? "disabled" : ""}></textarea>
-        <div class="compose-actions">
-          <button id="btn-send" \${isRunning ? "disabled" : ""}>\${isRunning ? "Running…" : "Send"}</button>
-          \${isRunning ? '<button id="btn-cancel" class="danger">Cancel</button>' : ''}
-        </div>
+      <div class="tabbar">
+        <button class="tab \${tab === "trace" ? "active" : ""}" data-tab="trace">Trace</button>
+        <button class="tab \${tab === "logs" ? "active" : ""}" data-tab="logs">Container logs</button>
+        <button class="tab \${tab === "files" ? "active" : ""}" data-tab="files">Workspace files</button>
+        <span class="spacer"></span>
+        <button class="tab-action" id="btn-compact" \${isRunning ? "disabled" : ""} title="Ask openclaw to summarize this session's history to free context">Compact</button>
       </div>
+      \${tabBody}
     </div>
   \`;
 
-  // Event expand/collapse for tool rows (and any row with a body)
+  // Tab switching
+  pane.querySelectorAll(".tabbar .tab").forEach((el) => {
+    el.addEventListener("click", () => {
+      S.activeTab = el.dataset.tab;
+      renderDetail(session, events);
+      if (S.activeTab === "logs") refreshLogs();
+      if (S.activeTab === "files") refreshFiles();
+    });
+  });
+
+  const compactBtn = document.getElementById("btn-compact");
+  if (compactBtn) compactBtn.onclick = compactSession;
+
+  if (tab === "trace") {
+    wireTraceInteractions(pane, isRunning);
+  } else if (tab === "logs") {
+    refreshLogs();
+  } else if (tab === "files") {
+    refreshFiles();
+  }
+}
+
+function renderTraceTab(rows, isRunning) {
+  const eventsHtml = rows.length
+    ? rows.map((r, i) => renderRow(r, i)).join("")
+    : '<div class="muted" style="padding: 20px; text-align: center;">No events yet. Send a message below.</div>';
+  const timelineHtml = rows.length
+    ? rows.map((r, i) => {
+        const cls = r.kind === "tool" && r.isError ? "tool-error" : r.kind;
+        const title = r.kind === "tool"
+          ? r.toolName + (r.duration != null ? \` · \${fmtDuration(r.duration)}\` : "")
+          : r.kind + (r.summary ? ": " + r.summary.slice(0, 60) : "");
+        return \`<div class="bead \${cls}" data-idx="\${i}" title="\${escapeAttr(title)}"></div>\`;
+      }).join("")
+    : "";
+  return \`
+    \${timelineHtml ? \`<div class="timeline">\${timelineHtml}</div>\` : ""}
+    <div class="detail-events" id="detail-events">\${eventsHtml}</div>
+    <div class="composer">
+      <textarea id="composer-text" placeholder="Type a message and press Enter (Shift+Enter for newline)" \${isRunning ? "disabled" : ""}></textarea>
+      <div class="compose-actions">
+        <button id="btn-send" \${isRunning ? "disabled" : ""}>\${isRunning ? "Running…" : "Send"}</button>
+        \${isRunning ? '<button id="btn-cancel" class="danger">Cancel</button>' : ''}
+      </div>
+    </div>
+  \`;
+}
+
+function wireTraceInteractions(pane, _isRunning) {
   pane.querySelectorAll(".event .ev-header").forEach((h) => {
     h.addEventListener("click", () => {
       const body = h.parentElement.querySelector(".ev-body");
@@ -659,8 +800,6 @@ function renderDetail(session, events) {
       if (chev) chev.classList.toggle("open");
     });
   });
-
-  // Timeline bead click — scroll the matching row into view
   pane.querySelectorAll(".timeline .bead").forEach((b) => {
     b.addEventListener("click", () => {
       const idx = b.dataset.idx;
@@ -672,22 +811,141 @@ function renderDetail(session, events) {
       }
     });
   });
-
   const ev = document.getElementById("detail-events");
-  ev.scrollTop = ev.scrollHeight;
+  if (ev) ev.scrollTop = ev.scrollHeight;
 
-  document.getElementById("btn-send").onclick = sendMessage;
+  const sendBtn = document.getElementById("btn-send");
+  if (sendBtn) sendBtn.onclick = sendMessage;
   const ta = document.getElementById("composer-text");
-  ta.onkeydown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  };
-  ta.focus();
-
+  if (ta) {
+    ta.onkeydown = (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    };
+    ta.focus();
+  }
   const cancelBtn = document.getElementById("btn-cancel");
   if (cancelBtn) cancelBtn.onclick = cancelSession;
+}
+
+async function refreshLogs() {
+  if (S.activeTab !== "logs" || !S.selectedSessionId) return;
+  const el = document.getElementById("logs-view");
+  if (!el) return;
+  try {
+    const res = await fetch(\`/v1/sessions/\${S.selectedSessionId}/logs?tail=500\`);
+    if (!res.ok) {
+      const body = await res.text();
+      el.innerHTML = \`<div class="muted" style="color: var(--warn);">Logs unavailable: \${escapeHtml(body)}</div>\`;
+      return;
+    }
+    const text = await res.text();
+    el.innerHTML = \`<pre>\${escapeHtml(text)}</pre>\`;
+    // Auto-scroll to bottom so the latest activity is visible.
+    el.scrollTop = el.scrollHeight;
+  } catch (err) {
+    el.innerHTML = \`<div class="muted" style="color: var(--danger);">Error: \${escapeHtml(String(err.message || err))}</div>\`;
+  }
+}
+
+async function refreshFiles() {
+  if (S.activeTab !== "files" || !S.selectedAgentId) return;
+  const el = document.getElementById("files-view");
+  if (!el) return;
+  const path = S.filesPath || "";
+  const crumbs = ["<a data-path=\\"\\">/</a>"];
+  if (path) {
+    const parts = path.split("/");
+    let acc = "";
+    for (const p of parts) {
+      acc = acc ? \`\${acc}/\${p}\` : p;
+      crumbs.push(\` <a data-path="\${escapeAttr(acc)}">\${escapeHtml(p)}</a> /\`);
+    }
+  }
+  const contentHtml = S.filesContent
+    ? \`<div class="ev-section-label" style="margin-top: 12px;">\${escapeHtml(S.filesContent.path)}</div><div class="file-content">\${escapeHtml(S.filesContent.text)}</div>\`
+    : "";
+  try {
+    const res = await fetch(\`/v1/agents/\${S.selectedAgentId}/files?path=\${encodeURIComponent(path)}\`);
+    if (!res.ok) {
+      const body = await res.text();
+      el.innerHTML = \`<div class="muted" style="color: var(--warn);">\${escapeHtml(body)}</div>\`;
+      return;
+    }
+    const data = await res.json();
+    const rows = (data.entries || []).map(e => \`
+      <div class="entry \${e.type}" data-name="\${escapeAttr(e.name)}" data-type="\${e.type}" data-path="\${escapeAttr(e.path)}">
+        <span class="icon">\${e.type === "dir" ? "▸" : "·"}</span>
+        <span class="name">\${escapeHtml(e.name)}</span>
+        <span class="size">\${e.type === "dir" ? "—" : fmtBytes(e.size)}</span>
+        <span class="mtime">\${fmtMs(e.mtime)}</span>
+      </div>
+    \`).join("");
+    el.innerHTML = \`
+      <div class="crumb">\${crumbs.join("")}</div>
+      \${rows || '<div class="muted">Empty directory.</div>'}
+      \${contentHtml}
+    \`;
+    el.querySelectorAll(".crumb a").forEach((a) => {
+      a.addEventListener("click", () => {
+        S.filesPath = a.dataset.path;
+        S.filesContent = null;
+        refreshFiles();
+      });
+    });
+    el.querySelectorAll(".entry").forEach((row) => {
+      row.addEventListener("click", async () => {
+        const p = row.dataset.path;
+        if (row.dataset.type === "dir") {
+          S.filesPath = p;
+          S.filesContent = null;
+          refreshFiles();
+          return;
+        }
+        try {
+          const r = await fetch(\`/v1/agents/\${S.selectedAgentId}/files/\${p.split("/").map(encodeURIComponent).join("/")}\`);
+          if (!r.ok) {
+            toast("Read failed: " + r.status, true);
+            return;
+          }
+          const buf = await r.arrayBuffer();
+          const text = new TextDecoder("utf-8", { fatal: false }).decode(buf).slice(0, 200_000);
+          S.filesContent = { path: p, text };
+          refreshFiles();
+        } catch (err) {
+          toast("Read error: " + err.message, true);
+        }
+      });
+    });
+  } catch (err) {
+    el.innerHTML = \`<div class="muted" style="color: var(--danger);">Error: \${escapeHtml(String(err.message || err))}</div>\`;
+  }
+}
+
+async function compactSession() {
+  if (!S.selectedSessionId) return;
+  try {
+    const res = await fetch(\`/v1/sessions/\${S.selectedSessionId}/compact\`, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.text();
+      toast("Compact: " + body, true);
+      return;
+    }
+    toast("Compaction summary generated");
+    refreshDetail();
+  } catch (err) {
+    toast("Compact error: " + err.message, true);
+  }
+}
+
+function fmtBytes(n) {
+  if (!n && n !== 0) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
 }
 
 /**
@@ -891,6 +1149,7 @@ function openNewAgent() {
     const model = document.getElementById("fld-model").value.trim();
     const instructions = document.getElementById("fld-instructions").value.trim();
     const policy = document.getElementById("fld-policy").value;
+    const thinkingLevel = document.getElementById("fld-thinking").value;
     if (!model) { toast("Model is required", true); return; }
     try {
       const body = {
@@ -898,6 +1157,7 @@ function openNewAgent() {
         instructions,
         tools: [],
         permissionPolicy: { type: policy },
+        thinkingLevel,
       };
       const res = await api("/v1/agents", { method: "POST", body: JSON.stringify(body) });
       backdrop.remove();
