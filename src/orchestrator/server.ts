@@ -21,6 +21,7 @@ import type {
   EnvironmentStore,
   SessionStore,
 } from "../store/types.js";
+import { portalHtml } from "./portal.js";
 import { AgentRouter, RouterError } from "./router.js";
 import {
   CreateAgentRequestSchema,
@@ -238,8 +239,16 @@ export function buildApp(deps: ServerDeps): Hono {
 
   // Self-documenting root. A developer landing on the orchestrator gets the
   // full endpoint map without needing to read docs first.
-  app.get("/", (c) =>
-    c.json({
+  //
+  // Browsers (Accept: text/html) get the single-page console at the same
+  // URL instead. No client-side routing — the portal lives entirely in
+  // portal.ts and talks to the same /v1/* HTTP endpoints the SDKs use.
+  app.get("/", (c) => {
+    const accept = c.req.header("accept") ?? "";
+    if (accept.includes("text/html")) {
+      return c.html(portalHtml({ authRequired: Boolean(deps.apiToken), version: deps.version }));
+    }
+    return c.json({
       name: "OpenClaw Managed Agents",
       description: "The open alternative to Claude Managed Agents.",
       version: deps.version,
@@ -288,8 +297,8 @@ export function buildApp(deps: ServerDeps): Hono {
           metrics: "GET /metrics",
         },
       },
-    }),
-  );
+    });
+  });
 
   app.get("/healthz", (c) => c.json({ ok: true, version: deps.version }));
 
