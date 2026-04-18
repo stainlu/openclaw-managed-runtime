@@ -4,23 +4,58 @@ The open alternative to Claude Managed Agents. Run autonomous AI agents via API 
 
 Built on [OpenClaw](https://github.com/openclaw/openclaw), the most popular open-source AI agent framework.
 
-## Why this exists
+## What this is
 
-Anthropic's [Claude Managed Agents](https://www.anthropic.com/engineering/managed-agents) is Claude-only, Anthropic-hosted, and charges $0.08/session-hour on top of tokens. OpenClaw Managed Agents is the open counter: same architectural pattern (stateless orchestrator + per-session container + append-only event log), but you pick the model, you pick the cloud, and there's no platform tax.
+**The name says it:** `openclaw-managed-agents` = **OpenClaw** (the agent runtime — multi-provider, 53 built-in skills, MCP-native, Pi's durable JSONL event log) + **Managed Agents** (the four-primitive API shape — Agent / Environment / Session / Event — that Claude Managed Agents made standard).
+
+You POST an Agent (model + system prompt + tools + MCP servers), open a Session against it, send Events, stream back Events. Under the hood: one isolated Docker container per session running OpenClaw, SQLite for orchestrator metadata, SSE for streaming, WebSocket control plane for cancel / model-override / tool-confirmation. Deploy anywhere Docker runs.
+
+It's the layer that turns OpenClaw from a personal AI assistant into a programmatic agent service your app can call.
+
+## vs. Claude Managed Agents
 
 | | Claude Managed Agents | OpenClaw Managed Agents |
 |---|---|---|
-| Models | Claude only | Any — Anthropic, OpenAI, Gemini, Moonshot, DeepSeek, Mistral, xAI, and [15+ more](https://openclaw.ai) |
-| Hosting | Anthropic's cloud only | Any cloud or VPS with Docker — from $0/month (Oracle free tier) to $4/month (Hetzner) |
+| Models | Claude only | Any — Anthropic, OpenAI, Gemini, Moonshot, DeepSeek, Mistral, xAI, Bedrock, OpenRouter, Groq, and [more](https://openclaw.ai) |
+| Hosting | Anthropic's cloud only | Any cloud or VPS with Docker — from $0/month (GCE free tier) to $4/month (Hetzner) |
 | Source | Closed | Open source (MIT) |
-| Platform tax | $0.08/session-hour | None |
+| Platform tax | $0.08/session-hour on top of tokens | None |
 | Data | Anthropic's infrastructure | Your disk, your VPC, your control |
-| Multi-agent | Research preview (gated) | GA — inspectable child sessions, allowlists, depth caps |
+| Multi-agent / subagents | Research preview (gated) | GA — children are first-class inspectable sessions |
 | Permission policy | `always_allow` + `always_ask` | `always_allow` + `deny` + `always_ask` |
-| Subagent observability | Opaque (tool result only) | First-class — every child session is inspectable via the same API |
-| Event types | 12+ types | 10 types + synthetic session status events |
-| Agent versioning | Immutable history | Immutable history + optimistic concurrency + archive |
+| Subagent observability | Opaque (tool result only) | First-class — every child session visible through the same API |
+| Agent versioning | Immutable history + archive | Immutable history + archive + optimistic concurrency on `PATCH` |
+| MCP servers | First-class `mcp_servers` field | First-class `mcpServers` field |
+| Streaming | Real SSE token deltas | Real SSE token deltas |
+| Restart safety | Not documented | Durable event queue, HMAC secret persistence, running-container adoption, observer-side run completion |
+| Per-session quotas | Not exposed | `maxCostUsdPerSession`, `maxTokensPerSession`, `maxWallDurationMs` |
+| Audit log | Telemetry only | Queryable `GET /v1/audit` |
+| OpenTelemetry | Built-in | Config-passthrough to OpenClaw's built-in OTEL |
 | SDK | 7 languages + CLI | Python + TypeScript + OpenAI drop-in |
+| Production track record | Notion, Rakuten, Asana, Sentry, Vibecode | New project, no deployed customers yet |
+
+Both are solid engineering. The choice is about model/cloud freedom, platform-tax economics, and whether you want the runtime as a black box or as code you can read.
+
+## vs. running OpenClaw directly on a cloud VPS
+
+[AWS's Lightsail OpenClaw blueprint](https://aws.amazon.com/blogs/aws/introducing-openclaw-on-amazon-lightsail-to-run-your-autonomous-private-ai-agents/) (or running OpenClaw yourself via its own CLI on a VPS) gives you a personal OpenClaw instance. That's great for *you* — one operator, one browser pairing, chat through WhatsApp / Telegram / Discord, use it as your Jarvis.
+
+OpenClaw Managed Agents is for when you want to **build a product** with OpenClaw instead of just using one.
+
+| | OpenClaw directly on a VPS (e.g. Lightsail blueprint) | OpenClaw Managed Agents |
+|---|---|---|
+| Who it's for | One human operator | Developers building programmatic agent products |
+| Access | Browser pairing + SSH CLI | HTTP REST + SSE + WebSocket |
+| Sessions | 1 shared operator pairing | N long-lived API sessions, 1 container each, isolated |
+| Channels | WhatsApp / Telegram / Discord / Slack built-in | None — programmatic only |
+| Agent management | Edit `openclaw.json` + restart the gateway | `POST /v1/agents` / `PATCH` / `archive` — versioned with optimistic concurrency, no restart needed |
+| Session isolation | Single workspace | Per-session Docker container with cgroup limits + bind-mounted state |
+| Restart safety | Personal data survives; in-flight work lost | Durable event queue, HMAC token persistence, container reattach on orchestrator restart |
+| Concurrency | One user at a time | Warm pool + active pool; 5-7 concurrent sessions on a $4 Hetzner CAX11 |
+| API shape | Gateway's OpenAI-compat + control plane | Full 4-primitive REST matching the Claude Managed Agents shape |
+| Deploy | Click Lightsail blueprint | `./scripts/deploy-hetzner.sh` etc. |
+
+Not a competitor to the personal OpenClaw — a different layer. OpenClaw is the framework inside each of our containers. This project is the managed service around it.
 
 ## Quick start
 
@@ -37,7 +72,7 @@ docker compose up --build -d
 Create an agent, open a session, send a message:
 
 ```bash
-# Create an agent template
+# Create an agent
 AGENT=$(curl -s -X POST http://localhost:8080/v1/agents \
   -H 'Content-Type: application/json' \
   -d '{"model":"moonshot/kimi-k2.5","instructions":"You are a research assistant."}' \
@@ -91,7 +126,7 @@ for await (const event of client.sessions.stream(session.session_id)) {
 }
 ```
 
-Or use the OpenAI SDK — just change `base_url`:
+Or point the **OpenAI SDK** at us — just change `base_url` and it Just Works, including real token-level streaming:
 
 ```python
 from openai import OpenAI
@@ -102,11 +137,20 @@ client = OpenAI(
     default_headers={"x-openclaw-agent-id": "<your-agent-id>"},
 )
 
+# Non-streaming
 r = client.chat.completions.create(
     model="placeholder",
     messages=[{"role": "user", "content": "Summarize the agent platform landscape."}],
 )
 print(r.choices[0].message.content)
+
+# Streaming — real per-token SSE frames, not emulated
+for chunk in client.chat.completions.create(
+    model="placeholder",
+    messages=[{"role": "user", "content": "Write a haiku about containers."}],
+    stream=True,
+):
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
 ## Core concepts
@@ -115,8 +159,8 @@ Four primitives, matching Claude Managed Agents' model:
 
 | Concept | What it is | API |
 |---|---|---|
-| **Agent** | Reusable config: model, instructions, tools, permission policy, delegation rules. Versioned — updates create immutable history. | `POST/GET/PATCH/DELETE /v1/agents` |
-| **Environment** | Container config: packages (pip/apt/npm), networking. Composed with agents at session time. | `POST/GET/DELETE /v1/environments` |
+| **Agent** | Reusable config: model, instructions, tools, MCP servers, permission policy, delegation rules, quotas. Versioned — updates create immutable history. | `POST/GET/PATCH/DELETE /v1/agents` |
+| **Environment** | Container config: packages (pip / apt / npm), networking policy. Composed with agents at session time. | `POST/GET/DELETE /v1/environments` |
 | **Session** | A running agent in an environment. Long-lived, multi-turn, one container per session. | `POST/GET/DELETE /v1/sessions` |
 | **Event** | Messages, tool calls, thinking blocks, status changes in and out of a session. SSE streaming. | `POST/GET /v1/sessions/:id/events` |
 
@@ -129,7 +173,8 @@ The orchestrator is self-documenting — `curl http://localhost:8080/` returns t
 ```
 POST   /v1/agents                         # create
        body: { model, instructions, tools?, name?,
-               permissionPolicy?, callableAgents?, maxSubagentDepth? }
+               permissionPolicy?, callableAgents?, maxSubagentDepth?,
+               mcpServers?, quota? }
 GET    /v1/agents                         # list all
 GET    /v1/agents/:id                     # get latest version
 PATCH  /v1/agents/:id                     # update — { version, ...fields }, 409 on conflict
@@ -143,6 +188,13 @@ Permission policy options for `permissionPolicy`:
 - `{"type":"deny","tools":["bash","write"]}` — specified tools are blocked entirely
 - `{"type":"always_ask","tools":["bash"]}` — specified tools pause for client confirmation via `user.tool_confirmation`
 
+Per-session quotas (optional, on `quota`):
+- `maxCostUsdPerSession` — refuse further turns once cumulative cost crosses the cap
+- `maxTokensPerSession` — same, for `tokens_in + tokens_out`
+- `maxWallDurationMs` — session expires after this many ms since creation
+
+Rejected runs surface as `HTTP 429 quota_exceeded`.
+
 **Environments** (container configuration)
 
 ```
@@ -151,6 +203,10 @@ GET    /v1/environments                   # list all
 GET    /v1/environments/:id               # get one
 DELETE /v1/environments/:id               # 409 if sessions reference it
 ```
+
+Networking modes:
+- `{"type":"unrestricted"}` (default) — full egress on the shared Docker bridge
+- `{"type":"limited","allowedHosts":["api.openai.com","*.anthropic.com"]}` — per-session confined `--internal` network + egress-proxy sidecar. HTTP/HTTPS filtered at TCP 8118, DNS filtered at UDP 53. Enforced at the Docker bridge, not inside the agent container; raw-socket / DNS-exfil paths both closed. Enable by setting `OPENCLAW_EGRESS_PROXY_IMAGE` + `OPENCLAW_CONTROL_PLANE_NETWORK` on the orchestrator. See [`docs/designs/networking-limited.md`](./docs/designs/networking-limited.md) and [`test/e2e-networking.sh`](./test/e2e-networking.sh) for the design + 9-case enforcement proof.
 
 **Sessions** (the main interaction surface)
 
@@ -162,6 +218,7 @@ DELETE /v1/sessions/:id                   # tears down container + data
 POST   /v1/sessions/:id/events            # send message or tool confirmation (see below)
 GET    /v1/sessions/:id/events            # full event history
 GET    /v1/sessions/:id/events?stream=true  # SSE: catch-up + live tail-follow
+                                           # supports Last-Event-ID header for resume
 POST   /v1/sessions/:id/cancel            # abort in-flight run
 ```
 
@@ -173,6 +230,19 @@ POST events accepts two event types:
 
 ```
 POST   /v1/chat/completions              # OpenAI SDK drop-in (x-openclaw-agent-id header required)
+```
+
+Real per-token SSE streaming when `stream: true`. Busy sessions return `HTTP 409 session_busy` so streams don't interleave with the event queue.
+
+**Audit log**
+
+```
+GET    /v1/audit?since=<ts>&until=<ts>&action=<verb>&target=<id>&limit=<n>
+                                          # queryable structured log of mutating API calls;
+                                          # all params optional; `action` supports LIKE
+                                          # wildcards (e.g. "agent.%"); newest-first, limit
+                                          # 1..1000 (default 100).
+                                          # retained OPENCLAW_AUDIT_RETENTION_DAYS (default 30)
 ```
 
 ## Event types
@@ -194,7 +264,7 @@ Events from `GET /v1/sessions/:id/events` and the SSE stream:
 | `session.status_running` | SSE only | Session transitioned to running |
 | `session.status_failed` | SSE only | Session transitioned to failed |
 
-The SSE stream emits an initial status event on connect and checks for status transitions on every yielded event and every 15-second heartbeat.
+The SSE stream emits an initial status event on connect, checks for status transitions on every yielded event + every 15-second heartbeat, and accepts a resume cursor via the `Last-Event-ID` header or `?after=<event_id>` query param so reconnecting clients don't replay history they've already seen.
 
 ## Key features
 
@@ -202,27 +272,39 @@ The SSE stream emits an initial status event on connect and checks for status tr
 
 **Permission policy.** Three modes: `always_allow` (default), `deny` (block specific tools entirely), and `always_ask` (pause for client confirmation before executing specific tools). The `always_ask` flow uses OpenClaw's `before_tool_call` plugin hook with `requireApproval` — the agent blocks, the orchestrator surfaces a confirmation request via SSE, and the client resolves it via `user.tool_confirmation`.
 
-**Environments.** Declare packages (`pip`, `apt`, `npm`) and networking policy per environment. Compose any agent with any environment at session creation. Packages install inside the container before the agent boots. Two properties worth calling out: `networking: "limited"` enforces a hostname allowlist per session via a confined `--internal` Docker network + an egress-proxy sidecar that filters HTTP/HTTPS at TCP 8118 and DNS at UDP 53 (see [`docs/designs/networking-limited.md`](./docs/designs/networking-limited.md) and [`test/e2e-networking.sh`](./test/e2e-networking.sh) for the 9-case enforcement proof, run in CI on native Linux); enable by setting `OPENCLAW_EGRESS_PROXY_IMAGE` + `OPENCLAW_CONTROL_PLANE_NETWORK`; and `npm install` runs arbitrary package postinstall scripts at container boot, so when agent creation is open to untrusted users, package names should come from a trusted source.
+**MCP servers.** Agents declare `mcpServers` (object keyed by server name, value is either a stdio `{command, args, env, cwd}` or HTTP `{url, headers}` config). The orchestrator forwards them into the container's `openclaw.json` at spawn time; OpenClaw's MCP integration handles the rest. Matches Claude Managed Agents' shape so SDKs porting across translate without rewrites.
 
-**Pre-warmed container pool.** When a non-delegating agent is created, a container boots in the background. The first session on that agent claims the pre-warmed container instead of cold-spawning. After claiming, the pool replenishes automatically. Active containers are reaped after `OPENCLAW_IDLE_TIMEOUT_MS` (default 10 min) of no use; the warm bucket is bounded by `OPENCLAW_MAX_WARM_CONTAINERS` (default 5) with oldest-first eviction and reaps entries after `OPENCLAW_WARM_IDLE_TIMEOUT_MS`. Pool reuse measured at 4s vs 78s cold-start. Delegating agents (`callableAgents` or `maxSubagentDepth > 0`) skip warm-up to keep subagent token lineage correct.
+**Per-session quotas.** `maxCostUsdPerSession` / `maxTokensPerSession` / `maxWallDurationMs` set on the agent (inherited by every session derived from it). Enforced at the runtime edge before each turn; rejected runs return `HTTP 429 quota_exceeded` with a `quota_rejections_total{kind="cost"|"tokens"|"duration"}` metric increment. Soft-ceiling semantics: a session at $0.99 with a $1.00 cap gets one more turn, the next post rejects — matches operator intent without mid-turn aborts.
 
-**Delegated subagents.** An agent can delegate tasks to other agents via the `openclaw-call-agent` CLI. Children are first-class sessions — fully inspectable through the same API. Allowlists, depth caps, and HMAC-signed tokens enforce who can call whom. Unlike Claude Managed Agents, subagent transcripts are not hidden behind an opaque tool result.
+**Networking: `limited`.** Per-session confined `--internal` Docker network + egress-proxy sidecar filtering hostname allowlist at HTTP + DNS layers. Enforcement at the Docker bridge, not inside the container — raw-socket / DNS-exfil paths both closed. Proven with a 9-case E2E script in CI on native Linux (`test/e2e-networking.sh`).
 
-**Rich event stream.** 10 event types from the JSONL (messages, tool calls, tool results, thinking blocks, model changes, compaction summaries) plus synthetic session status events in the SSE stream. `GET /v1/sessions/:id/events?stream=true` catches up on past events then tail-follows new ones in real time.
+**Pre-warmed container pool.** When a non-delegating agent is created, a container boots in the background. The first session on that agent claims the pre-warmed container instead of cold-spawning. After claiming, the pool replenishes automatically. Active containers are reaped after `OPENCLAW_IDLE_TIMEOUT_MS` (default 10 min) of no use; the warm bucket is bounded by `OPENCLAW_MAX_WARM_CONTAINERS` (default 5) with oldest-first eviction. Measured pool reuse: 4 s vs 78 s cold-start on Hetzner CAX11.
+
+**Delegated subagents.** An agent can delegate tasks to other agents via the `openclaw-call-agent` CLI. Children are first-class sessions — fully inspectable through the same API. Allowlists, depth caps, and HMAC-signed tokens enforce who can call whom. Subagent transcripts are not hidden behind an opaque tool result.
+
+**Real token-level streaming on `POST /v1/chat/completions`.** `stream: true` pipes the container's real SSE chunks byte-for-byte to the caller — OpenAI-compatible `ChatCompletionChunk` frames with `[DONE]` terminator. A busy session returns `HTTP 409 session_busy` so streams don't interleave with the event queue; client disconnect aborts the relay but the container's turn continues server-side (Pi's JSONL retains truth).
+
+**Restart safety.** Four invariants that survive orchestrator crash or deploy:
+1. Parent-token HMAC secret persisted to SQLite — outstanding subagent delegation tokens stay valid across restarts.
+2. Durable event queue (SQLite) — committed `{queued: true}` events are re-dispatched on startup.
+3. Running-container adoption — `DockerContainerRuntime.listManaged()` + `SessionContainerPool.adopt()` reattach labelled containers whose sessions still exist; orphaned containers are selectively stopped. Running sessions that can't be adopted get a recoverable `"post a new message to resume"` error.
+4. Observer-side run completion — WS `chat` event subscription on adopted running sessions finalizes the in-flight turn when Pi emits the final message, rolls up cost from JSONL, drains queued events.
 
 **Cancel + queue.** Cancel aborts the in-flight run via the WebSocket control plane. Events posted to a busy session queue automatically and drain in order.
 
 **Per-turn cost.** Each session tracks rolling `tokens_in`, `tokens_out`, and `cost_usd` from the provider's own billing data — cache-aware, not a static price sheet. Anthropic, OpenAI, Google, xAI, Mistral, OpenRouter, and Bedrock auto-report non-zero cost with no config. Moonshot's upstream catalog currently ships zero prices (real prices tracked in [openclaw/openclaw#67928](https://github.com/openclaw/openclaw/pull/67928)); once that PR lands and the openclaw pin bumps, Moonshot reports real cost via the same path with zero runtime changes.
 
-**OpenAI SDK drop-in.** Point any OpenAI SDK at `http://<host>:8080/v1` with an `x-openclaw-agent-id` header. Sticky sessions via the `user` field. `stream: true` pipes real token-level SSE chunks from the provider through the container's OpenClaw gateway straight to the client (OpenAI-compatible `ChatCompletionChunk` frames with `[DONE]` terminator) — a busy session returns HTTP 409 `session_busy` so streaming doesn't interleave with the event queue.
+**OpenAI SDK drop-in.** Point any OpenAI SDK at `http://<host>:8080/v1` with an `x-openclaw-agent-id` header. Sticky sessions via the `user` field. Real per-token streaming (not emulated) when `stream: true`.
 
-**Persistent state.** SQLite (WAL mode) for agent templates, environments, and session metadata. Pi's JSONL files for the event log. Both survive orchestrator restarts. Pre-built multi-arch images (amd64 + arm64) published to GHCR on every push to `main`.
+**Persistent state.** SQLite (WAL mode) for agents, environments, session metadata, queued events, audit log, and the HMAC secret for subagent tokens. Pi's JSONL files for the event log. All of it survives orchestrator restarts. Pre-built multi-arch images (amd64 + arm64) published to GHCR on every push to `main`.
 
-**Observability.** Structured pino logs in JSON (production) or pretty TTY (dev); every log line carries `request_id`, `agent_id`, `session_id` automatically via AsyncLocalStorage. Prometheus metrics at `GET /metrics` — HTTP counters + duration histograms, pool active/warm gauges, spawn + run duration histograms, per-source pool-acquire counters. See [docs/architecture.md#observability](./docs/architecture.md#observability).
+**Observability.** Structured pino logs in JSON (production) or pretty TTY (dev); every log line carries `request_id`, `agent_id`, `session_id` automatically via AsyncLocalStorage. Prometheus metrics at `GET /metrics` — HTTP counters + duration histograms, pool active/warm gauges, spawn + run duration histograms, per-source pool-acquire counters, quota rejections, JSONL size gauge with configurable warn threshold, startup adoption outcomes, rate-limit rejections. OpenTelemetry config-passthrough: set `OTEL_EXPORTER_OTLP_ENDPOINT` (and optional `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`, etc.) and OpenClaw's built-in OTEL exporter turns on traces + metrics + logs at boot. See [docs/architecture.md#observability](./docs/architecture.md#observability).
 
-**Baseline bearer-token auth.** Set `OPENCLAW_API_TOKEN=<random-secret>` on the orchestrator host and every request must attach `Authorization: Bearer <token>` — except `/healthz` and `/metrics` (infra endpoints). Unset = auth disabled (localhost dev default). One token per deployment, matching Claude Managed Agents' API-key depth. Multi-tenancy / per-user ACLs are deliberately out of scope today; stack a reverse proxy (Caddy, Cloudflare Access) when you need them. One-command rotation on any live deploy: `./scripts/rotate-api-token.sh hetzner|lightsail|gcp|local <host-or-instance>` (generates + applies + verifies with a 401-then-200 curl pair).
+**Structured audit log.** Every mutating API call writes a row to `audit_events` (SQLite): `ts`, `request_id`, `actor` (token fingerprint or IP), `action`, `target`, `outcome`, optional metadata. Queryable via `GET /v1/audit?since=&until=&action=&target=&limit=` (all optional; `action` accepts LIKE wildcards like `agent.%`; newest-first; limit 1-1000, default 100). Retention via `OPENCLAW_AUDIT_RETENTION_DAYS` (default 30); hourly cleanup.
 
-**Rate limiting.** Per-caller token-bucket in front of every route except `/healthz` and `/metrics`. Keyed by Bearer token when present, else client IP (`x-forwarded-for` first entry, else peer). Defaults to 120 req/min (2 req/s sustained, 120-burst). Override via `OPENCLAW_RATE_LIMIT_RPM` (0 = disabled). Runs BEFORE auth so unauthenticated floods can't exhaust the orchestrator even while auth middleware rejects them. Rejections surface as HTTP 429 with a `Retry-After` header and increment `rate_limit_rejections_total{kind="token"|"ip"}` on the metrics endpoint.
+**Baseline bearer-token auth.** Set `OPENCLAW_API_TOKEN=<random-secret>` on the orchestrator host and every request must attach `Authorization: Bearer <token>` — except `/healthz` and `/metrics` (infra endpoints). Unset = auth disabled (localhost dev default). One-command rotation on any live deploy: `./scripts/rotate-api-token.sh hetzner|lightsail|gcp|local <host-or-instance>` (generates + applies + verifies with a 401-then-200 curl pair).
+
+**Rate limiting.** Per-caller token-bucket in front of every route except `/healthz` and `/metrics`. Keyed by Bearer token when present, else client IP (`x-forwarded-for` first entry, else peer). Defaults to 120 req/min (2 req/s sustained, 120-burst). Override via `OPENCLAW_RATE_LIMIT_RPM` (0 = disabled). Runs BEFORE auth so unauthenticated floods can't exhaust the orchestrator even while auth middleware rejects them. Rejections surface as HTTP 429 with a `Retry-After` header and increment `rate_limit_rejections_total{kind="token"|"ip"}` on `/metrics`.
 
 ## Deploy
 
@@ -236,7 +318,7 @@ export MOONSHOT_API_KEY=sk-...            # or any provider key
 ./scripts/deploy-hetzner.sh
 ```
 
-Measured on CAX11 (2 vCPU / 4 GB ARM, $4/month): 78s cold start, 4s pool reuse, 5-7 concurrent sessions.
+Measured on CAX11 (2 vCPU / 4 GB ARM, $4/month): 78 s cold start, 4 s pool reuse, 5-7 concurrent sessions.
 [Full guide](./docs/deploying-on-hetzner.md)
 
 ### AWS Lightsail (from $12/month)
@@ -248,7 +330,7 @@ export MOONSHOT_API_KEY=sk-...
 ./scripts/deploy-aws-lightsail.sh
 ```
 
-Measured on medium_3_0 (2 vCPU / 4 GB, $24/month): 294s cold start, 5s pool reuse, 5-7 concurrent sessions.
+Measured on medium_3_0 (2 vCPU / 4 GB, $24/month): 294 s cold start, 5 s pool reuse, 5-7 concurrent sessions.
 [Full guide](./docs/deploying-on-aws-lightsail.md)
 
 ### Google Cloud Compute Engine (from $0/month on free tier, $25/month default)
@@ -263,64 +345,80 @@ export MOONSHOT_API_KEY=sk-...
 `e2-medium` (1 vCPU burstable / 4 GB / 20 GB PD, ~$25/month) is the default and matches the Hetzner/Lightsail capacity floor. Override `GCE_MACHINE_TYPE=e2-micro` for the Always Free tier ($0/mo in us-east1/us-central1/us-west1, 1 GB RAM — good for smoke testing). GCE's NVMe-backed disk puts first-turn cold spawn in Hetzner territory (~80 s), not Lightsail territory (~5 min).
 [Full guide](./docs/deploying-on-gcp-compute.md)
 
-### Cost comparison (infrastructure only, no token costs)
+### Cost by deployment target (infrastructure only, no token costs)
 
 | | 1 session 24/7 | 10 sessions 24/7 | 100 sessions 24/7 |
 |---|---|---|---|
-| **Claude Managed Agents** | $57.60/mo | $576/mo | $5,760/mo |
+| **Claude Managed Agents** (for reference) | $57.60/mo | $576/mo | $5,760/mo |
 | **Hetzner CAX11** | $4/mo | $8/mo (2 hosts) | $73/mo (17 hosts) |
 | **AWS Lightsail medium_3_0** | $24/mo | $48/mo (2 hosts) | $408/mo (17 hosts) |
 | **GCE e2-medium** | $25/mo | $50/mo (2 hosts) | $425/mo (17 hosts) |
-| **GCE e2-micro (free tier)** | $0/mo* | $0/mo (1 host, 1 instance free-tier limit) | n/a |
+| **GCE e2-micro** (free tier) | $0/mo* | $0/mo (1 host, 1 instance free-tier limit) | n/a |
 
-*Free tier: 1 `e2-micro` instance in us-east1, us-central1, or us-west1; 30 GB PD; 1 GB egress/month. Beyond the free tier, `e2-micro` is ~$7/mo.
+*Free tier: 1 `e2-micro` in us-east1 / us-central1 / us-west1; 30 GB PD; 1 GB egress/month. Beyond the free tier, `e2-micro` is ~$7/mo. Token costs are separate and depend on the provider + model you choose.
 
 ## Architecture
 
 ```
-Developer
-   |
-   | HTTP API (Hono)
-   v
-Orchestrator
-   |-- AgentStore + EnvironmentStore + SessionStore (SQLite, WAL)
-   |-- SessionContainerPool (per-session active + per-agent pre-warmed)
-   |-- GatewayWebSocketClient (cancel, model override, tool confirmation)
-   |-- PiJsonlEventReader (event log, cost, SSE)
-   |-- ParentTokenMinter (HMAC-SHA256 subagent auth)
-   |
-   v
-OpenClaw containers (one per session)
-   - Full agent loop (tool use, multi-turn, thinking)
-   - Pi SessionManager (append-only JSONL)
-   - Session resume from JSONL across container restarts
-   - confirm-tools plugin (always_ask policy enforcement)
-   - call-agent CLI (delegated subagent spawning)
+Developer's app
+     |
+     | HTTP REST + SSE + WebSocket
+     v
+Orchestrator (Hono, TypeScript)
+  |-- AgentStore + EnvironmentStore + SessionStore (SQLite, WAL)
+  |-- QueueStore (durable per-session event queue)
+  |-- SecretStore (HMAC secret for subagent tokens)
+  |-- AuditStore (structured audit log with retention)
+  |-- SessionContainerPool (per-session active + per-agent pre-warmed + adopt on restart)
+  |-- GatewayWebSocketClient (cancel, model override, tool confirmation, observer-resume)
+  |-- PiJsonlEventReader (event log, cost, SSE, size sampler)
+  |-- ParentTokenMinter (HMAC-SHA256 subagent auth, persisted)
+  |
+  v
+OpenClaw containers (one per session, isolated)
+  - Full agent loop (tool use, multi-turn, thinking)
+  - Pi SessionManager (append-only JSONL)
+  - Session resume from JSONL across container restarts
+  - confirm-tools plugin (always_ask policy enforcement)
+  - call-agent CLI (delegated subagent spawning)
+  - egress-proxy sidecar (networking: limited enforcement)
+  - openclaw's built-in OTEL exporter (when configured)
 ```
 
-The orchestrator is stateless — all durable state lives in SQLite (agents, environments, sessions) and Pi's JSONL files (events). Pre-built multi-arch images (amd64 + arm64) are published to GHCR on every push to `main`.
+The orchestrator keeps only ephemeral caches in memory; all commitments live in SQLite and Pi's JSONL. Restart reattaches running containers, drains queued events, and subscribes to WS broadcasts to finalize in-flight turns. Pre-built multi-arch images (amd64 + arm64) are published to GHCR on every push to `main`.
 
 ## Test status
 
-28 end-to-end checks, all passing against real Moonshot Kimi K2.5:
+**175 tests pass**, covering unit + restart-safety + contract + integration shapes:
 
-- Session-centric resume (multi-turn memory across turns)
+- Session-centric resume (multi-turn memory across turns, across container restart, across orchestrator restart)
 - Cost accounting from provider billing data
-- SQLite persistence across orchestrator restart
-- Container pool reuse (41s faster than cold-start)
-- SSE live event streaming
+- SQLite persistence across orchestrator restart (migrations, additive columns, audit retention)
+- Durable event queue (FIFO, per-session isolation, survives close + reopen)
+- HMAC secret persistence (outstanding subagent tokens survive deploys)
+- Container pool adoption (reattach running + stop orphan + selectively fail unrecoverable)
+- Observer-side run completion (WS `chat` event → finalize from JSONL, idempotent)
+- Container pool reuse (4 s warm vs 78 s cold)
+- Real SSE token streaming via OpenAI-compat endpoint
+- SSE event stream with `Last-Event-ID` resume cursor
 - Cancel via WebSocket control plane
 - Event queue with ordered drain
 - OpenAI SDK compatibility (shape, multi-turn memory, streaming, queue race)
 - Delegated subagents (inspectable child sessions)
-- Rich event stream (tool_use + tool_result events)
-- Subagent allowlist rejection
+- Subagent allowlist rejection + depth-cap rejection
 - Agent versioning (create, update, no-op detection, conflict rejection, archive)
 - Environment abstraction (CRUD, session binding, deletion rejection, backward compat)
+- Networking: `limited` enforcement (9-case E2E: allowed proxy, denied proxy, raw socket blocked, AWS IMDS blocked both layers, DNS NXDOMAIN, DNS resolve, sidecar logs)
+- Per-session quotas (cost / tokens / duration refused pre-turn)
+- Audit log (record, list with filters, retention)
+- Permission policy (deny + always_ask approval flow)
+- ContainerRuntime contract (any backend passing the shared suite is drop-in)
 
 ## Relationship to OpenClaw
 
-This project uses [OpenClaw](https://github.com/openclaw/openclaw) as an npm dependency, not a fork. All agent execution, tool invocation, session management, and provider integration comes from OpenClaw core. This repo adds the managed layer: the orchestrator, the container lifecycle, the API, and the deploy scripts.
+This project uses [OpenClaw](https://github.com/openclaw/openclaw) as an npm dependency, not a fork. All agent execution, tool invocation, session management, provider integration, and 53 built-in skills come from OpenClaw core. This repo adds the managed layer: the orchestrator, the container lifecycle, the 4-primitive REST API, the deploy scripts, the restart-safety + audit + quota + observability primitives.
+
+Think of OpenClaw as the runtime framework (the personal AI assistant) and OpenClaw Managed Agents as the cloud service around it (the programmatic agent platform your app calls). OpenClaw-the-framework stays personal and single-user; we bring the multi-session, API-first, restart-safe service layer.
 
 ## License
 

@@ -12,5 +12,5 @@ coverage/
 data/
 .openclaw/
 
-# Local strategy notes — gitignored by design (see docs/strategic-comparisons.md)
-docs/strategic-comparisons.md
+# Local strategy notes — gitignored by design (see docs/strategy.md)
+docs/strategy.md
