@@ -61,6 +61,17 @@ export const McpServerConfigSchema = z
 export type McpServerConfig = z.infer<typeof McpServerConfigSchema>;
 export type McpServers = Record<string, McpServerConfig>;
 
+/**
+ * Pi's extended-thinking levels. "off" suppresses thinking output even on
+ * reasoning-capable models; "low" through "xhigh" allocate increasing
+ * thinking budget. Accepted verbatim by openclaw.json's
+ * agents.list[].thinkingLevel field — see pi-mono's agent runtime for
+ * budget semantics. Providers that don't support thinking ignore this
+ * field (no error), so it's safe to set on any agent.
+ */
+export const ThinkingLevelSchema = z.enum(["off", "low", "medium", "high", "xhigh"]);
+export type ThinkingLevel = z.infer<typeof ThinkingLevelSchema>;
+
 export const CreateAgentRequestSchema = z.object({
   model: z.string().min(1, "model is required"),
   tools: z.array(z.string()).default([]),
@@ -68,6 +79,13 @@ export const CreateAgentRequestSchema = z.object({
   permissionPolicy: PermissionPolicySchema.default({ type: "always_allow" }),
   /** Optional stable display name for UI/logging. */
   name: z.string().optional(),
+  /**
+   * Default Pi thinking budget for this agent. Passed to openclaw.json as
+   * agents.list[].thinkingLevel. Per-turn override available via
+   * PostUserMessage.thinkingLevel. Defaults to "off" matching Pi's
+   * default for non-reasoning usage.
+   */
+  thinkingLevel: ThinkingLevelSchema.default("off"),
   /**
    * Item 12-14: list of agent IDs this agent is permitted to invoke via
    * the in-container `call_agent` tool. Default empty = no delegation.
@@ -113,6 +131,7 @@ export const UpdateAgentRequestSchema = z.object({
     .nullable()
     .optional(),
   quota: QuotaSchema.nullable().optional(),
+  thinkingLevel: ThinkingLevelSchema.optional(),
 });
 
 export type UpdateAgentRequest = z.infer<typeof UpdateAgentRequestSchema>;
@@ -132,6 +151,7 @@ export type AgentConfig = {
   maxSubagentDepth: number;
   mcpServers: McpServers;
   quota?: Quota;
+  thinkingLevel: ThinkingLevel;
 };
 
 // ---------- Environment (container configuration template) ----------
@@ -337,6 +357,14 @@ export const PostUserMessageSchema = z.object({
    * until changed again.
    */
   model: z.string().min(1).optional(),
+  /**
+   * Optional per-turn thinking level override. Applied via WS
+   * sessions.patch before the chat completion runs. Session-scoped like
+   * `model` — persists for subsequent events until changed. Use "off"
+   * to explicitly suppress thinking on a reasoning-capable model for
+   * one turn.
+   */
+  thinkingLevel: ThinkingLevelSchema.optional(),
 });
 
 export const PostToolConfirmationSchema = z.object({

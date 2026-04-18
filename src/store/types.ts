@@ -209,5 +209,7 @@ export type QueuedEvent = {
   content: string;
   /** Optional per-event model override. */
   model?: string;
+  /** Optional per-event thinking-level override. */
+  thinkingLevel?: string;
   enqueuedAt: number;
 };

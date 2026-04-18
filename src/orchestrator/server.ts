@@ -135,6 +135,7 @@ function agentResponse(agent: AgentConfig) {
     max_subagent_depth: agent.maxSubagentDepth,
     mcp_servers: agent.mcpServers,
     quota: agent.quota,
+    thinking_level: agent.thinkingLevel,
     version: agent.version,
     created_at: agent.createdAt,
     updated_at: agent.updatedAt,
@@ -285,6 +286,7 @@ export function buildApp(deps: ServerDeps): Hono {
           list_events: "GET /v1/sessions/:sessionId/events",
           stream_events: "GET /v1/sessions/:sessionId/events?stream=true",
           cancel: "POST /v1/sessions/:sessionId/cancel",
+          compact: "POST /v1/sessions/:sessionId/compact",
         },
         openai_compat: {
           chat_completions: "POST /v1/chat/completions",
@@ -618,6 +620,7 @@ export function buildApp(deps: ServerDeps): Hono {
         sessionId,
         content: event.content,
         model: event.model,
+        thinkingLevel: event.thinkingLevel,
       });
       // The event id is Pi's — we don't know it until the JSONL is written.
       // Clients that need to correlate this response with the persisted
@@ -650,6 +653,30 @@ export function buildApp(deps: ServerDeps): Hono {
     } catch (err) {
       writeAudit(deps.audit, c, {
         action: "session.cancel",
+        target: sessionId,
+        outcome: err instanceof RouterError ? err.code : "error",
+      });
+      return handleRouterError(err, c);
+    }
+  });
+
+  app.post("/v1/sessions/:sessionId/compact", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    try {
+      const session = await deps.router.compact(sessionId);
+      writeAudit(deps.audit, c, {
+        action: "session.compact",
+        target: sessionId,
+        outcome: "ok",
+      });
+      return c.json({
+        session_id: session.sessionId,
+        session_status: session.status,
+        compacted: true,
+      });
+    } catch (err) {
+      writeAudit(deps.audit, c, {
+        action: "session.compact",
         target: sessionId,
         outcome: err instanceof RouterError ? err.code : "error",
       });

@@ -321,6 +321,21 @@ export class GatewayWebSocketClient {
   }
 
   /**
+   * Ask openclaw to compact the session's accumulated event log into a
+   * summary, freeing context-window budget. Openclaw writes the resulting
+   * summary as a `compaction` JSONL entry which `PiJsonlEventReader`
+   * surfaces as a `session.compaction` event in our public stream.
+   *
+   * Compaction does an LLM call to produce the summary, so the default
+   * 10s request timeout isn't enough. Use a 3-minute timeout — long
+   * enough for a large history + slow model, short enough to avoid
+   * stalling the caller forever.
+   */
+  async compact(sessionKey: string): Promise<unknown> {
+    return this.request("sessions.compact", { key: sessionKey }, 180_000);
+  }
+
+  /**
    * Resolve a pending tool-confirmation approval. Called when the client
    * sends a `user.tool_confirmation` event. The `id` is the approval
    * request id from the `plugin.approval.requested` broadcast event.
@@ -360,7 +375,11 @@ export class GatewayWebSocketClient {
     }
   }
 
-  private request(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private request(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<unknown> {
     if (this.closed) {
       return Promise.reject(new GatewayWsError("closed", "ws client is closed"));
     }
@@ -370,7 +389,8 @@ export class GatewayWebSocketClient {
       );
     }
     const id = String(this.nextRequestId++);
-    const requestTimeoutMs = this.cfg.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    const requestTimeoutMs =
+      timeoutMs ?? this.cfg.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

@@ -76,6 +76,12 @@ export type RunEventArgs = {
    * runs until changed again.
    */
   model?: string;
+  /**
+   * Optional thinking-level override for this turn. Applied via the same
+   * WS sessions.patch path as `model`. Session-scoped like model —
+   * persists across subsequent runs until changed.
+   */
+  thinkingLevel?: string;
 };
 
 export type RunEventResult = {
@@ -326,6 +332,7 @@ export class AgentRouter {
       this.queue.enqueue(args.sessionId, {
         content: args.content,
         model: args.model,
+        thinkingLevel: args.thinkingLevel,
         enqueuedAt: Date.now(),
       });
       return { session, queued: true };
@@ -339,7 +346,13 @@ export class AgentRouter {
     // fire-and-forget background task's logs carry the same identifiers
     // as the HTTP handler that kicked it off.
     const runInBackground = withCapturedContext(() =>
-      this.executeInBackground(args.sessionId, agent, args.content, args.model),
+      this.executeInBackground(
+        args.sessionId,
+        agent,
+        args.content,
+        args.model,
+        args.thinkingLevel,
+      ),
     );
     const handleFailure = withCapturedContext((err: unknown) =>
       this.handleBackgroundFailure(args.sessionId, err),
@@ -398,16 +411,21 @@ export class AgentRouter {
         networking,
       });
 
-      if (args.model) {
+      // Same patch rules as executeInBackground — see the note there.
+      const effectiveThinking = args.thinkingLevel ?? agent.thinkingLevel;
+      if (args.model || effectiveThinking !== "off") {
         const wsClient = this.pool.getWsClient(args.sessionId);
         if (!wsClient) {
           throw new RouterError(
             "no_active_container",
-            `session ${args.sessionId} has no WS client for model patch`,
+            `session ${args.sessionId} has no WS client for patch`,
           );
         }
+        const patch: Record<string, string> = {};
+        if (args.model) patch.model = args.model;
+        if (effectiveThinking !== "off") patch.thinkingLevel = effectiveThinking;
         try {
-          await wsClient.patch(`agent:main:${args.sessionId}`, { model: args.model });
+          await wsClient.patch(`agent:main:${args.sessionId}`, patch);
         } catch (err) {
           throw wrapWsError(err, "patch_failed");
         }
@@ -537,6 +555,47 @@ export class AgentRouter {
    * session back to idle (no error recorded — cancellation is a deliberate
    * stop, not an agent failure). Returns the updated Session.
    */
+  /**
+   * Trigger openclaw to compact the session's conversation log. Requires
+   * an active container (session has been interacted with at least once —
+   * otherwise there's nothing to compact). Does not race with a running
+   * turn: we refuse if the session is in "running" state, since openclaw
+   * can't compact while a turn is in flight.
+   *
+   * The compaction itself is openclaw's responsibility; it writes a
+   * `compaction` JSONL entry which surfaces as a `session.compaction`
+   * event in the subsequent events stream.
+   */
+  async compact(sessionId: string): Promise<Session> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new RouterError(
+        "session_not_found",
+        `session ${sessionId} does not exist`,
+      );
+    }
+    if (session.status === "running") {
+      throw new RouterError(
+        "session_busy",
+        `session ${sessionId} is running; wait for it to finish before compacting`,
+      );
+    }
+    const wsClient = this.pool.getWsClient(sessionId);
+    if (!wsClient) {
+      throw new RouterError(
+        "no_active_container",
+        `session ${sessionId} has no active container to compact (post an event first)`,
+      );
+    }
+    const canonicalKey = `agent:main:${sessionId}`;
+    try {
+      await wsClient.compact(canonicalKey);
+    } catch (err) {
+      throw wrapWsError(err, "compact_failed");
+    }
+    return session;
+  }
+
   async cancel(sessionId: string): Promise<Session> {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -682,6 +741,12 @@ export class AgentRouter {
       OPENCLAW_ORCHESTRATOR_URL: this.cfg.orchestratorUrl,
       OPENCLAW_ORCHESTRATOR_TOKEN: parentToken,
     };
+    // NOTE on thinkingLevel: openclaw's config schema rejects thinkingLevel
+    // in both `agents.list[].thinkingLevel` and `agents.defaults.thinkingLevel`
+    // paths — it's a *runtime* session field set via WS sessions.patch
+    // (same channel model override takes). executeInBackground + streamEvent
+    // patch it before every turn based on agent.thinkingLevel + per-event
+    // override, so no env var is needed here.
     if (envConfig?.packages) {
       env.OPENCLAW_PACKAGES_JSON = JSON.stringify(envConfig.packages);
     }
@@ -717,6 +782,7 @@ export class AgentRouter {
     agent: AgentConfig,
     content: string,
     modelOverride?: string,
+    thinkingLevelOverride?: string,
   ): Promise<void> {
     const currentSession = this.sessions.get(sessionId);
     const spawnOptions = this.buildSpawnOptions(
@@ -760,11 +826,23 @@ export class AgentRouter {
       }
     }
 
-    // Per-event model override. Apply via WS patch BEFORE the chat
-    // completions call. The WS handshake completed during acquire so a
-    // client must be present here; if it's missing, treat as an
-    // infrastructure failure and evict.
-    if (modelOverride) {
+    // Model + thinking-level patch via WS BEFORE the chat completions
+    // call. The WS handshake completed during acquire so a client must be
+    // present here; if it's missing, treat as an infrastructure failure
+    // and evict.
+    //
+    // thinkingLevel: effective level is (per-event override) ?? (agent
+    // default). We always re-patch when the effective level !== "off" —
+    // this makes the runtime idempotent in the face of warm-pool
+    // container reuse (a container claimed from a different agent could
+    // carry the prior agent's level otherwise).
+    //
+    // model: session-scoped under Pi's setModel; only patched when the
+    // per-event override is explicit, to avoid redundant per-turn patches
+    // on the same agent.
+    const effectiveThinking = thinkingLevelOverride ?? agent.thinkingLevel;
+    const needsPatch = Boolean(modelOverride) || effectiveThinking !== "off";
+    if (needsPatch) {
       const wsClient = this.pool.getWsClient(sessionId);
       if (!wsClient) {
         await this.pool.evictSession(sessionId).catch(() => {
@@ -772,12 +850,15 @@ export class AgentRouter {
         });
         throw new RouterError(
           "no_active_container",
-          `session ${sessionId} has no WS client for model patch`,
+          `session ${sessionId} has no WS client for patch`,
         );
       }
       const canonicalKey = `agent:main:${sessionId}`;
+      const patch: Record<string, string> = {};
+      if (modelOverride) patch.model = modelOverride;
+      if (effectiveThinking !== "off") patch.thinkingLevel = effectiveThinking;
       try {
-        await wsClient.patch(canonicalKey, { model: modelOverride });
+        await wsClient.patch(canonicalKey, patch);
       } catch (err) {
         await this.pool.evictSession(sessionId).catch(() => {
           /* best-effort */
@@ -827,8 +908,13 @@ export class AgentRouter {
     const next = this.queue.shift(sessionId);
     if (next) {
       this.sessions.addUsage(sessionId, usage);
-      void this.executeInBackground(sessionId, agent, next.content, next.model)
-        .catch((err) => this.handleBackgroundFailure(sessionId, err));
+      void this.executeInBackground(
+        sessionId,
+        agent,
+        next.content,
+        next.model,
+        next.thinkingLevel,
+      ).catch((err) => this.handleBackgroundFailure(sessionId, err));
       return;
     }
 
@@ -944,6 +1030,7 @@ export class AgentRouter {
           sessionId,
           content: next.content,
           model: next.model,
+          thinkingLevel: next.thinkingLevel,
         }).catch((err) => {
           log.warn(
             { err, session_id: sessionId },
@@ -1108,6 +1195,7 @@ export type RouterErrorCode =
   | "no_active_container"
   | "chat_completions_failed"
   | "cancel_failed"
+  | "compact_failed"
   | "patch_failed"
   | "confirm_tool_failed"
   | "quota_exceeded";

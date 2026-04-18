@@ -12,6 +12,7 @@ import type {
   Quota,
   Session,
   SessionStatus,
+  ThinkingLevel,
   UpdateAgentRequest,
 } from "../orchestrator/types.js";
 import type {
@@ -46,6 +47,7 @@ type AgentRow = {
   max_subagent_depth: number;
   mcp_servers_json: string | null;
   quota_json: string | null;
+  thinking_level: string | null;
 };
 
 type EnvironmentRow = {
@@ -93,6 +95,7 @@ function rowToAgent(r: AgentRow): AgentConfig {
       ? (JSON.parse(r.mcp_servers_json) as McpServers)
       : {},
     quota: r.quota_json ? (JSON.parse(r.quota_json) as Quota) : undefined,
+    thinkingLevel: (r.thinking_level as ThinkingLevel | null) ?? "off",
   };
 }
 
@@ -156,7 +159,8 @@ CREATE TABLE IF NOT EXISTS agents (
   callable_agents_json TEXT,
   max_subagent_depth INTEGER NOT NULL DEFAULT 0,
   mcp_servers_json TEXT,
-  quota_json TEXT
+  quota_json TEXT,
+  thinking_level TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_versions (
@@ -171,6 +175,7 @@ CREATE TABLE IF NOT EXISTS agent_versions (
   max_subagent_depth INTEGER NOT NULL DEFAULT 0,
   mcp_servers_json TEXT,
   quota_json TEXT,
+  thinking_level TEXT,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (agent_id, version)
 );
@@ -264,22 +269,26 @@ class SqliteAgentStore implements AgentStore {
       `INSERT INTO agents (
         agent_id, model, tools_json, instructions, permission_policy_json,
         name, created_at, updated_at, archived_at, version,
-        callable_agents_json, max_subagent_depth, mcp_servers_json, quota_json
+        callable_agents_json, max_subagent_depth, mcp_servers_json, quota_json,
+        thinking_level
        ) VALUES (
         @agent_id, @model, @tools_json, @instructions, @permission_policy_json,
         @name, @created_at, @updated_at, NULL, 1,
-        @callable_agents_json, @max_subagent_depth, @mcp_servers_json, @quota_json
+        @callable_agents_json, @max_subagent_depth, @mcp_servers_json, @quota_json,
+        @thinking_level
        )`,
     );
     this.insertVersionStmt = db.prepare(
       `INSERT INTO agent_versions (
         agent_id, version, model, tools_json, instructions,
         permission_policy_json, name,
-        callable_agents_json, max_subagent_depth, mcp_servers_json, quota_json, created_at
+        callable_agents_json, max_subagent_depth, mcp_servers_json, quota_json,
+        thinking_level, created_at
        ) VALUES (
         @agent_id, @version, @model, @tools_json, @instructions,
         @permission_policy_json, @name,
-        @callable_agents_json, @max_subagent_depth, @mcp_servers_json, @quota_json, @created_at
+        @callable_agents_json, @max_subagent_depth, @mcp_servers_json, @quota_json,
+        @thinking_level, @created_at
        )`,
     );
     this.getStmt = db.prepare(`SELECT * FROM agents WHERE agent_id = ?`);
@@ -294,6 +303,7 @@ class SqliteAgentStore implements AgentStore {
         max_subagent_depth = @max_subagent_depth,
         mcp_servers_json = @mcp_servers_json,
         quota_json = @quota_json,
+        thinking_level = @thinking_level,
         version = @version, updated_at = @updated_at
        WHERE agent_id = @agent_id AND version = @prev_version`,
     );
@@ -301,7 +311,7 @@ class SqliteAgentStore implements AgentStore {
       `SELECT agent_id, version, model, tools_json, instructions,
               permission_policy_json, name,
               callable_agents_json, max_subagent_depth, mcp_servers_json,
-              quota_json,
+              quota_json, thinking_level,
               created_at,
               created_at as updated_at, NULL as archived_at
        FROM agent_versions WHERE agent_id = ? ORDER BY version ASC`,
@@ -330,6 +340,7 @@ class SqliteAgentStore implements AgentStore {
           ? JSON.stringify(agent.mcpServers)
           : null,
       quota_json: agent.quota ? JSON.stringify(agent.quota) : null,
+      thinking_level: agent.thinkingLevel === "off" ? null : agent.thinkingLevel,
     };
   }
 
@@ -350,6 +361,7 @@ class SqliteAgentStore implements AgentStore {
       maxSubagentDepth: req.maxSubagentDepth,
       mcpServers: req.mcpServers,
       quota: req.quota,
+      thinkingLevel: req.thinkingLevel,
     };
     const row = this.agentToRow(agent);
     this.insertStmt.run({ ...row, created_at: now, updated_at: now });
@@ -388,6 +400,7 @@ class SqliteAgentStore implements AgentStore {
       maxSubagentDepth: req.maxSubagentDepth ?? current.maxSubagentDepth,
       mcpServers: req.mcpServers === null ? {} : (req.mcpServers ?? current.mcpServers),
       quota: req.quota === null ? undefined : (req.quota ?? current.quota),
+      thinkingLevel: req.thinkingLevel ?? current.thinkingLevel,
       updatedAt: now,
       version: current.version + 1,
     };
@@ -400,7 +413,8 @@ class SqliteAgentStore implements AgentStore {
       JSON.stringify(updated.callableAgents) === JSON.stringify(current.callableAgents) &&
       updated.maxSubagentDepth === current.maxSubagentDepth &&
       JSON.stringify(updated.mcpServers) === JSON.stringify(current.mcpServers) &&
-      JSON.stringify(updated.quota) === JSON.stringify(current.quota)
+      JSON.stringify(updated.quota) === JSON.stringify(current.quota) &&
+      updated.thinkingLevel === current.thinkingLevel
     ) {
       return current;
     }
@@ -948,6 +962,12 @@ export class SqliteStore implements Store {
       // Pre-B5 rows default to NULL = no caps, matching pre-B5 behavior.
       this.db.exec("ALTER TABLE agents ADD COLUMN quota_json TEXT");
     }
+    if (!agentsCols.some((c) => c.name === "thinking_level")) {
+      // D1: Pi extended-thinking level ("off" | "low" | "medium" | "high"
+      // | "xhigh"). Pre-D1 rows default to NULL which rowToAgent maps to
+      // "off", matching pre-D1 behavior (no thinking blocks emitted).
+      this.db.exec("ALTER TABLE agents ADD COLUMN thinking_level TEXT");
+    }
     const versionsCols = this.db.pragma("table_info(agent_versions)") as Array<{ name: string }>;
     if (versionsCols.length > 0 && !versionsCols.some((c) => c.name === "permission_policy_json")) {
       this.db.exec("ALTER TABLE agent_versions ADD COLUMN permission_policy_json TEXT");
@@ -957,6 +977,9 @@ export class SqliteStore implements Store {
     }
     if (versionsCols.length > 0 && !versionsCols.some((c) => c.name === "quota_json")) {
       this.db.exec("ALTER TABLE agent_versions ADD COLUMN quota_json TEXT");
+    }
+    if (versionsCols.length > 0 && !versionsCols.some((c) => c.name === "thinking_level")) {
+      this.db.exec("ALTER TABLE agent_versions ADD COLUMN thinking_level TEXT");
     }
 
     this.agents = new SqliteAgentStore(this.db);
