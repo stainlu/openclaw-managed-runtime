@@ -141,46 +141,138 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
     display: grid;
-    grid-template-columns: auto 1fr;
+    grid-template-columns: auto 1fr auto 1fr;
     gap: 6px 14px;
     font-size: 12px;
     background: var(--bg-elev);
     flex-shrink: 0;
   }
   .detail-meta .label { color: var(--text-muted); }
-  .detail-meta .value { font-family: ui-monospace, monospace; }
+  .detail-meta .value { font-family: ui-monospace, monospace; word-break: break-all; }
+  .detail-meta .value.wide { grid-column: 2 / 5; }
+
+  .timeline {
+    display: flex;
+    gap: 2px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elev);
+    flex-shrink: 0;
+    overflow-x: auto;
+  }
+  .timeline .bead {
+    height: 22px;
+    min-width: 14px;
+    flex: 0 0 auto;
+    border-radius: 3px;
+    background: var(--border);
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .timeline .bead:hover { border-color: var(--text-dim); }
+  .timeline .bead.active { outline: 2px solid var(--accent); }
+  .bead.user { background: #4c8bf5; }
+  .bead.agent { background: #3fb950; }
+  .bead.thinking { background: #a371f7; }
+  .bead.tool { background: #d29922; }
+  .bead.tool-error { background: var(--danger); }
+  .bead.system { background: var(--text-dim); }
+
   .detail-events {
     flex: 1;
     overflow-y: auto;
-    padding: 12px 16px;
+    padding: 10px 14px;
     min-height: 0;
   }
   .event {
-    margin-bottom: 12px;
+    margin-bottom: 8px;
     padding: 8px 12px;
     border-radius: 4px;
     background: var(--bg-elev);
     border-left: 3px solid var(--border);
   }
-  .event.user { border-left-color: var(--accent); }
+  .event.user { border-left-color: #4c8bf5; }
   .event.agent { border-left-color: var(--success); }
-  .event.system { border-left-color: var(--text-dim); }
+  .event.thinking { border-left-color: #a371f7; background: var(--bg-input); }
+  .event.tool { border-left-color: var(--warn); padding: 0; overflow: hidden; }
+  .event.tool.error { border-left-color: var(--danger); }
+  .event.system { border-left-color: var(--text-dim); background: var(--bg-input); font-size: 11px; }
   .event.error { border-left-color: var(--danger); }
-  .event .ev-type {
+
+  .event .ev-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .event.tool .ev-header { cursor: pointer; }
+  .event.tool .ev-header:hover { background: var(--border-muted); }
+  .event .chevron {
+    font-size: 10px;
+    color: var(--text-dim);
+    width: 10px;
+    display: inline-block;
+    transition: transform 0.1s;
+  }
+  .event .chevron.open { transform: rotate(90deg); }
+  .event .chip {
+    padding: 1px 7px;
+    border-radius: 3px;
     font-family: ui-monospace, monospace;
     font-size: 11px;
+    text-transform: lowercase;
+    background: var(--code-bg);
     color: var(--text-muted);
-    margin-bottom: 4px;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
   }
-  .event .ev-content {
+  .event .chip.role-user { background: #1b3a6b; color: #b3cafb; }
+  .event .chip.role-agent { background: #143d21; color: #7ed58b; }
+  .event .chip.role-thinking { background: #3a1e52; color: #d1b0ff; }
+  .event .chip.role-tool { background: #4a3410; color: #f5cf7a; }
+  .event .chip.role-tool.error { background: #5a1d1d; color: #ffb3b3; }
+  .event .ev-summary {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .event .ev-meta { font-size: 11px; color: var(--text-dim); font-family: ui-monospace, monospace; flex-shrink: 0; }
+  .event .ev-body {
+    padding: 0 12px 10px 30px;
     font-size: 13px;
     line-height: 1.5;
+  }
+  .event.agent .ev-body,
+  .event.user .ev-body,
+  .event.thinking .ev-body {
+    padding: 0 12px 8px 12px;
+  }
+  .event .ev-body.hidden { display: none; }
+  .event .ev-content {
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .event .ev-meta { font-size: 11px; color: var(--text-dim); margin-top: 4px; font-family: ui-monospace, monospace; }
+  .event .ev-content.code {
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 10px;
+    max-height: 320px;
+    overflow: auto;
+  }
+  .event .ev-section-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin: 8px 0 3px 0;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
 
   .composer {
     border-top: 1px solid var(--border);
@@ -509,20 +601,43 @@ function renderDetail(session, events) {
   if (!session) return;
   const statusCls = "status-" + (session.status || "idle");
   const isRunning = session.status === "running";
-  const eventsHtml = events.length
-    ? events.map(e => renderEvent(e)).join("")
+
+  // Combine agent.tool_use + agent.tool_result pairs into a single row,
+  // matched by tool_call_id. Orphan tool_use (result pending) shows a
+  // spinner. Session-level metadata events are hidden by default.
+  const rows = buildEventRows(events);
+  const totalDuration = events.length
+    ? (events[events.length - 1].created_at - events[0].created_at)
+    : 0;
+  const toolCount = rows.filter(r => r.kind === "tool").length;
+
+  const eventsHtml = rows.length
+    ? rows.map((r, i) => renderRow(r, i)).join("")
     : '<div class="muted" style="padding: 20px; text-align: center;">No events yet. Send a message below.</div>';
+
+  const timelineHtml = rows.length
+    ? rows.map((r, i) => {
+        const cls = r.kind === "tool" && r.isError ? "tool-error" : r.kind;
+        const title = r.kind === "tool"
+          ? r.toolName + (r.duration != null ? \` · \${fmtDuration(r.duration)}\` : "")
+          : r.kind + (r.summary ? ": " + r.summary.slice(0, 60) : "");
+        return \`<div class="bead \${cls}" data-idx="\${i}" title="\${escapeAttr(title)}"></div>\`;
+      }).join("")
+    : "";
 
   pane.innerHTML = \`
     <div class="detail">
       <div class="detail-meta">
         <span class="label">Session</span><span class="value">\${session.session_id}</span>
         <span class="label">Agent</span><span class="value">\${session.agent_id}</span>
-        <span class="label">Status</span><span class="value \${statusCls}">\${isRunning ? '<span class="spinner"></span>' : ""}\${session.status}\${session.error ? " — " + session.error : ""}</span>
+        <span class="label">Status</span><span class="value \${statusCls}">\${isRunning ? '<span class="spinner"></span>' : ""}\${session.status}\${session.error ? " — " + escapeHtml(session.error) : ""}</span>
+        <span class="label">Duration</span><span class="value">\${totalDuration ? fmtDuration(totalDuration) : "—"}</span>
         <span class="label">Tokens</span><span class="value">\${session.tokens?.input || 0} in / \${session.tokens?.output || 0} out</span>
         <span class="label">Cost</span><span class="value">\${fmtCost(session.cost_usd || 0)}</span>
+        <span class="label">Tool calls</span><span class="value">\${toolCount}</span>
         <span class="label">Last event</span><span class="value">\${fmtMs(session.last_event_at)}</span>
       </div>
+      \${timelineHtml ? \`<div class="timeline">\${timelineHtml}</div>\` : ""}
       <div class="detail-events" id="detail-events">\${eventsHtml}</div>
       <div class="composer">
         <textarea id="composer-text" placeholder="Type a message and press Enter (Shift+Enter for newline)" \${isRunning ? "disabled" : ""}></textarea>
@@ -533,6 +648,30 @@ function renderDetail(session, events) {
       </div>
     </div>
   \`;
+
+  // Event expand/collapse for tool rows (and any row with a body)
+  pane.querySelectorAll(".event .ev-header").forEach((h) => {
+    h.addEventListener("click", () => {
+      const body = h.parentElement.querySelector(".ev-body");
+      const chev = h.querySelector(".chevron");
+      if (!body) return;
+      body.classList.toggle("hidden");
+      if (chev) chev.classList.toggle("open");
+    });
+  });
+
+  // Timeline bead click — scroll the matching row into view
+  pane.querySelectorAll(".timeline .bead").forEach((b) => {
+    b.addEventListener("click", () => {
+      const idx = b.dataset.idx;
+      const row = document.getElementById("row-" + idx);
+      if (row) {
+        row.scrollIntoView({ behavior: "smooth", block: "center" });
+        row.style.outline = "2px solid var(--accent)";
+        setTimeout(() => { row.style.outline = ""; }, 1200);
+      }
+    });
+  });
 
   const ev = document.getElementById("detail-events");
   ev.scrollTop = ev.scrollHeight;
@@ -551,33 +690,157 @@ function renderDetail(session, events) {
   if (cancelBtn) cancelBtn.onclick = cancelSession;
 }
 
-function renderEvent(e) {
-  const type = e.type || "unknown";
-  const isUser = type === "user.message";
-  const isAgent = type === "agent.message";
-  const isError = type === "agent.error" || type === "session.error";
-  const isTool = type === "agent.tool_use" || type === "agent.tool_result";
-  const cls = isUser ? "user" : isAgent ? "agent" : isError ? "error" : "system";
+/**
+ * Fold the raw event stream into display rows:
+ *   - user / agent / thinking / session.* → one row each
+ *   - agent.tool_use → start a pending tool row
+ *   - agent.tool_result → attach to the matching tool_use by tool_call_id
+ *   - unmatched tool_result → standalone row
+ */
+function buildEventRows(events) {
+  const pending = new Map(); // tool_call_id -> row ref
+  const rows = [];
+  for (const e of events) {
+    const t = e.type;
+    if (t === "user.message") {
+      rows.push({ kind: "user", e, summary: asText(e.content) });
+    } else if (t === "agent.message") {
+      rows.push({
+        kind: "agent", e,
+        summary: asText(e.content),
+        tokensIn: e.tokens_in, tokensOut: e.tokens_out, cost: e.cost_usd,
+      });
+    } else if (t === "agent.thinking") {
+      rows.push({ kind: "thinking", e, summary: asText(e.content) });
+    } else if (t === "agent.tool_use") {
+      const row = {
+        kind: "tool", e,
+        toolName: e.tool_name || "(tool)",
+        toolCallId: e.tool_call_id,
+        toolArgs: e.tool_arguments,
+        toolResult: null,
+        isError: false,
+        startedAt: e.created_at,
+        finishedAt: null,
+        duration: null,
+        summary: buildToolSummary(e.tool_name, e.tool_arguments),
+      };
+      rows.push(row);
+      if (e.tool_call_id) pending.set(e.tool_call_id, row);
+    } else if (t === "agent.tool_result") {
+      const match = e.tool_call_id ? pending.get(e.tool_call_id) : null;
+      if (match) {
+        match.toolResult = asText(e.content);
+        match.isError = !!e.is_error;
+        match.finishedAt = e.created_at;
+        match.duration = e.created_at - match.startedAt;
+        pending.delete(e.tool_call_id);
+      } else {
+        // Orphan result (shouldn't happen, but don't drop it)
+        rows.push({
+          kind: "tool", e,
+          toolName: e.tool_name || "(result)",
+          toolResult: asText(e.content),
+          isError: !!e.is_error,
+          summary: "(orphan result)",
+        });
+      }
+    } else if (t === "session.model_change" || t === "session.thinking_level_change" || t === "session.compaction") {
+      rows.push({ kind: "system", e, summary: \`\${t.replace("session.", "")}: \${asText(e.content)}\` });
+    } else if (t === "agent.error" || t === "session.error") {
+      rows.push({ kind: "error", e, summary: asText(e.content) });
+    } else {
+      rows.push({ kind: "system", e, summary: t + ": " + asText(e.content) });
+    }
+  }
+  return rows;
+}
 
-  let content = "";
-  if (typeof e.content === "string") content = e.content;
-  else if (Array.isArray(e.content)) {
-    content = e.content.map(p => typeof p === "string" ? p : (p.text || JSON.stringify(p))).join("");
-  } else if (e.content != null) content = JSON.stringify(e.content, null, 2);
+function buildToolSummary(name, args) {
+  if (!args || typeof args !== "object") return name;
+  // Heuristic one-line summary for common tools.
+  if (args.command) return args.command;
+  if (args.path) return args.path;
+  if (args.file_path) return args.file_path;
+  if (args.pattern) return args.pattern;
+  if (args.url) return args.url;
+  if (args.query) return args.query;
+  // Fallback: the first string value.
+  const firstStr = Object.values(args).find(v => typeof v === "string");
+  return firstStr || name;
+}
 
+function asText(v) {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.map(p => typeof p === "string" ? p : (p?.text || JSON.stringify(p))).join("");
+  if (v != null) return JSON.stringify(v);
+  return "";
+}
+
+function renderRow(r, idx) {
+  const rowId = "row-" + idx;
+  if (r.kind === "tool") return renderToolRow(r, rowId);
+  if (r.kind === "user") return renderSimpleRow(r, rowId, "user", "user");
+  if (r.kind === "agent") return renderSimpleRow(r, rowId, "agent", "agent");
+  if (r.kind === "thinking") return renderSimpleRow(r, rowId, "thinking", "thinking", { italic: true });
+  if (r.kind === "error") return renderSimpleRow(r, rowId, "error", "error");
+  // system
+  return \`<div class="event system" id="\${rowId}"><div class="ev-body"><span class="chip">\${escapeHtml(r.summary)}</span></div></div>\`;
+}
+
+function renderSimpleRow(r, rowId, cssCls, chip, opts = {}) {
+  const content = asText(r.e.content);
+  const short = content.length > 160;
   const meta = [];
-  if (e.tokens_in || e.tokens_out) meta.push(\`\${e.tokens_in || 0} in / \${e.tokens_out || 0} out tok\`);
-  if (e.cost_usd) meta.push(fmtCost(e.cost_usd));
-  if (isTool && e.tool_name) meta.push("tool: " + e.tool_name);
-
+  if (r.tokensIn || r.tokensOut) meta.push(\`\${r.tokensIn || 0}in/\${r.tokensOut || 0}out\`);
+  if (r.cost) meta.push(fmtCost(r.cost));
   return \`
-    <div class="event \${cls}">
-      <div class="ev-type">\${type}</div>
-      \${content ? \`<div class="ev-content">\${escapeHtml(content)}</div>\` : ""}
-      \${meta.length ? \`<div class="ev-meta">\${meta.join(" · ")}</div>\` : ""}
+    <div class="event \${cssCls}" id="\${rowId}">
+      <div class="ev-header">
+        <span class="chevron \${short ? "" : "open"}">▸</span>
+        <span class="chip role-\${chip}">\${chip}</span>
+        <span class="ev-summary"\${opts.italic ? ' style="font-style: italic; color: var(--text-muted);"' : ""}>\${escapeHtml(content.slice(0, 160))}\${short ? "…" : ""}</span>
+        \${meta.length ? \`<span class="ev-meta">\${meta.join(" · ")}</span>\` : ""}
+      </div>
+      <div class="ev-body \${short ? "hidden" : ""}">
+        <div class="ev-content"\${opts.italic ? ' style="font-style: italic; color: var(--text-muted);"' : ""}>\${escapeHtml(content)}</div>
+      </div>
     </div>
   \`;
 }
+
+function renderToolRow(r, rowId) {
+  const pending = !r.toolResult && r.startedAt;
+  const resultShort = r.toolResult ? r.toolResult.slice(0, 200) : (pending ? "running…" : "");
+  const argsJson = r.toolArgs ? JSON.stringify(r.toolArgs, null, 2) : null;
+  const durationTxt = r.duration != null ? fmtDuration(r.duration) : (pending ? "…" : "");
+  const errCls = r.isError ? " error" : "";
+  return \`
+    <div class="event tool\${errCls}" id="\${rowId}">
+      <div class="ev-header">
+        <span class="chevron">▸</span>
+        <span class="chip role-tool\${errCls}">\${escapeHtml(r.toolName)}</span>
+        <span class="ev-summary">\${escapeHtml(r.summary || "")}</span>
+        \${durationTxt ? \`<span class="ev-meta">\${pending ? '<span class="spinner"></span>' : ""}\${durationTxt}</span>\` : ""}
+      </div>
+      <div class="ev-body hidden">
+        \${argsJson ? \`<div class="ev-section-label">Arguments</div><div class="ev-content code">\${escapeHtml(argsJson)}</div>\` : ""}
+        \${r.toolResult != null ? \`<div class="ev-section-label">\${r.isError ? "Error" : "Result"}</div><div class="ev-content code">\${escapeHtml(r.toolResult)}</div>\` : (pending ? '<div class="ev-section-label">Result</div><div class="ev-content code"><span class="spinner"></span>running…</div>' : "")}
+      </div>
+    </div>
+  \`;
+}
+
+function fmtDuration(ms) {
+  if (ms < 1000) return ms + "ms";
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + "s";
+  const m = Math.floor(s / 60);
+  const rs = Math.round(s % 60);
+  return m + "m " + rs + "s";
+}
+
+function escapeAttr(s) { return escapeHtml(String(s)).replace(/"/g, "&quot;"); }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
