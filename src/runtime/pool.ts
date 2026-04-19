@@ -80,6 +80,31 @@ export type PoolConfig = {
    */
   cleanupOnReap?: (sessionId: string) => Promise<void>;
   /**
+   * Invoked the instant a container becomes session-owned — either by
+   * claiming a pre-warmed container or finishing a fresh spawn. The
+   * orchestrator wires this to persist the session ↔ container mapping
+   * into SessionContainerStore so that a subsequent orchestrator
+   * restart can reattach instead of treating the container as an
+   * orphan. Sync-void return signature: the pool does NOT await this
+   * callback (the hot path is already serialized per-session through
+   * `pending`, and blocking on a durability write here would stretch
+   * pool_acquire_ms for no benefit — a crashed orchestrator that
+   * failed to persist is equivalent to a lost container on reattach).
+   */
+  onContainerClaimed?: (args: {
+    sessionId: string;
+    agentId: string;
+    container: Container;
+  }) => void;
+  /**
+   * Invoked after the pool releases a container back to the
+   * not-a-session state: idle-sweeper reap, explicit evictSession
+   * (cancel), or spawn failure rollback. Used to drop the persistent
+   * mapping so adoption doesn't resurrect a dead session on the next
+   * restart.
+   */
+  onContainerReleased?: (sessionId: string) => void;
+  /**
    * Config for `networking: limited` sessions. When this is unset,
    * limited networking is effectively disabled (schema still accepts
    * it but spawn will throw). In practice, index.ts always wires this
@@ -189,14 +214,17 @@ export class SessionContainerPool {
   }
 
   private async doWarmForAgent(agentId: string, spawnOptions: SpawnOptions): Promise<void> {
+    const t0 = Date.now();
     await this.evictOldestWarmIfAtCap();
     const container = await this.runtime.spawn(spawnOptions);
+    const tCreated = Date.now();
     try {
       await this.runtime.waitForReady(container, this.cfg.readyTimeoutMs);
     } catch (err) {
       await this.runtime.stop(container.id).catch(() => { /* best-effort */ });
       throw err;
     }
+    const tReady = Date.now();
     const wsClient = new GatewayWebSocketClient({
       baseUrl: container.baseUrl,
       token: container.token,
@@ -209,6 +237,7 @@ export class SessionContainerPool {
       await this.runtime.stop(container.id).catch(() => { /* best-effort */ });
       throw err;
     }
+    const tConnected = Date.now();
     this.warm.set(agentId, {
       agentId,
       container,
@@ -217,7 +246,16 @@ export class SessionContainerPool {
       spawnedAt: Date.now(),
     });
     poolWarmContainers.set(this.warm.size);
-    log.info({ agent_id: agentId }, "pre-warmed container for agent");
+    log.info(
+      {
+        agent_id: agentId,
+        container_create_ms: tCreated - t0,
+        ready_wait_ms: tReady - tCreated,
+        ws_connect_ms: tConnected - tReady,
+        total_warm_ms: tConnected - t0,
+      },
+      "pre-warmed container for agent",
+    );
   }
 
   /**
@@ -277,9 +315,15 @@ export class SessionContainerPool {
     if (args.agentId) {
       const inflight = this.pendingByAgent.get(args.agentId);
       if (inflight) {
+        const waitStart = Date.now();
         await inflight.catch(() => {
           /* if the warm spawn threw, fall through to a fresh spawn below */
         });
+        const waited = Date.now() - waitStart;
+        log.info(
+          { session_id: args.sessionId, agent_id: args.agentId, waited_for_warm_ms: waited },
+          waited > 500 ? "acquireForSession: WAITED for inflight warm" : "acquireForSession: warm-wait (instant)",
+        );
       }
     }
 
@@ -303,6 +347,11 @@ export class SessionContainerPool {
         });
         poolActiveContainers.set(this.active.size);
         poolAcquireTotal.labels({ source: "warm" }).inc();
+        this.cfg.onContainerClaimed?.({
+          sessionId: args.sessionId,
+          agentId: args.agentId,
+          container: warmEntry.container,
+        });
         log.info(
           { session_id: args.sessionId, agent_id: args.agentId },
           "claimed pre-warmed container",
@@ -335,7 +384,9 @@ export class SessionContainerPool {
     spawnOptions: SpawnOptions;
   }): Promise<Container> {
     const spawnEnd = poolSpawnDurationSeconds.startTimer();
+    const t0 = Date.now();
     const container = await this.runtime.spawn(args.spawnOptions);
+    const tCreated = Date.now();
     try {
       await this.runtime.waitForReady(container, this.cfg.readyTimeoutMs);
     } catch (err) {
@@ -344,6 +395,7 @@ export class SessionContainerPool {
       });
       throw err;
     }
+    const tReady = Date.now();
 
     const wsClient = new GatewayWebSocketClient({
       baseUrl: container.baseUrl,
@@ -363,6 +415,7 @@ export class SessionContainerPool {
       const msg = err instanceof Error ? err.message : String(err);
       throw new GatewayWsError(code, `gateway ws handshake failed: ${msg}`);
     }
+    const tConnected = Date.now();
 
     const now = Date.now();
     this.active.set(args.sessionId, {
@@ -375,6 +428,24 @@ export class SessionContainerPool {
     poolActiveContainers.set(this.active.size);
     poolAcquireTotal.labels({ source: "spawn" }).inc();
     spawnEnd();
+    const agentIdForClaim = args.spawnOptions.labels?.["orchestrator-agent-id"];
+    if (agentIdForClaim) {
+      this.cfg.onContainerClaimed?.({
+        sessionId: args.sessionId,
+        agentId: agentIdForClaim,
+        container,
+      });
+    }
+    log.info(
+      {
+        session_id: args.sessionId,
+        container_create_ms: tCreated - t0,
+        ready_wait_ms: tReady - tCreated,
+        ws_connect_ms: tConnected - tReady,
+        total_spawn_ms: tConnected - t0,
+      },
+      "fresh container spawn completed",
+    );
     return container;
   }
 
@@ -594,6 +665,14 @@ export class SessionContainerPool {
       poolActiveContainers.set(this.active.size);
       poolAcquireTotal.labels({ source: "spawn" }).inc();
       spawnEnd();
+      const agentIdForClaim = args.spawnOptions.labels?.["orchestrator-agent-id"];
+      if (agentIdForClaim) {
+        this.cfg.onContainerClaimed?.({
+          sessionId: args.sessionId,
+          agentId: agentIdForClaim,
+          container: agent,
+        });
+      }
       log.info(
         {
           session_id: args.sessionId,
@@ -641,6 +720,7 @@ export class SessionContainerPool {
     if (!entry) return;
     this.active.delete(sessionId);
     poolActiveContainers.set(this.active.size);
+    this.cfg.onContainerReleased?.(sessionId);
     await entry.wsClient.close().catch(() => {
       /* best-effort */
     });
@@ -674,7 +754,7 @@ export class SessionContainerPool {
    * ourselves; on failure the caller is responsible for stopping the
    * container. Throws if the session already has an active entry.
    */
-  async adopt(args: { sessionId: string; container: Container }): Promise<void> {
+  async adopt(args: { sessionId: string; container: Container; agentId?: string }): Promise<void> {
     if (this.active.has(args.sessionId)) {
       throw new Error(
         `session ${args.sessionId} already has an active container in the pool`,
@@ -704,6 +784,19 @@ export class SessionContainerPool {
     });
     poolActiveContainers.set(this.active.size);
     poolAcquireTotal.labels({ source: "adopt" }).inc();
+    // Re-assert the session↔container mapping after adoption. If the
+    // mapping was already in SQLite this is a no-op; if not (e.g.,
+    // container pre-dates this feature), it recovers it so subsequent
+    // restarts also reattach cleanly. Agent id is looked up from the
+    // caller's args via spawnOptions is unavailable here, so read it
+    // from the adopted session's store entry.
+    if (args.agentId) {
+      this.cfg.onContainerClaimed?.({
+        sessionId: args.sessionId,
+        agentId: args.agentId,
+        container: args.container,
+      });
+    }
     log.info(
       { session_id: args.sessionId, container_id: args.container.id },
       "adopted existing container",
@@ -770,6 +863,7 @@ export class SessionContainerPool {
       if (this.cfg.isBusy(entry.sessionId)) continue;
       this.active.delete(entry.sessionId);
       poolActiveContainers.set(this.active.size);
+      this.cfg.onContainerReleased?.(entry.sessionId);
       const idleSec = Math.round((now - entry.lastUsedAt) / 1000);
       log.info(
         { session_id: entry.sessionId, idle_seconds: idleSec },

@@ -314,8 +314,48 @@ export interface Store {
   /** Queue backend — durable on SQLite, in-memory on memory. */
   readonly queue: QueueStore;
   readonly audit: AuditStore;
+  /** Persistent session ↔ container mapping for restart-safe reattach. */
+  readonly sessionContainers: SessionContainerStore;
   /** Closes any backing file handles or connections. Safe to call more than once. */
   close(): void;
+}
+
+/**
+ * Persistent record of which Docker container serves which session.
+ *
+ * Lives in SQLite so that, after an orchestrator restart, adoption can
+ * reconnect to existing containers even when their Docker labels are
+ * stale (claimed warm containers still carry `orchestrator-session-id
+ * =__warm__` as a label because Docker labels are immutable post-create
+ * — the in-memory pool moved them from warm→active without updating
+ * any label, and there's no Docker API to update labels on a running
+ * container). The SQLite table is the authoritative source of truth;
+ * Docker labels are kept only as a best-effort hint for ops tooling.
+ *
+ * Populated the instant a container becomes session-owned (fresh
+ * spawn or warm claim). Cleared when the container is reaped or the
+ * session is evicted. No schema migration at rest — plain durability.
+ */
+export type SessionContainer = {
+  sessionId: string;
+  agentId: string;
+  containerId: string;
+  containerName: string;
+  containerPort: number;
+  /** Per-container auth token. Required for WS reconnect after restart. */
+  gatewayToken: string;
+  claimedAt: number;
+};
+
+export interface SessionContainerStore {
+  /** Upsert; overwrites any prior mapping for the session. */
+  put(entry: SessionContainer): void;
+  /** Look up by session. Returns undefined if no mapping is recorded. */
+  get(sessionId: string): SessionContainer | undefined;
+  /** Remove a session's mapping. Idempotent. */
+  delete(sessionId: string): void;
+  /** Enumerate every mapping. Used at adoption time. */
+  list(): SessionContainer[];
 }
 
 /**

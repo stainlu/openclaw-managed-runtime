@@ -1168,16 +1168,27 @@ export class AgentRouter {
     modelOverride?: string,
     thinkingLevelOverride?: string,
   ): Promise<void> {
+    // Per-step timing ledger. Lets us see exactly where wall-clock
+    // time goes between "POST /events received" and "chat.completions
+    // starts". Cheap to keep permanently — the log line only fires
+    // once per turn.
+    const t0 = Date.now();
+    const tick = (label: string, from: number) => ({ [label + "_ms"]: Date.now() - from });
+    let cursor = t0;
     const currentSession = this.sessions.get(sessionId);
     // Refresh OAuth credentials before spawn — same rationale as the
     // streamEvent path above: buildSpawnOptions reads the freshly
     // rotated access tokens via injectVaultCredentials.
     await this.refreshExpiringOAuthCredentials(agent, currentSession?.vaultId ?? null);
+    const timings: Record<string, number> = { ...tick("oauth_refresh", cursor) };
+    cursor = Date.now();
     const spawnOptions = this.buildSpawnOptions(
       sessionId,
       agent,
       currentSession ?? { remainingSubagentDepth: 0, environmentId: null } as Session,
     );
+    Object.assign(timings, tick("build_spawn_options", cursor));
+    cursor = Date.now();
 
     // Pool-backed: the first event for a session spawns a fresh container,
     // waits for /readyz, and runs the WS handshake; subsequent events
@@ -1190,6 +1201,8 @@ export class AgentRouter {
       networking: currentSession ? this.resolveNetworking(currentSession) : undefined,
       bypassWarmPool: Boolean(currentSession?.vaultId),
     });
+    Object.assign(timings, tick("pool_acquire", cursor));
+    cursor = Date.now();
 
     // Subscribe to approval broadcasts when the agent has always_ask.
     // The WS client was opened during acquireForSession; we attach a
@@ -1255,6 +1268,12 @@ export class AgentRouter {
         throw wrapWsError(err, "patch_failed");
       }
     }
+    Object.assign(timings, tick("ws_patch", cursor));
+    cursor = Date.now();
+    log.info(
+      { session_id: sessionId, total_pre_llm_ms: cursor - t0, ...timings },
+      "turn pre-LLM timings (receipt → chat.completions dispatch)",
+    );
 
     // Run the completion. On failure, do NOT evict here — the failure
     // handler decides whether to evict based on whether the session was
@@ -1268,6 +1287,10 @@ export class AgentRouter {
       sessionKey: sessionId,
     });
     runEnd();
+    log.info(
+      { session_id: sessionId, chat_completions_ms: Date.now() - cursor },
+      "chat.completions returned",
+    );
 
     // Item 9 — cost accounting. Pi's provider plugins compute the
     // authoritative per-turn cost from their catalogs (cache-aware: a

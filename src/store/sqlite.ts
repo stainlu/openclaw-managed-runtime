@@ -26,6 +26,8 @@ import type {
   QueueStore,
   RunUsage,
   SecretStore,
+  SessionContainer,
+  SessionContainerStore,
   SessionStore,
   Store,
   Vault,
@@ -309,6 +311,30 @@ CREATE TABLE IF NOT EXISTS vault_credentials (
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_credentials_vault ON vault_credentials(vault_id);
+
+-- Session ↔ container mapping. Populated by the pool the instant a
+-- container becomes session-owned (fresh spawn OR warm claim) and
+-- deleted when the container is reaped/evicted. This is the
+-- authoritative source that lets orchestrator adoption reconnect to
+-- in-flight containers after a restart: Docker labels carry stale
+-- session-ids for claimed-warm containers (labels are immutable
+-- post-create), so falling back to them would misclassify every
+-- claimed-warm container as orphan and kill running sessions —
+-- exactly the "orchestrator restarted mid-run" bug we're fixing.
+-- FK cascades so deleting a session also drops its container row;
+-- the reverse direction (stopping a container) is handled in
+-- SessionContainerPool.
+CREATE TABLE IF NOT EXISTS session_containers (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL,
+  container_id TEXT NOT NULL,
+  container_name TEXT NOT NULL,
+  container_port INTEGER NOT NULL,
+  gateway_token TEXT NOT NULL,
+  claimed_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_containers_container ON session_containers(container_id);
 `;
 
 // ---------- Agent store ----------
@@ -1181,6 +1207,95 @@ class SqliteQueueStore implements QueueStore {
   }
 }
 
+// ---------- Session-container mapping store ----------
+
+class SqliteSessionContainerStore implements SessionContainerStore {
+  private readonly upsertStmt: Database.Statement;
+  private readonly getStmt: Database.Statement;
+  private readonly deleteStmt: Database.Statement;
+  private readonly listStmt: Database.Statement;
+
+  constructor(db: Database.Database) {
+    this.upsertStmt = db.prepare(
+      `INSERT INTO session_containers (
+         session_id, agent_id, container_id, container_name,
+         container_port, gateway_token, claimed_at
+       ) VALUES (
+         @session_id, @agent_id, @container_id, @container_name,
+         @container_port, @gateway_token, @claimed_at
+       )
+       ON CONFLICT(session_id) DO UPDATE SET
+         agent_id = excluded.agent_id,
+         container_id = excluded.container_id,
+         container_name = excluded.container_name,
+         container_port = excluded.container_port,
+         gateway_token = excluded.gateway_token,
+         claimed_at = excluded.claimed_at`,
+    );
+    this.getStmt = db.prepare(
+      `SELECT session_id, agent_id, container_id, container_name,
+              container_port, gateway_token, claimed_at
+       FROM session_containers WHERE session_id = ?`,
+    );
+    this.deleteStmt = db.prepare(
+      `DELETE FROM session_containers WHERE session_id = ?`,
+    );
+    this.listStmt = db.prepare(
+      `SELECT session_id, agent_id, container_id, container_name,
+              container_port, gateway_token, claimed_at
+       FROM session_containers`,
+    );
+  }
+
+  put(entry: SessionContainer): void {
+    this.upsertStmt.run({
+      session_id: entry.sessionId,
+      agent_id: entry.agentId,
+      container_id: entry.containerId,
+      container_name: entry.containerName,
+      container_port: entry.containerPort,
+      gateway_token: entry.gatewayToken,
+      claimed_at: entry.claimedAt,
+    });
+  }
+
+  get(sessionId: string): SessionContainer | undefined {
+    const row = this.getStmt.get(sessionId) as SessionContainerRow | undefined;
+    return row ? rowToSessionContainer(row) : undefined;
+  }
+
+  delete(sessionId: string): void {
+    this.deleteStmt.run(sessionId);
+  }
+
+  list(): SessionContainer[] {
+    const rows = this.listStmt.all() as SessionContainerRow[];
+    return rows.map(rowToSessionContainer);
+  }
+}
+
+type SessionContainerRow = {
+  session_id: string;
+  agent_id: string;
+  container_id: string;
+  container_name: string;
+  container_port: number;
+  gateway_token: string;
+  claimed_at: number;
+};
+
+function rowToSessionContainer(row: SessionContainerRow): SessionContainer {
+  return {
+    sessionId: row.session_id,
+    agentId: row.agent_id,
+    containerId: row.container_id,
+    containerName: row.container_name,
+    containerPort: row.container_port,
+    gatewayToken: row.gateway_token,
+    claimedAt: row.claimed_at,
+  };
+}
+
 // ---------- Audit store ----------
 
 class SqliteAuditStore implements AuditStore {
@@ -1292,6 +1407,7 @@ export class SqliteStore implements Store {
   readonly queue: QueueStore;
   readonly audit: AuditStore;
   readonly vaults: VaultStore;
+  readonly sessionContainers: SessionContainerStore;
   /** Number of vault credentials re-encrypted during boot migration.
    *  Surfaced via src/index.ts startup log when > 0. */
   readonly migratedVaultCredentials: number = 0;
@@ -1436,6 +1552,7 @@ export class SqliteStore implements Store {
     this.secrets = new SqliteSecretStore(this.db);
     this.queue = new SqliteQueueStore(this.db);
     this.audit = new SqliteAuditStore(this.db);
+    this.sessionContainers = new SqliteSessionContainerStore(this.db);
     // Resolve vault master key. Priority:
     //   1. OPENCLAW_VAULT_KEY env (hex/base64/base64url 32 bytes)
     //   2. Row in kv_secrets (persisted from a previous boot)

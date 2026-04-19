@@ -165,9 +165,16 @@ async function main(): Promise<void> {
   // idle timeout defaults to the active timeout — if a warm container
   // has been waiting that long unclaimed, its agent is rarely used.
   const maxWarmContainers = envInt("OPENCLAW_MAX_WARM_CONTAINERS", 5);
+  // Warm-pool TTL. Default 30 min so a user who opens the portal,
+  // sends a message, reads the result, and comes back 15 minutes
+  // later still hits a hot container instead of waiting through
+  // another 10-20 s cold spawn. The old default (10 min, tied to
+  // the active session timeout) optimised for memory over latency
+  // — wrong tradeoff on a workstation or small VPS where ~10 MB of
+  // idle RAM costs less than a visible UX stall.
   const warmIdleTimeoutMs = envInt(
     "OPENCLAW_WARM_IDLE_TIMEOUT_MS",
-    idleTimeoutMs,
+    30 * 60_000,
   );
   // networking: "limited" — per-session confined network + egress-proxy
   // sidecar. Both env vars must be set or the pool treats limited
@@ -253,6 +260,27 @@ async function main(): Promise<void> {
       }
       store.sessions.delete(sessionId);
       log.info({ session_id: sessionId }, "reaped ephemeral session");
+    },
+    // Persist session↔container mapping the instant a container
+    // becomes session-owned. Required for reattach after restart:
+    // claimed warm containers still carry orchestrator-session-id=
+    // __warm__ in their Docker labels (labels are immutable
+    // post-create), so without this SQLite mapping adoption would
+    // misclassify every claimed-warm container as an orphan and
+    // kill its running session. See SessionContainerStore docstring.
+    onContainerClaimed: ({ sessionId, agentId, container }) => {
+      store.sessionContainers.put({
+        sessionId,
+        agentId,
+        containerId: container.id,
+        containerName: container.name,
+        containerPort: gatewayPort,
+        gatewayToken: container.token,
+        claimedAt: Date.now(),
+      });
+    },
+    onContainerReleased: (sessionId) => {
+      store.sessionContainers.delete(sessionId);
     },
     limitedNetworking,
   });
@@ -345,12 +373,25 @@ async function main(): Promise<void> {
   let adoptionStoppedOrphan = 0;
   let adoptionFailed = 0;
   const managedContainers = await runtime.listManaged();
+  // Authoritative session→container map is the SQLite store. Docker
+  // labels on claimed-warm containers are stale (still say __warm__),
+  // so we resolve every listManaged entry through the SQLite mapping
+  // first, falling back to the Docker label only for containers that
+  // pre-date the feature. This is what lets reattach succeed on
+  // claimed-warm containers across an orchestrator restart.
+  const persistedByContainer = new Map(
+    store.sessionContainers.list().map((e) => [e.containerId, e]),
+  );
+  const persistedBySession = new Map(
+    store.sessionContainers.list().map((e) => [e.sessionId, e]),
+  );
   for (const info of managedContainers) {
     adoptionAttempts += 1;
-    // Containers without a session-id label are legacy (pre-rename) or
-    // unclaimed warm containers. Stop them — nothing durable to rebuild.
-    const sessionId = info.sessionId;
+    // Resolve session-id: SQLite first, Docker label as fallback.
+    const persisted = persistedByContainer.get(info.id);
+    const sessionId = persisted?.sessionId ?? info.sessionId;
     if (!sessionId || sessionId === "__warm__") {
+      // Genuinely orphan: no SQLite row, and Docker label says __warm__.
       await runtime.stop(info.id).catch(() => { /* best-effort */ });
       adoptionStoppedOrphan += 1;
       startupAdoptionsTotal.labels({ outcome: "stopped_orphan" }).inc();
@@ -359,24 +400,31 @@ async function main(): Promise<void> {
     const session = store.sessions.get(sessionId);
     if (!session || session.status === "failed") {
       await runtime.stop(info.id).catch(() => { /* best-effort */ });
+      if (persisted) store.sessionContainers.delete(sessionId);
       adoptionStoppedOrphan += 1;
       startupAdoptionsTotal.labels({ outcome: "stopped_orphan" }).inc();
       continue;
     }
     if (!info.running) {
       await runtime.stop(info.id).catch(() => { /* best-effort */ });
+      if (persisted) store.sessionContainers.delete(sessionId);
       adoptionStoppedOrphan += 1;
       startupAdoptionsTotal.labels({ outcome: "stopped_orphan" }).inc();
       continue;
     }
     try {
+      // Prefer the SQLite-persisted gateway token. For containers
+      // pre-dating the feature, fall back to reading the env var via
+      // listManaged — both paths produce the same valid token.
+      const gatewayToken = persisted?.gatewayToken ?? info.token;
       await pool.adopt({
         sessionId,
+        agentId: persisted?.agentId ?? info.agentId,
         container: {
           id: info.id,
           name: info.name,
           baseUrl: info.baseUrl,
-          token: info.token,
+          token: gatewayToken,
         },
       });
       adopted.add(sessionId);
@@ -388,8 +436,20 @@ async function main(): Promise<void> {
         "adopt failed; stopping container",
       );
       await runtime.stop(info.id).catch(() => { /* best-effort */ });
+      store.sessionContainers.delete(sessionId);
       adoptionFailed += 1;
       startupAdoptionsTotal.labels({ outcome: "reattach_failed" }).inc();
+    }
+  }
+  // Any persisted mapping that didn't correspond to a still-existing
+  // container on the host is stale (container was removed while
+  // orchestrator was down). Drop it so adoption doesn't try next
+  // restart. Sessions themselves are handled by the orphan-running
+  // pass below.
+  const seenContainers = new Set(managedContainers.map((c) => c.id));
+  for (const entry of persistedBySession.values()) {
+    if (!seenContainers.has(entry.containerId)) {
+      store.sessionContainers.delete(entry.sessionId);
     }
   }
 

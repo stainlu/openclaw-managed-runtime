@@ -38,6 +38,17 @@
 
 set -euo pipefail
 
+# Boot profiling — cheap. Records ms since container started at each
+# milestone so we can see exactly where the 7-20s cold-spawn time
+# goes. Leave permanently; costs a couple microseconds per echo.
+_BOOT_T0_MS=$(date +%s%N)
+profile() {
+  local now=$(date +%s%N)
+  local delta_ms=$(( (now - _BOOT_T0_MS) / 1000000 ))
+  echo "[boot +${delta_ms}ms] $*" >&2
+}
+profile "entrypoint start"
+
 : "${OPENCLAW_AGENT_ID:?OPENCLAW_AGENT_ID is required}"
 : "${OPENCLAW_MODEL:?OPENCLAW_MODEL is required}"
 : "${OPENCLAW_STATE_DIR:=/workspace}"
@@ -93,6 +104,7 @@ tools_json_fragment() {
     | jq -s '{alsoAllow: .}'
 }
 
+profile "env validated; building tool fragments"
 TOOLS_JSON=$(tools_json_fragment)
 
 # Build denied-tools list as a JSON array for OpenClaw's tools.deny config.
@@ -257,6 +269,7 @@ jq -n \
 + (if $otel != null then { diagnostics: { otel: $otel } } else {} end)
 + (if $mcp != null then { mcp: { servers: $mcp } } else {} end)
 ' > "${CONFIG_PATH}"
+profile "wrote base config via jq"
 
 # Populate models.providers.<id> for Category B providers from the bundled
 # openclaw extension's catalog builder. No-op for Category A providers — they
@@ -266,6 +279,7 @@ jq -n \
 if [ -f /opt/openclaw-plugins/apply-provider-config.mjs ]; then
   echo "[entrypoint] applying ${OPENCLAW_PLUGIN} catalog via bundled openclaw extension"
   node /opt/openclaw-plugins/apply-provider-config.mjs "${CONFIG_PATH}" "${OPENCLAW_PLUGIN}"
+  profile "apply-provider-config.mjs done"
 fi
 
 echo "[entrypoint] wrote config to ${CONFIG_PATH}:"
@@ -317,6 +331,7 @@ if [ -n "${OPENCLAW_PACKAGES_JSON:-}" ]; then
   echo "[entrypoint] environment packages installed"
 fi
 
+profile "about to exec openclaw gateway run"
 echo "[entrypoint] starting gateway on port ${OPENCLAW_GATEWAY_PORT} (bind=lan, auth=token)"
 exec openclaw gateway run \
   --port "${OPENCLAW_GATEWAY_PORT}" \

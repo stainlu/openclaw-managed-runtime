@@ -419,6 +419,25 @@ export function buildApp(deps: ServerDeps): Hono {
     return c.json(agentResponse(agent));
   });
 
+  // Warm the per-agent container pool. Call this the moment the
+  // user expresses intent to use this agent (e.g., clicks its row
+  // in the portal) so that by the time they actually POST their
+  // first event, a container is ready. Fire-and-forget; always
+  // returns 202 immediately. The underlying warmForAgent is
+  // idempotent + race-safe (per-agent dedup map), so spamming this
+  // endpoint costs nothing beyond a single spawn.
+  app.post("/v1/agents/:agentId/warm", (c) => {
+    const agentId = c.req.param("agentId");
+    const agent = deps.agents.get(agentId);
+    if (!agent) {
+      return c.json({ error: "agent_not_found" }, 404);
+    }
+    void deps.router.warmForAgent(agent.agentId).catch((err) => {
+      log.warn({ err, agent_id: agent.agentId }, "warm-for-agent via POST /warm failed (non-fatal)");
+    });
+    return c.json({ agent_id: agent.agentId, queued: true }, 202);
+  });
+
   app.delete("/v1/agents/:agentId", (c) => {
     const agentId = c.req.param("agentId");
     const existed = deps.agents.delete(agentId);

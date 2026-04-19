@@ -19,6 +19,8 @@ import type {
   QueueStore,
   RunUsage,
   SecretStore,
+  SessionContainer,
+  SessionContainerStore,
   SessionStore,
   Store,
   Vault,
@@ -488,6 +490,23 @@ class InMemoryVaultStore implements VaultStore {
 
 // ---------- Bundle ----------
 
+class InMemorySessionContainerStore implements SessionContainerStore {
+  private readonly entries = new Map<string, SessionContainer>();
+  put(entry: SessionContainer): void {
+    this.entries.set(entry.sessionId, { ...entry });
+  }
+  get(sessionId: string): SessionContainer | undefined {
+    const e = this.entries.get(sessionId);
+    return e ? { ...e } : undefined;
+  }
+  delete(sessionId: string): void {
+    this.entries.delete(sessionId);
+  }
+  list(): SessionContainer[] {
+    return [...this.entries.values()].map((e) => ({ ...e }));
+  }
+}
+
 export class InMemoryStore implements Store {
   readonly agents: AgentStore;
   readonly environments: EnvironmentStore;
@@ -496,6 +515,7 @@ export class InMemoryStore implements Store {
   readonly queue: QueueStore;
   readonly audit: AuditStore;
   readonly vaults: VaultStore;
+  readonly sessionContainers: SessionContainerStore;
 
   constructor() {
     this.agents = new InMemoryAgentStore();
@@ -505,6 +525,7 @@ export class InMemoryStore implements Store {
     this.queue = new InMemoryQueueStore();
     this.audit = new InMemoryAuditStore();
     this.vaults = new InMemoryVaultStore();
+    this.sessionContainers = new InMemorySessionContainerStore();
   }
 
   close(): void {
