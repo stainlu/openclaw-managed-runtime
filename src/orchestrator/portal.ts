@@ -515,6 +515,14 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
           </select>
           <div class="hint">Only affects reasoning-capable models (e.g. <code>moonshot/kimi-k2-thinking</code>, <code>anthropic/claude-*</code>). Non-reasoning models silently ignore this.</div>
         </div>
+        <div class="field">
+          <label>Channels <span class="muted">— which adapters route to this agent</span></label>
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 6px 0;">
+            <input type="checkbox" id="fld-channel-telegram" style="margin: 0;" />
+            <span>Enable Telegram <span class="muted">(pairs with the telegram-adapter container + <code>TELEGRAM_BOT_TOKEN</code> in .env)</span></span>
+          </label>
+          <div class="hint">Declarative binding. The adapter container with a bot token validates this flag at startup and refuses to route messages to agents that haven't opted in.</div>
+        </div>
       </div>
       <div class="modal-footer">
         <button class="secondary" data-close="1">Cancel</button>
@@ -607,11 +615,15 @@ function renderAgents() {
     const el = document.createElement("div");
     el.className = "list-item" + (a.agent_id === S.selectedAgentId ? " selected" : "");
     const archived = a.archived_at ? '<span class="chip status-archived">archived</span>' : "";
+    const telegramBadge = a.channels?.telegram?.enabled
+      ? '<span class="chip" title="This agent answers on Telegram">telegram</span>'
+      : "";
     el.innerHTML = \`
       <div class="primary">\${a.agent_id}</div>
       <div class="secondary">
         <span class="chip">\${a.model}</span>
         <span>v\${a.version}</span>
+        \${telegramBadge}
         \${archived}
       </div>
     \`;
@@ -1150,6 +1162,7 @@ function openNewAgent() {
     const instructions = document.getElementById("fld-instructions").value.trim();
     const policy = document.getElementById("fld-policy").value;
     const thinkingLevel = document.getElementById("fld-thinking").value;
+    const telegramEnabled = document.getElementById("fld-channel-telegram").checked;
     if (!model) { toast("Model is required", true); return; }
     try {
       const body = {
@@ -1158,6 +1171,7 @@ function openNewAgent() {
         tools: [],
         permissionPolicy: { type: policy },
         thinkingLevel,
+        channels: { telegram: { enabled: telegramEnabled } },
       };
       const res = await api("/v1/agents", { method: "POST", body: JSON.stringify(body) });
       backdrop.remove();
