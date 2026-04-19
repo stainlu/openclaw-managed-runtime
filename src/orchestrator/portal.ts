@@ -168,9 +168,25 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
     background: var(--border);
     cursor: pointer;
     border: 1px solid transparent;
+    transition: transform 0.12s ease-out, box-shadow 0.12s ease-out;
   }
-  .timeline .bead:hover { border-color: var(--text-dim); }
+  .timeline .bead:hover {
+    border-color: var(--text-dim);
+    transform: translateY(-1px);
+  }
   .timeline .bead.active { outline: 2px solid var(--accent); }
+  /* The most recent step on a running session gets a pulsing glow so
+     the reader's eye tracks the agent's current action. Removed as
+     soon as the session flips back to idle (the next render doesn't
+     add the class). */
+  .timeline .bead.current {
+    box-shadow: 0 0 0 0 rgba(47, 129, 247, 0.6);
+    animation: beadPulse 1.2s ease-in-out infinite;
+  }
+  @keyframes beadPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(47, 129, 247, 0.55); }
+    50%      { box-shadow: 0 0 0 6px rgba(47, 129, 247, 0); }
+  }
   .bead.user { background: #4c8bf5; }
   .bead.agent { background: #3fb950; }
   .bead.thinking { background: #a371f7; }
@@ -297,11 +313,26 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
   .event.tool .ev-header { cursor: pointer; }
   .event.tool .ev-header:hover { background: var(--border-muted); }
   .event .chevron {
-    font-size: 10px;
-    color: var(--text-dim);
     width: 10px;
-    display: inline-block;
-    transition: transform 0.1s;
+    height: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: transform 0.15s ease-out;
+    opacity: 0.75;
+  }
+  /* Filled triangle via CSS borders — crisp at any zoom level and
+     independent of the host font's unicode support. Replaces the
+     earlier unicode triangle which rendered as a dot in small sizes. */
+  .event .chevron::before {
+    content: "";
+    width: 0;
+    height: 0;
+    border-left: 6px solid currentColor;
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    color: var(--text-muted);
   }
   .event .chevron.open { transform: rotate(90deg); }
   .event .chip {
@@ -316,8 +347,31 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
   .event .chip.role-user { background: #1b3a6b; color: #b3cafb; }
   .event .chip.role-agent { background: #143d21; color: #7ed58b; }
   .event .chip.role-thinking { background: #3a1e52; color: #d1b0ff; }
+  /* Tool chip: default amber (shell / process / catch-all). Category
+     overrides below tint to match the tool's broad type so a reader
+     can scan the trace by color — file ops one color, web ops another,
+     so nothing requires reading each label to identify the step. */
   .event .chip.role-tool { background: #4a3410; color: #f5cf7a; }
   .event .chip.role-tool.error { background: #5a1d1d; color: #ffb3b3; }
+  .event .chip.role-tool.cat-file  { background: #15305b; color: #a9cbff; }
+  .event .chip.role-tool.cat-web   { background: #3a1e52; color: #d1b0ff; }
+  .event .chip.role-tool.cat-media { background: #143d21; color: #7ed58b; }
+  .event .chip.role-tool.cat-shell { background: #4a3410; color: #f5cf7a; }
+
+  /* Chips default to Title Case so labels read like prose. */
+  .event .chip { text-transform: capitalize; }
+  .event .chip code, .event .chip:first-letter { }
+
+  /* Fresh-row entrance animation — applied only to rows that weren't
+     in the previous render. Subtle fade + downward slide so a long
+     stream of tool calls plays visibly without distracting from
+     existing content. */
+  @keyframes stepIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .event.fresh { animation: stepIn 0.25s ease-out; }
+  .timeline .bead.fresh { animation: stepIn 0.22s ease-out; }
   .event .ev-summary {
     flex: 1;
     min-width: 0;
@@ -621,7 +675,60 @@ const S = {
   // Cleared when the server-side events catch up (real user.message
   // arrives) OR the session has been idle for a poll cycle.
   pendingBySession: {},
+  // Tracks which row ids were present in the last render per session —
+  // lets us apply the fresh animation class only to rows that just
+  // arrived, instead of re-animating everything on every poll.
+  prevRowIdsBySession: {},
 };
+
+// Human-readable labels for tool chips. Keyed by tool_name. Anything
+// not in this map falls back to a Title-cased version of the raw id.
+const TOOL_LABELS = {
+  exec: "Exec",
+  bash: "Bash",
+  read: "Read",
+  write: "Write",
+  edit: "Edit",
+  apply_patch: "Patch",
+  glob: "Glob",
+  grep: "Grep",
+  web_fetch: "Web fetch",
+  web_search: "Web search",
+  x_search: "X search",
+  browser: "Browser",
+  memory_search: "Memory search",
+  memory_get: "Memory",
+  image: "Image",
+  image_generate: "Image gen",
+  music_generate: "Music gen",
+  video_generate: "Video gen",
+  tts: "TTS",
+  sessions_list: "Subagents",
+  sessions_send: "Subagent send",
+  sessions_spawn: "Spawn agent",
+  sessions_yield: "Yield",
+  subagents: "Subagents",
+  code_execution: "Code exec",
+  process: "Process",
+};
+
+// Tool chip color category. Keeps a trace scannable by color.
+const TOOL_CATEGORY = {
+  exec: "shell", bash: "shell", process: "shell", code_execution: "shell",
+  read: "file", write: "file", edit: "file", apply_patch: "file",
+  glob: "file", grep: "file",
+  web_fetch: "web", web_search: "web", x_search: "web", browser: "web",
+  image: "media", image_generate: "media", music_generate: "media",
+  video_generate: "media", tts: "media",
+};
+
+function toolLabel(name) {
+  if (!name) return "tool";
+  return TOOL_LABELS[name] ?? name.charAt(0).toUpperCase() + name.slice(1).replace(/_/g, " ");
+}
+function toolCategory(name) {
+  return TOOL_CATEGORY[name] ?? "shell";
+}
 
 // ---------- fetch helpers ----------
 async function api(path, opts = {}) {
@@ -830,8 +937,19 @@ function renderDetail(session, events) {
   const toolCount = rows.filter(r => r.kind === "tool").length;
   const tab = S.activeTab || "trace";
 
+  // Compute the set of row ids that were already rendered on the
+  // previous poll tick — used to apply the fresh animation class
+  // ONLY to newly-arrived rows. Otherwise every re-render would play
+  // the animation for all rows and look like a strobe.
+  const sid = session.session_id;
+  const prevIds = S.prevRowIdsBySession[sid] ?? new Set();
+  const rowIdFor = (r, i) => r.e?.event_id ?? r.e?.tempId ?? ("idx:" + i);
+  const currentIds = new Set(rows.map((r, i) => rowIdFor(r, i)));
+  S.prevRowIdsBySession[sid] = currentIds;
+  const freshIds = new Set([...currentIds].filter(id => !prevIds.has(id)));
+
   const tabBody = tab === "trace"
-    ? renderTraceTab(rows, isRunning)
+    ? renderTraceTab(rows, isRunning, { freshIds, rowIdFor })
     : tab === "logs"
       ? \`<div class="logs-view" id="logs-view"><div class="muted">Loading…</div></div>\`
       : \`<div class="files-view" id="files-view"><div class="muted">Loading…</div></div>\`;
@@ -848,7 +966,7 @@ function renderDetail(session, events) {
         <span class="label">Status</span><span class="value \${statusCls}">\${isRunning ? '<span class="spinner"></span>' : ""}\${session.status}</span>
         <span class="label">Duration</span><span class="value">\${totalDuration ? fmtDuration(totalDuration) : "—"}</span>
         <span class="label">Tokens</span><span class="value">\${session.tokens?.input || 0} in / \${session.tokens?.output || 0} out</span>
-        <span class="label">Cost</span><span class="value">\${fmtCost(session.cost_usd || 0)}</span>
+        <span class="label">Cost</span><span class="value" title="Cost comes from the provider plugin's price catalog in the container. Moonshot models currently ship \\$0 in openclaw's bundled catalog (tracked upstream); Anthropic / OpenAI / Google / xAI / Mistral / Bedrock report real cost automatically.">\${fmtCost(session.cost_usd || 0)}\${(session.cost_usd || 0) === 0 && (session.tokens?.input || 0) > 0 ? ' <span class="muted" style="font-size: 10px;">(catalog $0)</span>' : ""}</span>
         <span class="label">Tool calls</span><span class="value">\${toolCount}</span>
         <span class="label">Last event</span><span class="value">\${fmtMs(session.last_event_at)}</span>
       </div>
@@ -945,17 +1063,28 @@ function renderErrorBanner(rawError) {
   \`;
 }
 
-function renderTraceTab(rows, isRunning) {
+function renderTraceTab(rows, isRunning, opts = {}) {
+  const freshIds = opts.freshIds ?? new Set();
+  const rowIdFor = opts.rowIdFor ?? ((r, i) => r.e?.event_id ?? ("idx:" + i));
+  const lastIdx = rows.length - 1;
   const eventsHtml = rows.length
-    ? rows.map((r, i) => renderRow(r, i)).join("")
+    ? rows.map((r, i) => {
+        const isFresh = freshIds.has(rowIdFor(r, i));
+        return renderRow(r, i, { fresh: isFresh });
+      }).join("")
     : '<div class="muted" style="padding: 20px; text-align: center;">No events yet. Send a message below.</div>';
   const timelineHtml = rows.length
     ? rows.map((r, i) => {
         const cls = r.kind === "tool" && r.isError ? "tool-error" : r.kind;
         const title = r.kind === "tool"
-          ? r.toolName + (r.duration != null ? \` · \${fmtDuration(r.duration)}\` : "")
+          ? toolLabel(r.toolName) + (r.duration != null ? \` · \${fmtDuration(r.duration)}\` : "")
           : r.kind + (r.summary ? ": " + r.summary.slice(0, 60) : "");
-        return \`<div class="bead \${cls}" data-idx="\${i}" title="\${escapeAttr(title)}"></div>\`;
+        const classes = ["bead", cls];
+        if (freshIds.has(rowIdFor(r, i))) classes.push("fresh");
+        // Emphasize the last step while the session is live — reader's
+        // eye follows the pulsing marker to the agent's current action.
+        if (isRunning && i === lastIdx) classes.push("current");
+        return \`<div class="\${classes.join(" ")}" data-idx="\${i}" title="\${escapeAttr(title)}"></div>\`;
       }).join("")
     : "";
   return \`
@@ -1216,15 +1345,16 @@ function asText(v) {
   return "";
 }
 
-function renderRow(r, idx) {
+function renderRow(r, idx, opts = {}) {
   const rowId = "row-" + idx;
-  if (r.kind === "tool") return renderToolRow(r, rowId);
-  if (r.kind === "user") return renderSimpleRow(r, rowId, "user", "user");
-  if (r.kind === "agent") return renderSimpleRow(r, rowId, "agent", "agent");
-  if (r.kind === "thinking") return renderSimpleRow(r, rowId, "thinking", "thinking", { italic: true });
-  if (r.kind === "error") return renderSimpleRow(r, rowId, "error", "error");
+  const fresh = opts.fresh ? " fresh" : "";
+  if (r.kind === "tool") return renderToolRow(r, rowId, fresh);
+  if (r.kind === "user") return renderSimpleRow(r, rowId, "user", "user", { fresh });
+  if (r.kind === "agent") return renderSimpleRow(r, rowId, "agent", "agent", { fresh });
+  if (r.kind === "thinking") return renderSimpleRow(r, rowId, "thinking", "thinking", { italic: true, fresh });
+  if (r.kind === "error") return renderSimpleRow(r, rowId, "error", "error", { fresh });
   // system
-  return \`<div class="event system" id="\${rowId}"><div class="ev-body"><span class="chip">\${escapeHtml(r.summary)}</span></div></div>\`;
+  return \`<div class="event system\${fresh}" id="\${rowId}"><div class="ev-body"><span class="chip">\${escapeHtml(r.summary)}</span></div></div>\`;
 }
 
 /**
@@ -1250,8 +1380,9 @@ function renderSimpleRow(r, rowId, cssCls, chip, opts = {}) {
         : '<span class="ev-meta"><span class="spinner"></span>sending…</span>')
     : "";
   const contentStyle = opts.italic ? ' style="font-style: italic; color: var(--text-muted);"' : "";
+  const freshCls = opts.fresh || "";
   return \`
-    <div class="event \${cssCls}" id="\${rowId}">
+    <div class="event \${cssCls}\${freshCls}" id="\${rowId}">
       <div class="ev-simple-header">
         <span class="chip role-\${chip}">\${chip}</span>
         \${meta.length ? \`<span class="ev-meta">\${meta.join(" · ")}</span>\` : ""}
@@ -1262,17 +1393,18 @@ function renderSimpleRow(r, rowId, cssCls, chip, opts = {}) {
   \`;
 }
 
-function renderToolRow(r, rowId) {
+function renderToolRow(r, rowId, fresh = "") {
   const pending = !r.toolResult && r.startedAt;
-  const resultShort = r.toolResult ? r.toolResult.slice(0, 200) : (pending ? "running…" : "");
   const argsJson = r.toolArgs ? JSON.stringify(r.toolArgs, null, 2) : null;
   const durationTxt = r.duration != null ? fmtDuration(r.duration) : (pending ? "…" : "");
   const errCls = r.isError ? " error" : "";
+  const category = toolCategory(r.toolName);
+  const label = toolLabel(r.toolName);
   return \`
-    <div class="event tool\${errCls}" id="\${rowId}">
+    <div class="event tool\${errCls}\${fresh}" id="\${rowId}">
       <div class="ev-header">
-        <span class="chevron">▸</span>
-        <span class="chip role-tool\${errCls}">\${escapeHtml(r.toolName)}</span>
+        <span class="chevron"></span>
+        <span class="chip role-tool cat-\${category}\${errCls}">\${escapeHtml(label)}</span>
         <span class="ev-summary">\${escapeHtml(r.summary || "")}</span>
         \${durationTxt ? \`<span class="ev-meta">\${pending ? '<span class="spinner"></span>' : ""}\${durationTxt}</span>\` : ""}
       </div>
