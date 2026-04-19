@@ -306,11 +306,13 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
     display: flex;
     align-items: center;
     gap: 10px;
+    /* Match ev-simple-header padding exactly so the [chip] starts at
+       the same left X coordinate regardless of whether the row is a
+       user bubble, agent bubble, or tool row. */
     padding: 8px 12px;
     cursor: pointer;
     user-select: none;
   }
-  .event.tool .ev-header { cursor: pointer; }
   .event.tool .ev-header:hover { background: var(--border-muted); }
   .event .chevron {
     width: 10px;
@@ -381,9 +383,28 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .event .ev-meta { font-size: 11px; color: var(--text-dim); font-family: ui-monospace, monospace; flex-shrink: 0; }
+  .event .ev-meta {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-family: ui-monospace, monospace;
+    flex-shrink: 0;
+    /* Always float timing to the far right regardless of row type,
+       so "Ns · 0:SS" lines up in a single column across every row. */
+    margin-left: auto;
+  }
+  .event .ev-meta.pending-failed {
+    color: var(--danger);
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: background 0.12s ease-out;
+  }
+  .event .ev-meta.pending-failed:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); }
   .event .ev-body {
-    padding: 0 12px 10px 30px;
+    /* Same left indent as the simple-content body (12px) so tool row
+       bodies line up with user/agent bubble contents. The earlier 30px
+       indent was to clear the chevron — chevron is gone, indent with it. */
+    padding: 0 12px 10px 12px;
     font-size: 13px;
     line-height: 1.5;
   }
@@ -422,7 +443,8 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 6px 12px 2px;
+    /* Match ev-header so chip + timing line up across row types. */
+    padding: 8px 12px 2px;
   }
   .event .ev-simple-content {
     padding: 2px 12px 8px;
@@ -822,6 +844,14 @@ function selectAgent(agentId) {
   document.getElementById("btn-new-session").disabled = false;
   loadSessions();
   renderDetail();
+  // Fire-and-forget warm-up. Starts spawning a container for this
+  // agent NOW so that by the time the user types their first
+  // message and clicks Send (typically 5-30s later), the pool has
+  // a ready container to claim. Hides ~20s of cold-spawn latency.
+  // The endpoint is idempotent — clicking back and forth between
+  // agents doesn't rack up spawns.
+  fetch(\`/v1/agents/\${agentId}/warm\`, { method: "POST" })
+    .catch(() => { /* best-effort, never blocks UI */ });
 }
 
 // ---------- Sessions pane ----------
@@ -901,7 +931,7 @@ function renderDetail(session, events) {
   // Combine agent.tool_use + agent.tool_result pairs into a single row,
   // matched by tool_call_id. Orphan tool_use (result pending) shows a
   // spinner. Session-level metadata events are hidden by default.
-  const rows = buildEventRows(events);
+  const rows = buildEventRows(events, session);
   // Splice in optimistic user messages that haven't landed in the
   // server event stream yet (the container hasn't persisted them).
   // Clear entries whose content already appears as a user.message
@@ -913,22 +943,56 @@ function renderDetail(session, events) {
       return typeof c === "string" ? c : "";
     }),
   );
+  // Drop pending entries whose content is now in the real event
+  // stream. Critical side-effect: transfer postedAt (client-side
+  // click time) onto the matching real user.message event as
+  // _clientPostedAt. This lets the user-row timing continue from
+  // client wall clock across the pending→real transition — no
+  // "sudden drop of 20s" when the real event arrives and we
+  // otherwise would've switched anchor from client clock to server
+  // clock (which starts after the container cold-spawn finishes).
+  for (const p of pendingList) {
+    const match = events.find(
+      e => e.type === "user.message" && (typeof e.content === "string" ? e.content : "") === p.content,
+    );
+    if (match && p.postedAt != null) {
+      match._clientPostedAt = p.postedAt;
+    }
+  }
   S.pendingBySession[session.session_id] = pendingList.filter(
-    p => p.status === "failed" || !realUserMessages.has(p.content),
+    p => !realUserMessages.has(p.content),
   );
-  // If the session flipped to failed and any pending is still
-  // "sending", the spawn failed before the container could record
-  // the message. Mark it so the spinner goes away and the red
-  // "failed to send" tag appears.
+  // If the session transitioned to "failed", any pending bubble
+  // corresponds to a message that never got processed. Flip it so
+  // the red "failed · retry" affordance appears.
   if (session.status === "failed") {
     for (const p of S.pendingBySession[session.session_id]) {
       if (p.status === "sending") p.status = "failed";
     }
   }
+  // NOTE: no time-based watchdog here. Agent runs routinely take
+  // longer than any reasonable wall-clock limit (10-60s for a
+  // multi-tool turn), and a watchdog fires during normal runs,
+  // flashing a fake "failed" state. The POST error handler in
+  // sendMessage() already handles network-level failures; the
+  // session.status === "failed" branch above handles server-side
+  // spawn/run failures. Everything else is legitimately "in flight"
+  // and the bubble should stay as the regular user bubble until the
+  // real message lands in the event stream and the filter above
+  // removes it.
+  // Pending user bubbles get their timing from postedAt so the "Ns ·
+  // 0:00" pill shows up the instant the bubble renders, without
+  // waiting for the real server event to land. Offset is 0 by
+  // convention (pending user = start of its own turn); duration
+  // ticks up on every poll.
+  const nowForPending = Date.now();
   for (const p of S.pendingBySession[session.session_id]) {
+    const durMs = p.postedAt ? Math.max(0, nowForPending - p.postedAt) : 0;
     rows.push({
       kind: "user",
       e: { content: p.content, _pending: p.status },
+      offsetMs: 0,
+      durationMs: durMs,
     });
   }
   const totalDuration = events.length
@@ -957,6 +1021,19 @@ function renderDetail(session, events) {
   const errBanner = session.status === "failed" && session.error
     ? renderErrorBanner(session.error)
     : "";
+
+  // Capture the user's current scroll position BEFORE we blow away
+  // the DOM via innerHTML. We only auto-scroll-to-bottom if the user
+  // was ALREADY at (or near) the bottom — otherwise we restore their
+  // manual scroll position so polling doesn't fight their reading.
+  // "Near bottom" = within 80px of the bottom, which covers small
+  // paddings/visual gaps. No previous state (first render / tab
+  // switch) → treat as at-bottom so the newest content is visible.
+  const prevEv = document.getElementById("detail-events");
+  const prevScrollTop = prevEv?.scrollTop ?? null;
+  const wasAtBottom = prevEv == null
+    ? true
+    : (prevEv.scrollTop + prevEv.clientHeight >= prevEv.scrollHeight - 80);
 
   pane.innerHTML = \`
     <div class="detail">
@@ -1007,6 +1084,18 @@ function renderDetail(session, events) {
   }
 
   if (tab === "trace") {
+    // Apply the scroll decision we captured above. This runs BEFORE
+    // wireTraceInteractions (which previously unconditionally
+    // scrolled to bottom — that behavior moved here with the
+    // at-bottom check so manual scrolls survive the 1.5s poll).
+    const newEv = document.getElementById("detail-events");
+    if (newEv) {
+      if (wasAtBottom) {
+        newEv.scrollTop = newEv.scrollHeight;
+      } else if (prevScrollTop != null) {
+        newEv.scrollTop = prevScrollTop;
+      }
+    }
     wireTraceInteractions(pane, isRunning);
   } else if (tab === "logs") {
     refreshLogs();
@@ -1121,9 +1210,9 @@ function wireTraceInteractions(pane, _isRunning) {
       }
     });
   });
-  const ev = document.getElementById("detail-events");
-  if (ev) ev.scrollTop = ev.scrollHeight;
-
+  // Scroll positioning is handled in renderDetail — it knows whether
+  // to auto-scroll (user was at the bottom) or preserve the user's
+  // manual position. Nothing to do here.
   const sendBtn = document.getElementById("btn-send");
   if (sendBtn) sendBtn.onclick = sendMessage;
   const ta = document.getElementById("composer-text");
@@ -1138,6 +1227,17 @@ function wireTraceInteractions(pane, _isRunning) {
   }
   const cancelBtn = document.getElementById("btn-cancel");
   if (cancelBtn) cancelBtn.onclick = cancelSession;
+  // Retry handler for bubbles whose POST failed (server bounced
+  // mid-request, network hiccup, etc.). Click the red "failed ·
+  // retry" badge to re-POST the original content.
+  pane.querySelectorAll(".pending-failed").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const content = el.dataset.retry;
+      if (!content || !S.selectedSessionId) return;
+      retrySend(S.selectedSessionId, content);
+    });
+  });
 }
 
 async function refreshLogs() {
@@ -1265,7 +1365,7 @@ function fmtBytes(n) {
  *   - agent.tool_result → attach to the matching tool_use by tool_call_id
  *   - unmatched tool_result → standalone row
  */
-function buildEventRows(events) {
+function buildEventRows(events, session = null) {
   const pending = new Map(); // tool_call_id -> row ref
   const rows = [];
   for (const e of events) {
@@ -1321,30 +1421,93 @@ function buildEventRows(events) {
       rows.push({ kind: "system", e, summary: t + ": " + asText(e.content) });
     }
   }
-  // Second pass: attach each row's offset from session-start and
-  // duration-until-next-row. These power the "Ns · 0:MM:SS" timing
-  // pill that the render functions drop into the meta area.
+  // Second pass: attach each row's offset + duration.
   //
-  //   - offsetMs = row.ts - firstRow.ts        (0 for the first row)
-  //   - durationMs = nextRow.ts - row.ts       (time spent BEFORE the
-  //                                             next observable step;
-  //                                             for tool rows we already
-  //                                             have tool_use→tool_result
-  //                                             duration, which we
-  //                                             prefer since it measures
-  //                                             the tool itself, not the
-  //                                             gap to the next agent step)
-  //   - last row's duration: null (in-flight or final)
-  const firstTs = rows.length > 0 ? (rows[0].e?.created_at ?? 0) : 0;
+  // OFFSET anchors to the MOST RECENT user.message. Each new user
+  // turn resets the clock — so "0:05" on a tool row means 5s since
+  // the user sent THIS turn's prompt, not 5s since the session was
+  // first created. For rows that appear before any user.message
+  // (session.model_change at session-init), offset falls back to the
+  // first row's ts, but those are system rows that render without
+  // timing anyway so the fallback is cosmetic.
+  //
+  // DURATION = time until the next row, except for tool rows which
+  // already carry the real tool_use→tool_result delta (preferred —
+  // measures the tool itself, not the gap to the next step).
+  // Anchor: if the current user row has a _clientPostedAt (set by
+  // renderDetail when a pending bubble's content matches this real
+  // event), use THAT as the anchor ts. That's the client's actual
+  // click time — anchoring here makes every offset in the turn
+  // reflect wall-clock-since-click, including the orchestrator
+  // cold-spawn window that's otherwise invisible in server
+  // timestamps (container's JSONL clock only starts after cold
+  // spawn finishes). For turns loaded from server with no pending
+  // history (e.g., page refresh mid-session), fall back to the
+  // server event ts — offsets then reflect only the post-cold-spawn
+  // timeline, but there's no client reference to recover from.
+  let anchorTs = rows.length > 0 ? (rows[0].e?.created_at ?? 0) : 0;
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     const ts = r.e?.created_at;
     if (typeof ts !== "number") continue;
-    r.offsetMs = Math.max(0, ts - firstTs);
-    if (r.kind === "tool" && typeof r.duration === "number") continue; // preserve tool's own duration
+    if (r.kind === "user") {
+      anchorTs = r.e._clientPostedAt ?? ts;
+    }
+    r.offsetMs = Math.max(0, ts - anchorTs);
+    if (r.kind === "tool" && typeof r.duration === "number") continue;
     const nextTs = rows[i + 1]?.e?.created_at;
     if (typeof nextTs === "number") r.durationMs = Math.max(0, nextTs - ts);
   }
+  // Third pass — override user-row duration to reflect the WHOLE
+  // TURN duration (user message → end of that turn), not the 2.5s
+  // gap to the agent's first reaction. This matches how a human
+  // reads "how long did this message take" — the full round-trip.
+  //
+  //   - Next user.message exists → turn ended when the user spoke
+  //     again; duration = next_user.ts - this_user.ts.
+  //   - No next user.message, session still running → turn
+  //     in-progress; duration = now - this_user.ts (updates live
+  //     via the 1.5s poll).
+  //   - No next user.message, session idle/failed → turn finished
+  //     at the last recorded event; duration = last.ts - this_user.ts.
+  const now = Date.now();
+  const lastTs = rows.length > 0 ? (rows[rows.length - 1]?.e?.created_at) : undefined;
+  const running = session?.status === "running";
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (r.kind !== "user") continue;
+    const thisTs = r.e?.created_at;
+    if (typeof thisTs !== "number") continue;
+    // Prefer client-side _clientPostedAt (actual click time) over
+    // the server event ts (which starts AFTER the cold spawn). This
+    // eliminates the "40s ticks down to 20s when exec appears"
+    // discontinuity when a pending bubble is replaced by its real
+    // event — both now use the same client click as the anchor.
+    const startTs = r.e?._clientPostedAt ?? thisTs;
+    let endTs;
+    for (let j = i + 1; j < rows.length; j++) {
+      if (rows[j].kind === "user") {
+        const cand = rows[j].e?._clientPostedAt ?? rows[j].e?.created_at;
+        if (typeof cand === "number") { endTs = cand; break; }
+      }
+    }
+    if (endTs == null) {
+      if (running) endTs = now;
+      else if (typeof lastTs === "number" && lastTs >= thisTs) endTs = lastTs;
+    }
+    if (typeof endTs === "number") r.durationMs = Math.max(0, endTs - startTs);
+  }
+  // Intentionally NO dedup pass here. Moonshot/Kimi emits text+tool
+  // intermediates during an agentic loop, and it's tempting to hide
+  // the non-final agent.messages to avoid "duplicate-looking"
+  // summaries. That created two worse bugs: (a) intermediates
+  // flickered — shown at poll N, removed at poll N+1 when a newer
+  // one arrived, reappearing as a different row; (b) by turn end,
+  // all the agent's in-progress narration was gone and only the
+  // final summary rendered, giving no sense of the model's
+  // progression. Showing every agent.message in chronological order
+  // with the tool calls interleaved matches what actually happened
+  // in the turn — which is what the trace is for.
   return rows;
 }
 
@@ -1395,15 +1558,12 @@ function renderRow(r, idx, opts = {}) {
  */
 function renderSimpleRow(r, rowId, cssCls, chip, opts = {}) {
   const content = asText(r.e.content);
-  const meta = [];
-  if (r.tokensIn || r.tokensOut) meta.push(\`\${r.tokensIn || 0}in/\${r.tokensOut || 0}out\`);
-  if (r.cost) meta.push(fmtCost(r.cost));
+  // Only timing per-row. Cost + tokens live in the session header
+  // (top-right stat block) — showing them again on every row is
+  // redundant and visually noisy.
   const timing = fmtStepTiming(r.durationMs, r.offsetMs);
-  if (timing) meta.push(timing);
-  const pendingTag = r.e?._pending
-    ? (r.e._pending === "failed"
-        ? '<span class="ev-meta" style="color: var(--danger);">failed to send</span>'
-        : '<span class="ev-meta"><span class="spinner"></span>sending…</span>')
+  const pendingTag = r.e?._pending === "failed"
+    ? \`<span class="ev-meta pending-failed" data-retry="\${escapeAttr(content)}" title="Click to retry">failed · retry ↻</span>\`
     : "";
   const contentStyle = opts.italic ? ' style="font-style: italic; color: var(--text-muted);"' : "";
   const freshCls = opts.fresh || "";
@@ -1411,7 +1571,7 @@ function renderSimpleRow(r, rowId, cssCls, chip, opts = {}) {
     <div class="event \${cssCls}\${freshCls}" id="\${rowId}">
       <div class="ev-simple-header">
         <span class="chip role-\${chip}">\${chip}</span>
-        \${meta.length ? \`<span class="ev-meta">\${meta.join(" · ")}</span>\` : ""}
+        \${timing ? \`<span class="ev-meta">\${timing}</span>\` : ""}
         \${pendingTag}
       </div>
       <div class="ev-simple-content"\${contentStyle}>\${escapeHtml(content)}</div>
@@ -1433,7 +1593,6 @@ function renderToolRow(r, rowId, fresh = "") {
   return \`
     <div class="event tool\${errCls}\${fresh}" id="\${rowId}">
       <div class="ev-header">
-        <span class="chevron"></span>
         <span class="chip role-tool cat-\${category}\${errCls}">\${escapeHtml(label)}</span>
         <span class="ev-summary">\${escapeHtml(r.summary || "")}</span>
         \${timing || pending ? \`<span class="ev-meta">\${pending ? '<span class="spinner"></span>' : ""}\${timing || "running…"}</span>\` : ""}
@@ -1473,11 +1632,17 @@ function fmtStepTiming(durationMs, offsetMs) {
 }
 
 function fmtDuration(ms) {
+  // Sub-second: keep millisecond precision (useful for tool rows
+  // that complete in ~100ms — seeing "0s" would hide real detail).
   if (ms < 1000) return ms + "ms";
-  const s = ms / 1000;
-  if (s < 60) return s.toFixed(s < 10 ? 1 : 0) + "s";
+  // 1s+: integer seconds only. Matches CMA's "1s · 0:00" style and
+  // gives a clean monotonic tick on the 1s poll — "1s → 2s → 3s"
+  // reads as a smooth wall clock, which the previous "1.5s → 3.0s →
+  // 4.5s" did not (users read the decimal jump as acceleration).
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + "s";
   const m = Math.floor(s / 60);
-  const rs = Math.round(s % 60);
+  const rs = s % 60;
   return m + "m " + rs + "s";
 }
 
@@ -1503,6 +1668,10 @@ async function sendMessage() {
   // "failed to send" — the message stays visible and the error
   // banner explains why.
   const tempId = "pending_" + Math.random().toString(36).slice(2, 10);
+  // postedAt is the JS timestamp of the user's send click. Used by
+  // renderDetail to compute a live "Ns · 0:00" timing pill on the
+  // pending bubble BEFORE the real user.message event arrives from
+  // the server, so the row has timing the instant it appears.
   const pending = { content, tempId, status: "sending", postedAt: Date.now() };
   if (!S.pendingBySession[sessionId]) S.pendingBySession[sessionId] = [];
   S.pendingBySession[sessionId].push(pending);
@@ -1512,13 +1681,34 @@ async function sendMessage() {
       method: "POST",
       body: JSON.stringify({ type: "user.message", content }),
     });
-    // Success path: don't clear the pending entry here — let the
-    // next refresh cycle clear it once the real user.message shows
-    // up in the server event stream. Prevents a flash of empty
-    // detail pane.
   } catch (err) {
     pending.status = "failed";
     toast("Send failed: " + err.message, true);
+  }
+  refreshDetail();
+}
+
+async function retrySend(sessionId, content) {
+  // Drop any failed entries matching this content from the pending
+  // list, then re-run the normal send path. Same optimistic insert,
+  // same watchdog — if it fails again, the user gets another
+  // "failed · retry" affordance, not a permanent stuck state.
+  const list = S.pendingBySession[sessionId] || [];
+  S.pendingBySession[sessionId] = list.filter(
+    p => !(p.status === "failed" && p.content === content),
+  );
+  const tempId = "pending_" + Math.random().toString(36).slice(2, 10);
+  const pending = { content, tempId, status: "sending", postedAt: Date.now() };
+  S.pendingBySession[sessionId].push(pending);
+  refreshDetail();
+  try {
+    await api(\`/v1/sessions/\${sessionId}/events\`, {
+      method: "POST",
+      body: JSON.stringify({ type: "user.message", content }),
+    });
+  } catch (err) {
+    pending.status = "failed";
+    toast("Retry failed: " + err.message, true);
   }
   refreshDetail();
 }
@@ -1594,6 +1784,10 @@ function startPolling() {
   S.sessionsPollTimer = setInterval(() => {
     if (S.selectedAgentId) loadSessions();
   }, 5_000);
+  // 1s cadence so the live duration counter on the current user
+  // bubble advances by exactly 1 second each tick — integer-second
+  // math and integer-second display line up, eliminating the "timer
+  // going too fast" perception that 1500ms + .toFixed(1) created.
   S.detailPollTimer = setInterval(async () => {
     if (!S.selectedSessionId) return;
     try {
@@ -1603,7 +1797,7 @@ function startPolling() {
         await refreshDetail();
       }
     } catch { /* ignore transient */ }
-  }, 1_500);
+  }, 1_000);
 }
 
 // ---------- Bootstrap ----------
