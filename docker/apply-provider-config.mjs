@@ -114,6 +114,47 @@ cfg.models.mode = cfg.models.mode ?? "merge";
 cfg.models.providers = cfg.models.providers ?? {};
 cfg.models.providers[providerId] = providerConfig;
 
+// Price-override pass. openclaw's bundled plugin catalogs ship with
+// real prices for most Category A providers (Anthropic, OpenAI, Google,
+// xAI, Mistral, Bedrock) but $0 for Moonshot (tracked in
+// openclaw/openclaw#67928). We carry a small JSON table of real-world
+// $/1M-token prices in provider-prices.json; if the provider built
+// above has an entry, patch the cost block on each matching model so
+// cost.total comes out non-zero. When openclaw ships real prices
+// upstream, delete the matching provider block from the JSON to defer
+// to upstream without any other change.
+const PRICES_PATH = "/opt/openclaw-plugins/provider-prices.json";
+let overrides;
+try {
+  overrides = JSON.parse(readFileSync(PRICES_PATH, "utf8"));
+} catch (err) {
+  if (err.code !== "ENOENT") {
+    process.stderr.write(
+      `[apply-provider-config] warning: couldn't read price overrides: ${err.message}\n`,
+    );
+  }
+}
+if (overrides && overrides[providerId] && Array.isArray(providerConfig.models)) {
+  const table = overrides[providerId];
+  let patched = 0;
+  for (const model of providerConfig.models) {
+    const row = table[model.id];
+    if (!row) continue;
+    model.cost = {
+      input: row.input ?? 0,
+      output: row.output ?? 0,
+      cacheRead: row.cacheRead ?? 0,
+      cacheWrite: row.cacheWrite ?? 0,
+    };
+    patched++;
+  }
+  if (patched > 0) {
+    process.stdout.write(
+      `[apply-provider-config] applied price overrides to ${patched} ${providerId} model(s) from provider-prices.json\n`,
+    );
+  }
+}
+
 writeFileSync(configPath, JSON.stringify(cfg, null, 2), "utf8");
 process.stdout.write(
   `[apply-provider-config] populated models.providers.${providerId} with ${providerConfig.models?.length ?? 0} model(s) from bundled openclaw catalog\n`,

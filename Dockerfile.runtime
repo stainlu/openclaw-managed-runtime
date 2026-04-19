@@ -102,6 +102,16 @@ COPY docker/confirm-tools-plugin/ /opt/openclaw-plugins/confirm-tools/
 # automatically on the next image rebuild.
 COPY docker/apply-provider-config.mjs /opt/openclaw-plugins/apply-provider-config.mjs
 
+# Real-world $/1M-token prices for providers whose openclaw-bundled
+# catalog ships $0 (currently Moonshot, tracked upstream in
+# openclaw/openclaw#67928). apply-provider-config.mjs reads this at
+# container start and patches cost blocks on matching model ids so
+# the session cost rollup reflects real spend instead of catalog-$0.
+# Sourced from each provider's own docs — see _meta.sources in the
+# JSON. Bump when upstream ships real prices (delete the provider
+# block to defer to upstream) or when a provider changes rates.
+COPY docker/provider-prices.json /opt/openclaw-plugins/provider-prices.json
+
 USER openclaw
 WORKDIR /workspace
 
