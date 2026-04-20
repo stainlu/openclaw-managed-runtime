@@ -56,6 +56,18 @@ PROVIDER_KEY_NAMES=(
 # Default test model matches the local smoke path.
 DEFAULT_TEST_MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.5}"
 
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+log() { printf "==> %s\n" "$*"; }
+err() { printf "error: %s\n" "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+# Run hcloud with HCLOUD_TOKEN already exported. We intentionally do NOT rely on
+# `hcloud context create` so the script is reproducible.
+hc() { hcloud "$@"; }
+
 # fail2ban whitelist. Ubuntu 24.04's stock image enables fail2ban on the
 # sshd jail — any IP that triggers "connection closed pre-auth" a few
 # times gets DROP-ruled for ~10 min, escalating on retry. Local proxies
@@ -69,9 +81,13 @@ DEFAULT_TEST_MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.5}"
 # so `./scripts/deploy-hetzner.sh` from a ClashX-proxied laptop just
 # works. Override with the literal IP(s) you want to trust; set to the
 # empty string to explicitly opt out of any auto-whitelist.
+#
+# IMPORTANT: this block MUST come after `log()` is defined above — a
+# previous version of this file inlined it near the top, which
+# silently fell through to macOS's `log` binary (prints a help page
+# and exits 0), masking any real error in the subsequent destroy/
+# provision path. Lesson: don't forward-reference shell functions.
 if [[ -z "${OPENCLAW_TRUSTED_SSH_IPS+x}" ]]; then
-    # Only auto-discover when the variable is entirely unset. Empty
-    # string means "operator wants no whitelist".
     _auto_ip=$(curl -sSf --max-time 4 https://api.ipify.org 2>/dev/null || true)
     if [[ -n "${_auto_ip}" ]]; then
         OPENCLAW_TRUSTED_SSH_IPS="${_auto_ip}"
@@ -80,18 +96,6 @@ if [[ -z "${OPENCLAW_TRUSTED_SSH_IPS+x}" ]]; then
         OPENCLAW_TRUSTED_SSH_IPS=""
     fi
 fi
-
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-
-log() { printf "==> %s\n" "$*"; }
-err() { printf "error: %s\n" "$*" >&2; }
-die() { err "$*"; exit 1; }
-
-# Run hcloud with HCLOUD_TOKEN already exported. We intentionally do NOT rely on
-# `hcloud context create` so the script is reproducible.
-hc() { hcloud "$@"; }
 
 # ------------------------------------------------------------------------------
 # Teardown path
