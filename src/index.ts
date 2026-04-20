@@ -673,6 +673,7 @@ async function main(): Promise<void> {
       sessionContainers: store.sessionContainers,
       startTs: Date.now(),
       commitSha: process.env.OPENCLAW_COMMIT,
+      maxWarmContainers,
     },
     { port },
   );

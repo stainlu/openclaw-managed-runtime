@@ -148,6 +148,13 @@ export type ServerDeps = {
    * hardcoded literal.
    */
   commitSha?: string;
+  /**
+   * Pool warm target — `OPENCLAW_MAX_WARM_CONTAINERS` resolved at
+   * process start. Surfaced on /healthz so the portal can render
+   * "0 / 3 target" honestly on cloud deploys and "0 / 0" on a dev
+   * laptop without guessing. Zero means warm pooling is opted out.
+   */
+  maxWarmContainers: number;
 };
 
 function agentResponse(agent: AgentConfig) {
@@ -428,6 +435,7 @@ export function buildApp(deps: ServerDeps): Hono {
       // clients don't need to compute it.
       start_ts: deps.startTs,
       uptime_ms: now - deps.startTs,
+      max_warm: deps.maxWarmContainers,
     });
   });
 

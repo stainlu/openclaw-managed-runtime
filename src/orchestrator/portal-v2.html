@@ -736,7 +736,7 @@ const EVENTS = [];
 const AUDIT_ROWS = [];
 const ENVIRONMENTS = [];
 const VAULTS = [];
-const HEALTH = { ok: false, version: '—', commit: 'unknown', uptimeMs: 0, startTs: null };
+const HEALTH = { ok: false, version: '—', commit: 'unknown', uptimeMs: 0, startTs: null, maxWarm: 0 };
 // Baseline labels rendered before the first pump lands. pumpSessions
 // + pumpMetrics overwrite each slot with live values. The "· 24h"
 // labels mean a real rolling 24-hour window (filtered on
@@ -998,6 +998,7 @@ async function pumpHealth() {
     HEALTH.commit = body.commit || 'unknown';
     HEALTH.startTs = typeof body.start_ts === 'number' ? body.start_ts : HEALTH.startTs;
     HEALTH.uptimeMs = typeof body.uptime_ms === 'number' ? body.uptime_ms : 0;
+    HEALTH.maxWarm = typeof body.max_warm === 'number' ? body.max_warm : 0;
     LIVE_BUS.notify();
   } catch {}
 }
@@ -1055,10 +1056,18 @@ async function pumpMetrics() {
     const warmActive = grab('pool_warm_containers');
     const activeCount = grab('pool_active_containers');
     if (warmActive !== null) {
+      // The value is the live warm count; the sub shows the configured
+      // target (max_warm from /healthz) so an operator on a cloud box
+      // can see "0 / 3 target" and tell the difference between "this
+      // deployment intends 3 warms but hasn't filled them" and "this
+      // deployment opted out of warming" (max 0, as on a dev laptop).
+      const target = HEALTH.maxWarm || 0;
+      const targetStr = target > 0 ? 'target ' + target : 'warming off';
+      const activeStr = activeCount != null ? activeCount + ' active' : '';
       STATS[1] = {
         label: 'Warm pool',
         value: String(warmActive),
-        sub: activeCount != null ? activeCount + ' active' : '',
+        sub: activeStr ? activeStr + ' · ' + targetStr : targetStr,
       };
     }
     // Cold starts — sum across all agent labels. Monotonic Prom
@@ -1151,14 +1160,16 @@ function Topbar({ route, setRoute, onTweaks }) {
         display: 'flex', alignItems: 'center', gap: 2,
         padding: '0 18px', minWidth: 0, overflow: 'hidden',
       }}>
-        <Mono s={11} c="var(--ink-3)">org_</Mono>
-        <Mono s={11} c="var(--ink)">stainlu</Mono>
-        <Icon n="chevronR" s={11} style={{ color: 'var(--ink-4)', margin: '0 6px', flexShrink: 0 }} />
-        <Mono s={11} c="var(--ink-3)" className="oc-deployment-prefix">deployment_</Mono>
+        {/* Breadcrumb = the truth of what this browser is talking to.
+            The old hardcoded "deployment_prod-hetzner-cax11" lied on
+            every localhost visit and made cloud-vs-local impossible
+            to tell apart. `window.location.host` is the honest label —
+            "localhost:8080", "42.42.42.42:8080", etc. */}
+        <Mono s={11} c="var(--ink-3)" className="oc-deployment-prefix">host_</Mono>
         <Mono s={11} c="var(--ink)" style={{
           whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0,
-        }}>prod-hetzner-cax11</Mono>
-        <Badge tone="ok" style={{ marginLeft: 10, flexShrink: 0 }}>healthy</Badge>
+        }}>{typeof window !== 'undefined' ? window.location.host : '—'}</Mono>
+        <Badge tone={HEALTH.ok ? 'ok' : 'warn'} style={{ marginLeft: 10, flexShrink: 0 }}>{HEALTH.ok ? 'healthy' : 'unhealthy'}</Badge>
         <Mono s={11} c="var(--ink-3)" className="oc-commit" style={{ marginLeft: 10, whiteSpace: 'nowrap', flexShrink: 0 }}>
           commit {HEALTH.commit === 'unknown' ? '—' : HEALTH.commit.slice(0, 7)} · v{HEALTH.version}
         </Mono>
