@@ -1900,6 +1900,14 @@ const { useState: useStateDetail, useEffect: useEffectDetail, useRef: useRefDeta
 // powers the `session.status_running` row's real container + boot
 // description (was previously a hardcoded mock string).
 function EventRow({ e, streaming, session }) {
+  // Orchestrator-internal bookkeeping. These fire at the top of every
+  // run when the composer set a model/thinking override. They contain
+  // no conversational content and clutter the stream — not in the
+  // design either. Hide them from the timeline; they stay in the
+  // raw JSONL for operators who want them.
+  if (e.type === 'session.model_change' || e.type === 'session.thinking_level_change') {
+    return null;
+  }
   const kindTone = {
     'session.status_running':  { tag: 'status', c: 'var(--ink-3)' },
     'user.message':            { tag: 'user',   c: 'var(--ink)' },
@@ -1979,6 +1987,15 @@ function EventRow({ e, streaming, session }) {
         fontSize: 13, color: 'var(--ink-3)', fontStyle: 'italic',
         lineHeight: 1.55, maxWidth: '62ch',
       }}>{e.text}</div>
+    </Row>;
+  }
+  if (e.type === 'agent.message') {
+    // The final reply. Rendered plain (no italic, full ink) so it
+    // reads like natural text, matching the design. e.text is the
+    // stringified content set by asDesignEvent — for agent.message
+    // Pi stores a plain string, so no further parsing needed.
+    return <Row>
+      <p style={{ margin: 0, fontSize: 14, color: 'var(--ink)', lineHeight: 1.6, maxWidth: '62ch', whiteSpace: 'pre-wrap' }}>{e.text}</p>
     </Row>;
   }
   if (e.type === 'agent.tool_use') {

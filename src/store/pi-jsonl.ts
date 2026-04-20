@@ -114,6 +114,23 @@ export class PiJsonlEventReader {
   }
 
   /**
+   * Count "turns" = user.message events for this session. Used by the
+   * orchestrator's session-list endpoint to expose a turns field on the
+   * session-summary response so the UI can render "4 turns" etc. without
+   * the client having to tail the entire event stream.
+   *
+   * Single-pass over the JSONL, no extra file I/O vs latestAgentMessage
+   * (same listBySession call); callers that want both should read the
+   * events array once and loop instead of hitting this twice.
+   */
+  countUserTurns(agentId: string, sessionId: string): number {
+    const events = this.listBySession(agentId, sessionId);
+    let n = 0;
+    for (const e of events) if (e && e.type === "user.message") n++;
+    return n;
+  }
+
+  /**
    * Return the on-disk byte size of the session's JSONL, or undefined
    * if the file doesn't exist yet (session hasn't written anything, or
    * container hasn't booted). Pure stat — no parsing, no read. Used by

@@ -241,7 +241,23 @@ function sessionResponse(
   events: PiJsonlEventReader,
   containers?: SessionContainerStore,
 ) {
-  const latestAgent = events.latestAgentMessage(session.agentId, session.sessionId);
+  // Pull events once and derive BOTH latestAgent and turns off that
+  // pass. Previously we were calling latestAgentMessage() which read
+  // the JSONL once; adding a separate countUserTurns() would double
+  // the read. The Session row doesn't track turns natively, so JSONL
+  // remains the source of truth. Tiny sessions (≤ a few hundred events)
+  // parse in µs; pathological giant JSONLs are the reason we have the
+  // size sampler + warning path in src/index.ts.
+  const evs = events.listBySession(session.agentId, session.sessionId);
+  let latestAgent: { content?: string } | undefined;
+  let turns = 0;
+  for (let i = evs.length - 1; i >= 0; i--) {
+    const e = evs[i];
+    if (e && e.type === "agent.message" && !latestAgent) latestAgent = e;
+  }
+  for (const e of evs) {
+    if (e && e.type === "user.message") turns++;
+  }
   const containerRow = containers?.get(session.sessionId);
   return {
     session_id: session.sessionId,
@@ -257,6 +273,10 @@ function sessionResponse(
     error: session.error,
     created_at: session.createdAt,
     last_event_at: session.lastEventAt,
+    // Turn count sourced from the event log (user.message count). Not
+    // stored on the Session row — derive at read time so it always
+    // matches Pi's JSONL truth, even for sessions adopted on restart.
+    turns,
     // Container telemetry — null when no live container (idle+reaped, failed).
     boot_ms: containerRow?.bootMs ?? null,
     pool_source: containerRow?.poolSource ?? null,
