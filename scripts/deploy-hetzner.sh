@@ -213,6 +213,15 @@ write_files:
       # alternate is a reliable safety net. Remove this file on a deployed
       # server if you do not need the extra port.
       [Socket]
+      # BindIPv6Only=both is load-bearing. Without it, systemd's
+      # `ListenStream=<port>` shortcut creates an IPv6-only socket
+      # (IPV6_V6ONLY=1 at the socket level, overriding the system
+      # sysctl net.ipv6.bindv6only=0). `ss -tlnp` then shows only
+      # `[::]:22` and the IPv4 kernel path returns RST → clients
+      # connecting to the VM's public IPv4 see "Connection refused".
+      # Symptom encountered on Hetzner CAX11 (ARM, Ubuntu 24.04.3)
+      # on 2026-04-20; the fix is to restore dual-stack explicitly.
+      BindIPv6Only=both
       ListenStream=
       ListenStream=22
       ListenStream=222
