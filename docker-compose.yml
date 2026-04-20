@@ -65,21 +65,20 @@ services:
       # upper-bounds the grace period rather than tuning per-backend.
       OPENCLAW_READY_TIMEOUT_MS: "600000"
       OPENCLAW_RUN_TIMEOUT_MS: "600000"
-      # Pool tuning — all consumed by src/index.ts via envInt(). Compose
-      # only forwards variables it enumerates explicitly, so values set
-      # in .env but not mentioned here silently fall back to library
-      # defaults. Leaving them blank keeps the defaults; set on cloud
-      # deploys to opt in to warming.
+      # Warm-pool opt-in. Library default is 0 (library code in
+      # src/index.ts uses envInt("…", 0)) so a dev laptop that didn't
+      # set this never warms containers and doesn't burn CPU on idle
+      # pool members. Cloud deploy scripts write
+      # OPENCLAW_MAX_WARM_CONTAINERS=3 into the host .env, and this
+      # line is the bridge that forwards the value into the
+      # orchestrator container — without it, the .env value is
+      # invisible to the running process and the code falls back to 0.
+      # IMPORTANT: use ":-0" (matches library default) rather than
+      # ":-" (empty string). Empty-string env vars are *set*, and any
+      # downstream `process.env.X ?? default` will skip its fallback
+      # and feed "" to the consumer. For consumers that strictly
+      # validate their input (e.g. pino log level), "" crashes boot.
       OPENCLAW_MAX_WARM_CONTAINERS: ${OPENCLAW_MAX_WARM_CONTAINERS:-0}
-      OPENCLAW_IDLE_TIMEOUT_MS: ${OPENCLAW_IDLE_TIMEOUT_MS:-}
-      OPENCLAW_WARM_IDLE_TIMEOUT_MS: ${OPENCLAW_WARM_IDLE_TIMEOUT_MS:-}
-      OPENCLAW_SWEEP_INTERVAL_MS: ${OPENCLAW_SWEEP_INTERVAL_MS:-}
-      OPENCLAW_RATE_LIMIT_RPM: ${OPENCLAW_RATE_LIMIT_RPM:-}
-      OPENCLAW_AUDIT_RETENTION_DAYS: ${OPENCLAW_AUDIT_RETENTION_DAYS:-}
-      OPENCLAW_JSONL_WARN_BYTES: ${OPENCLAW_JSONL_WARN_BYTES:-}
-      OPENCLAW_JSONL_SAMPLE_INTERVAL_MS: ${OPENCLAW_JSONL_SAMPLE_INTERVAL_MS:-}
-      OPENCLAW_LOG_LEVEL: ${OPENCLAW_LOG_LEVEL:-}
-      OPENCLAW_COMMIT: ${OPENCLAW_COMMIT:-}
       # Item 12-14: URL the in-container call_agent CLI uses to reach the
       # orchestrator. Matches this service's container_name + port.
       OPENCLAW_ORCHESTRATOR_URL: http://openclaw-orchestrator:8080
