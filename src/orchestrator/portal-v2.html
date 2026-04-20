@@ -3155,12 +3155,22 @@ function TweaksPanel({ tweaks, setTweaks, onClose }) {
     </div>
   );
 
-  const Seg = ({ value, options, onChange }) => (
+  // Clicking the already-active option clears the tweak (null). The
+  // "Session state" row uses this to let an operator drop out of
+  // forced-preview mode back to the real SSE-driven status without
+  // needing a separate reset button — Tweaks is all one-click.
+  // Non-toggleable controls (density, frames, layout) pass
+  // `noToggle` so clicking active just no-ops.
+  const Seg = ({ value, options, onChange, noToggle }) => (
     <div style={{ display: 'flex', border: '1px solid var(--line-2)', borderRadius: 6, overflow: 'hidden' }}>
       {options.map(o => {
         const active = value === o.v;
+        const handle = () => {
+          if (active && !noToggle) onChange(null);
+          else onChange(o.v);
+        };
         return (
-          <button key={o.v} onClick={() => onChange(o.v)} style={{
+          <button key={o.v} onClick={handle} style={{
             all: 'unset', cursor: 'pointer',
             padding: '5px 10px',
             fontSize: 11, fontFamily: 'var(--font-mono)',
@@ -3206,11 +3216,11 @@ function TweaksPanel({ tweaks, setTweaks, onClose }) {
       </div>
 
       <Row label="Density" sub="13px dev-tool vs 15px broader">
-        <Seg value={tweaks.density} onChange={v => setTweaks({ ...tweaks, density: v })}
+        <Seg noToggle value={tweaks.density} onChange={v => setTweaks({ ...tweaks, density: v })}
           options={[{ v: 'compact', l: '13' }, { v: 'comfy', l: '15' }]} />
       </Row>
 
-      <Row label="Session state" sub="cycle through lifecycle">
+      <Row label="Session state" sub="click again to release → real state">
         <Seg value={tweaks.sessionState} onChange={v => setTweaks({ ...tweaks, sessionState: v })}
           options={[
             { v: 'running', l: 'run' },
@@ -3229,12 +3239,12 @@ function TweaksPanel({ tweaks, setTweaks, onClose }) {
       </Row>
 
       <Row label="Editorial frames" sub="hard ink dividers on blocks">
-        <Seg value={tweaks.frames ? 'on' : 'off'} onChange={v => setTweaks({ ...tweaks, frames: v === 'on' })}
+        <Seg noToggle value={tweaks.frames ? 'on' : 'off'} onChange={v => setTweaks({ ...tweaks, frames: v === 'on' })}
           options={[{ v: 'on', l: 'on' }, { v: 'off', l: 'off' }]} />
       </Row>
 
       <Row label="Layout" sub="detail view arrangement">
-        <Seg value={tweaks.layout} onChange={v => setTweaks({ ...tweaks, layout: v })}
+        <Seg noToggle value={tweaks.layout} onChange={v => setTweaks({ ...tweaks, layout: v })}
           options={[{ v: 'split', l: 'split' }, { v: 'stack', l: 'stack' }]} />
       </Row>
 
