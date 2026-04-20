@@ -65,6 +65,21 @@ services:
       # upper-bounds the grace period rather than tuning per-backend.
       OPENCLAW_READY_TIMEOUT_MS: "600000"
       OPENCLAW_RUN_TIMEOUT_MS: "600000"
+      # Pool tuning — all consumed by src/index.ts via envInt(). Compose
+      # only forwards variables it enumerates explicitly, so values set
+      # in .env but not mentioned here silently fall back to library
+      # defaults. Leaving them blank keeps the defaults; set on cloud
+      # deploys to opt in to warming.
+      OPENCLAW_MAX_WARM_CONTAINERS: ${OPENCLAW_MAX_WARM_CONTAINERS:-0}
+      OPENCLAW_IDLE_TIMEOUT_MS: ${OPENCLAW_IDLE_TIMEOUT_MS:-}
+      OPENCLAW_WARM_IDLE_TIMEOUT_MS: ${OPENCLAW_WARM_IDLE_TIMEOUT_MS:-}
+      OPENCLAW_SWEEP_INTERVAL_MS: ${OPENCLAW_SWEEP_INTERVAL_MS:-}
+      OPENCLAW_RATE_LIMIT_RPM: ${OPENCLAW_RATE_LIMIT_RPM:-}
+      OPENCLAW_AUDIT_RETENTION_DAYS: ${OPENCLAW_AUDIT_RETENTION_DAYS:-}
+      OPENCLAW_JSONL_WARN_BYTES: ${OPENCLAW_JSONL_WARN_BYTES:-}
+      OPENCLAW_JSONL_SAMPLE_INTERVAL_MS: ${OPENCLAW_JSONL_SAMPLE_INTERVAL_MS:-}
+      OPENCLAW_LOG_LEVEL: ${OPENCLAW_LOG_LEVEL:-}
+      OPENCLAW_COMMIT: ${OPENCLAW_COMMIT:-}
       # Item 12-14: URL the in-container call_agent CLI uses to reach the
       # orchestrator. Matches this service's container_name + port.
       OPENCLAW_ORCHESTRATOR_URL: http://openclaw-orchestrator:8080
