@@ -888,6 +888,33 @@ async function pumpEventsPoll() {
 // connection that pushes new events the instant they land in the Pi
 // JSONL — no 1 s polling lag between the LLM emitting a tool_use
 // and the UI showing it.
+// Every event type the orchestrator emits on /v1/sessions/:id/events?stream=true.
+// The server writes each frame with `event: <type>` (matches the Event's
+// type field), which means EventSource delivers them to
+// addEventListener(<type>, ...) — NOT to onmessage. Keep this list in
+// sync with server.ts (grep: `writeSSE`) and with the EventRow switch
+// in this file. Anything missing here silently never arrives in the
+// portal until the SSE idle-timeout (~30s) ends the stream and the
+// poll fallback kicks in — exactly the "slow messages" user-visible bug
+// we hit in Apr 2026.
+//
+// `heartbeat` frames fire every 15s from the server keep-alive; they
+// carry no conversational content, so we intentionally skip registering
+// for them rather than let them clutter the rendered timeline.
+const SSE_EVENT_TYPES = [
+  'session.status_idle',
+  'session.status_running',
+  'session.status_failed',
+  'session.model_change',
+  'session.thinking_level_change',
+  'user.message',
+  'agent.message',
+  'agent.thinking',
+  'agent.tool_use',
+  'agent.tool_result',
+  'agent.tool_confirmation_request',
+];
+
 function openEventStream(sid) {
   if (LIVE_EVENT_STREAM) {
     try { LIVE_EVENT_STREAM.close(); } catch {}
@@ -901,19 +928,29 @@ function openEventStream(sid) {
   LIVE_EVENT_ANCHOR = null;
   EVENTS.length = 0;
   LIVE_BUS.notify();
-  es.onmessage = (m) => {
+
+  // Named-event handler. Every frame the server sends has a specific
+  // `event: <type>` header, so we subscribe per-type. `msg.type` is the
+  // DOM event name, which equals the original Event.type string; we
+  // copy it onto the payload because session.status_* frames carry
+  // {session_id, status, ts} with no explicit `type` field, and
+  // asDesignEvent switches on `type`.
+  const handler = (msg) => {
     if (sid !== LIVE_SELECTED_SESSION) return;
-    try {
-      const data = JSON.parse(m.data);
-      const events = Array.isArray(data) ? data : (data.event ? [data.event] : [data]);
-      for (const e of events) {
-        if (!e || typeof e.created_at !== 'number') continue;
-        if (LIVE_EVENT_ANCHOR == null) LIVE_EVENT_ANCHOR = e.created_at;
-        EVENTS.push(asDesignEvent(e, LIVE_EVENT_ANCHOR));
-      }
-      LIVE_BUS.notify();
-    } catch {}
+    let data;
+    try { data = JSON.parse(msg.data); } catch { return; }
+    if (!data || typeof data !== 'object') return;
+    if (!data.type) data.type = msg.type;
+    if (typeof data.created_at !== 'number') {
+      // session.status_* frames use `ts`, not `created_at`.
+      data.created_at = typeof data.ts === 'number' ? data.ts : Date.now();
+    }
+    if (LIVE_EVENT_ANCHOR == null) LIVE_EVENT_ANCHOR = data.created_at;
+    EVENTS.push(asDesignEvent(data, LIVE_EVENT_ANCHOR));
+    LIVE_BUS.notify();
   };
+  for (const t of SSE_EVENT_TYPES) es.addEventListener(t, handler);
+
   es.onerror = () => {
     // SSE fires onerror both on transient connection drops AND on
     // terminal 404s (session was deleted). EventSource doesn't expose
@@ -1901,15 +1938,20 @@ const { useState: useStateDetail, useEffect: useEffectDetail, useRef: useRefDeta
 // description (was previously a hardcoded mock string).
 function EventRow({ e, streaming, session }) {
   // Orchestrator-internal bookkeeping. These fire at the top of every
-  // run when the composer set a model/thinking override. They contain
-  // no conversational content and clutter the stream — not in the
-  // design either. Hide them from the timeline; they stay in the
-  // raw JSONL for operators who want them.
-  if (e.type === 'session.model_change' || e.type === 'session.thinking_level_change') {
+  // run when the composer set a model/thinking override, and on every
+  // idle→idle transition. They contain no conversational content and
+  // clutter the stream — not in the design either. Hide them from the
+  // timeline; they stay in the raw JSONL for operators who want them.
+  if (
+    e.type === 'session.model_change' ||
+    e.type === 'session.thinking_level_change' ||
+    e.type === 'session.status_idle'
+  ) {
     return null;
   }
   const kindTone = {
     'session.status_running':  { tag: 'status', c: 'var(--ink-3)' },
+    'session.status_failed':   { tag: 'status', c: 'var(--lobster)' },
     'user.message':            { tag: 'user',   c: 'var(--ink)' },
     'agent.thinking':          { tag: 'think',  c: 'var(--ink-3)' },
     'agent.message':           { tag: 'reply',  c: 'var(--ink)' },
@@ -2040,7 +2082,25 @@ function EventRow({ e, streaming, session }) {
   if (e.type === 'agent.tool_confirmation_request') {
     return <ApprovalRow e={e} />;
   }
-  return <Row>{e.type}</Row>;
+  if (e.type === 'session.status_failed') {
+    return (
+      <Row>
+        <span style={{ fontSize: 12, color: 'var(--lobster)' }}>
+          Session failed{session?.error ? <> · <Mono s={11} c="var(--lobster)">{session.error}</Mono></> : null}
+        </span>
+      </Row>
+    );
+  }
+  // Unknown event type — render minimally rather than fabricating
+  // content. The tag column already shows the type name; here we
+  // surface whatever textual payload exists so an operator on a
+  // fresh event type still sees *something* while the handler is
+  // being added.
+  return (
+    <Row>
+      <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>{e.text || <Mono s={11} c="var(--ink-4)">(no rendered content for {e.type})</Mono>}</span>
+    </Row>
+  );
 }
 
 // The streaming "agent.message" row currently being emitted token-by-token
