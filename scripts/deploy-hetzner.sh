@@ -215,9 +215,17 @@ write_files:
       mkdir -p data/sessions data/state
 
       # --- Write .env with the provider API key ---
+      # OPENCLAW_MAX_WARM_CONTAINERS=3 opts this cloud VM into the warm
+      # pool (first-event latency ~0 ms instead of ~10 s). The library
+      # default is 0 so local dev machines never accidentally spawn a
+      # pool of idle containers that each burn ~250% CPU — warming is
+      # only sensible on a dedicated VM with idle capacity.
+      # 3 was picked for CAX11 (4 vCPU, 8 GiB) as a balance — each
+      # warm holds ~500 MiB steady-state and won't peg all cores.
       cat > .env <<ENVFILE
       ${PROVIDER_KEY_NAME}=${PROVIDER_KEY_VALUE}
       OPENCLAW_TEST_MODEL=${DEFAULT_TEST_MODEL}
+      OPENCLAW_MAX_WARM_CONTAINERS=3
       ENVFILE
 
       # --- Pull pre-built images from GHCR (published by .github/workflows/

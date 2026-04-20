@@ -19,6 +19,7 @@ import type {
   AgentStore,
   AuditStore,
   EnvironmentStore,
+  SessionContainerStore,
   SessionStore,
   Vault,
   VaultCredential,
@@ -128,6 +129,25 @@ export type ServerDeps = {
   tokenMinter: ParentTokenMinter;
   /** Semver from package.json, surfaced on GET /. */
   version: string;
+  /**
+   * Session↔container mapping, used on the response layer to surface
+   * pool_source + boot_ms for a session's current container. Drives the
+   * inspector's "boot 4.1s · cold" sub-label without a second round-trip.
+   */
+  sessionContainers: SessionContainerStore;
+  /**
+   * Process start wall-clock (ms since epoch). Used on /healthz so the
+   * UI can render "Gateway up 14d 2h" without guessing. Injected at
+   * startServer time so tests control it.
+   */
+  startTs: number;
+  /**
+   * Git commit SHA this binary was built from (first 7+ chars). Read
+   * from OPENCLAW_COMMIT at process start — unset → "unknown". Surfaced
+   * on /healthz so the topbar can show the real SHA instead of a
+   * hardcoded literal.
+   */
+  commitSha?: string;
 };
 
 function agentResponse(agent: AgentConfig) {
@@ -203,8 +223,19 @@ function environmentResponse(env: EnvironmentConfig) {
 // Session response shape. `output` is a computed convenience: the content of
 // the most recent agent.message in the session, or null if none yet. The
 // event log lives in Pi's JSONL on the host mount — see PiJsonlEventReader.
-function sessionResponse(session: Session, events: PiJsonlEventReader) {
+//
+// container metadata (boot_ms / pool_source / container_id) comes from
+// SessionContainerStore, not from the Session row — the container is
+// ephemeral and only exists while the pool holds it. When the pool
+// reaps a session's container, the session_containers row is deleted
+// and these fields go null on subsequent responses.
+function sessionResponse(
+  session: Session,
+  events: PiJsonlEventReader,
+  containers?: SessionContainerStore,
+) {
   const latestAgent = events.latestAgentMessage(session.agentId, session.sessionId);
+  const containerRow = containers?.get(session.sessionId);
   return {
     session_id: session.sessionId,
     agent_id: session.agentId,
@@ -219,6 +250,11 @@ function sessionResponse(session: Session, events: PiJsonlEventReader) {
     error: session.error,
     created_at: session.createdAt,
     last_event_at: session.lastEventAt,
+    // Container telemetry — null when no live container (idle+reaped, failed).
+    boot_ms: containerRow?.bootMs ?? null,
+    pool_source: containerRow?.poolSource ?? null,
+    container_id: containerRow?.containerId ?? null,
+    container_name: containerRow?.containerName ?? null,
   };
 }
 
@@ -380,7 +416,20 @@ export function buildApp(deps: ServerDeps): Hono {
     });
   });
 
-  app.get("/healthz", (c) => c.json({ ok: true, version: deps.version }));
+  app.get("/healthz", (c) => {
+    const now = Date.now();
+    return c.json({
+      ok: true,
+      version: deps.version,
+      commit: deps.commitSha ?? "unknown",
+      // Surface start_ts and uptime_ms so the UI can render "Gateway up
+      // 14d 2h" deterministically without guessing from /metrics
+      // process_start_time_seconds. uptime_ms is derived so older
+      // clients don't need to compute it.
+      start_ts: deps.startTs,
+      uptime_ms: now - deps.startTs,
+    });
+  });
 
   // ---------- Agents (reusable templates) ----------
 
@@ -456,6 +505,15 @@ export function buildApp(deps: ServerDeps): Hono {
     if (!existed) {
       return c.json({ error: "agent_not_found" }, 404);
     }
+    // Reap any pre-warmed container for this template. Without this,
+    // the warm container sits in the pool burning RAM until the
+    // 30-minute idle-timeout sweeper fires — on the default
+    // warm_max=5, a user who creates-then-deletes multiple agents
+    // quickly could evict live warms for active templates to make
+    // room for corpses.
+    void deps.router.dropWarmForAgent(agentId).catch((err) => {
+      log.warn({ err, agent_id: agentId }, "drop-warm-for-agent failed (non-fatal)");
+    });
     return c.json({ deleted: true });
   });
 
@@ -827,7 +885,7 @@ export function buildApp(deps: ServerDeps): Hono {
       void deps.router.warmSession(session.sessionId).catch((err) => {
         log.warn({ err, session_id: session.sessionId }, "background warm-up failed (non-fatal)");
       });
-      return c.json(sessionResponse(session, deps.events));
+      return c.json(sessionResponse(session, deps.events, deps.sessionContainers));
     } catch (err) {
       writeAudit(deps.audit, c, {
         action: "session.create",
@@ -840,7 +898,7 @@ export function buildApp(deps: ServerDeps): Hono {
   });
 
   app.get("/v1/sessions", (c) => {
-    const sessions = deps.sessions.list().map((s) => sessionResponse(s, deps.events));
+    const sessions = deps.sessions.list().map((s) => sessionResponse(s, deps.events, deps.sessionContainers));
     return c.json({ sessions, count: sessions.length });
   });
 
@@ -850,7 +908,7 @@ export function buildApp(deps: ServerDeps): Hono {
     if (!session) {
       return c.json({ error: "session_not_found" }, 404);
     }
-    return c.json(sessionResponse(session, deps.events));
+    return c.json(sessionResponse(session, deps.events, deps.sessionContainers));
   });
 
   app.delete("/v1/sessions/:sessionId", (c) => {
@@ -898,7 +956,6 @@ export function buildApp(deps: ServerDeps): Hono {
           sessionId,
           event.toolUseId,
           event.result,
-          event.denyMessage,
         );
         return c.json({ session_id: sessionId, confirmed: true });
       } catch (err) {

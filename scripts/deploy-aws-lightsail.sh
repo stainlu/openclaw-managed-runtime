@@ -220,7 +220,10 @@ cd /opt/openclaw
 mkdir -p data/sessions data/state
 
 # --- Write .env via printf (no nested heredoc) ---
-printf '%s=%s\\nOPENCLAW_TEST_MODEL=%s\\n' '${PROVIDER_KEY_NAME}' '${PROVIDER_KEY_VALUE}' '${DEFAULT_TEST_MODEL}' > .env
+# OPENCLAW_MAX_WARM_CONTAINERS=3 opts this cloud VM into the warm pool.
+# Library default is 0 so local dev never spawns idle-but-expensive
+# openclaw containers; cloud deploys explicitly opt in here.
+printf '%s=%s\\nOPENCLAW_TEST_MODEL=%s\\nOPENCLAW_MAX_WARM_CONTAINERS=3\\n' '${PROVIDER_KEY_NAME}' '${PROVIDER_KEY_VALUE}' '${DEFAULT_TEST_MODEL}' > .env
 
 # --- Pull pre-built images from GHCR and bring up the stack. Skipping
 # --build cuts Lightsail deploy time from ~12 min to ~3 min. ---

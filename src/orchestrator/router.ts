@@ -288,6 +288,16 @@ export class AgentRouter {
   }
 
   /**
+   * Drop the warm container held for the given agent template. Called
+   * from the agent-delete HTTP handler so we don't leak a ~4 GB
+   * container on a template that no longer exists. Idempotent + safe
+   * to call for agents that never had a warm in the first place.
+   */
+  async dropWarmForAgent(agentId: string): Promise<void> {
+    await this.pool.dropWarmForAgent(agentId);
+  }
+
+  /**
    * Post a user.message to an existing session. Behavior depends on
    * session status:
    *
@@ -1019,7 +1029,6 @@ export class AgentRouter {
     sessionId: string,
     approvalId: string,
     decision: "allow" | "deny",
-    denyMessage?: string,
   ): Promise<void> {
     const wsClient = this.pool.getWsClient(sessionId);
     if (!wsClient) {
@@ -1037,7 +1046,7 @@ export class AgentRouter {
     }
     const wsDecision = decision === "allow" ? "allow-once" : "deny";
     try {
-      await wsClient.approvalResolve(approvalId, wsDecision, denyMessage);
+      await wsClient.approvalResolve(approvalId, wsDecision);
     } catch (err) {
       throw wrapWsError(err, "confirm_tool_failed");
     }

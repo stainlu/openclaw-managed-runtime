@@ -115,6 +115,38 @@ export const poolSpawnDurationSeconds = new Histogram({
   registers: [registry],
 });
 
+/**
+ * Cold starts attributed to a specific agent template. Powers the
+ * Overview "Cold starts · 24h" stat cell and lets operators see which
+ * agent templates are churning through fresh containers (warm-pool
+ * not keeping up, or agent template using session-specific env that
+ * bypasses warm pool).
+ *
+ * Incremented at the `onContainerClaimed` call site in index.ts when
+ * `source ∈ {cold, limited}` — warm claims and adopt-at-restart don't
+ * count as cold starts.
+ */
+export const poolColdStartsTotal = new Counter({
+  name: "pool_cold_starts_total",
+  help: "Total container cold-starts, by agent template.",
+  labelNames: ["agent_id"] as const,
+  registers: [registry],
+});
+
+/**
+ * Observed container boot duration (seconds). Same event that increments
+ * pool_cold_starts_total. Histogram instead of a gauge so operators can
+ * see the boot-time distribution per deploy (Moby cold-start vs warm-
+ * reuse vs Lightsail's slower I/O). Warm claims and adopt-at-restart
+ * are NOT observed — they'd distort the p50 downward.
+ */
+export const containerBootDurationSeconds = new Histogram({
+  name: "container_boot_duration_seconds",
+  help: "Observed cold-boot duration from pool acquire through WS handshake, in seconds.",
+  buckets: [0.5, 1, 2.5, 5, 10, 20, 40, 80, 120, 180, 300],
+  registers: [registry],
+});
+
 /** Wall-clock of a single run (user.message → agent.message via /v1/chat/completions). */
 export const sessionRunDurationSeconds = new Histogram({
   name: "session_run_duration_seconds",

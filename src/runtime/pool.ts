@@ -95,6 +95,19 @@ export type PoolConfig = {
     sessionId: string;
     agentId: string;
     container: Container;
+    /**
+     * Where the container came from. Used by the SessionContainerStore
+     * persister so sessionResponse() can surface the pool_source on the
+     * public API (and so the inspector's "boot 4.1s · cold" sub-label
+     * isn't always a lie).
+     */
+    source: "cold" | "warm" | "limited" | "adopt";
+    /**
+     * Wall-clock milliseconds the pool spent on the acquire. 0 for
+     * warm-reuse (instant), null for adopt (we didn't spawn it), full
+     * spawn duration for cold / limited.
+     */
+    bootMs: number | null;
   }) => void;
   /**
    * Invoked after the pool releases a container back to the
@@ -201,6 +214,12 @@ export class SessionContainerPool {
    * accumulate one persistent 2 GiB container per template.
    */
   async warmForAgent(agentId: string, spawnOptions: SpawnOptions): Promise<void> {
+    // warm-pool disabled → every warm path is a no-op. Applies to
+    // startup warming, agent-create warming, session-create warming,
+    // and post-claim replenishment. The session still works; the
+    // first event just pays cold-spawn latency. Default for local
+    // dev; production deploys override via OPENCLAW_MAX_WARM_CONTAINERS.
+    if (this.cfg.maxWarmContainers <= 0) return;
     if (this.warm.has(agentId)) return;
     const inflight = this.pendingByAgent.get(agentId);
     if (inflight) return inflight;
@@ -351,6 +370,12 @@ export class SessionContainerPool {
           sessionId: args.sessionId,
           agentId: args.agentId,
           container: warmEntry.container,
+          source: "warm",
+          // Warm-reuse is instant from the session's perspective. The
+          // container was fully booted before this session existed;
+          // reporting its original spawn duration would mis-represent
+          // the perceived latency of this session's first event.
+          bootMs: 0,
         });
         log.info(
           { session_id: args.sessionId, agent_id: args.agentId },
@@ -429,11 +454,14 @@ export class SessionContainerPool {
     poolAcquireTotal.labels({ source: "spawn" }).inc();
     spawnEnd();
     const agentIdForClaim = args.spawnOptions.labels?.["orchestrator-agent-id"];
+    const totalSpawnMs = tConnected - t0;
     if (agentIdForClaim) {
       this.cfg.onContainerClaimed?.({
         sessionId: args.sessionId,
         agentId: agentIdForClaim,
         container,
+        source: "cold",
+        bootMs: totalSpawnMs,
       });
     }
     log.info(
@@ -442,7 +470,7 @@ export class SessionContainerPool {
         container_create_ms: tCreated - t0,
         ready_wait_ms: tReady - tCreated,
         ws_connect_ms: tConnected - tReady,
-        total_spawn_ms: tConnected - t0,
+        total_spawn_ms: totalSpawnMs,
       },
       "fresh container spawn completed",
     );
@@ -487,6 +515,7 @@ export class SessionContainerPool {
     }
     const netCfg = this.cfg.limitedNetworking;
     const spawnEnd = poolSpawnDurationSeconds.startTimer();
+    const limitedT0 = Date.now();
 
     // Full session id, sanitized to Docker's name rules ([a-z0-9-_]).
     // Do NOT truncate: nanoid session ids are 12 chars and prefix
@@ -666,11 +695,14 @@ export class SessionContainerPool {
       poolAcquireTotal.labels({ source: "spawn" }).inc();
       spawnEnd();
       const agentIdForClaim = args.spawnOptions.labels?.["orchestrator-agent-id"];
+      const limitedBootMs = Date.now() - limitedT0;
       if (agentIdForClaim) {
         this.cfg.onContainerClaimed?.({
           sessionId: args.sessionId,
           agentId: agentIdForClaim,
           container: agent,
+          source: "limited",
+          bootMs: limitedBootMs,
         });
       }
       log.info(
@@ -679,6 +711,7 @@ export class SessionContainerPool {
           confined_network: confinedNet,
           egress_network: egressNet,
           allowed_hosts: args.allowedHosts.length,
+          total_spawn_ms: limitedBootMs,
         },
         "spawned limited-networking session",
       );
@@ -795,6 +828,11 @@ export class SessionContainerPool {
         sessionId: args.sessionId,
         agentId: args.agentId,
         container: args.container,
+        source: "adopt",
+        // Adoption means this orchestrator process didn't spawn the
+        // container — recording a bootMs here would be a fabricated
+        // wallclock. Preserve null so the UI can render "—".
+        bootMs: null,
       });
     }
     log.info(
@@ -934,9 +972,23 @@ export class SessionContainerPool {
     if (oldest) await this.reapWarmEntry(oldest, "cap-exceeded");
   }
 
+  /**
+   * Drop any pre-warmed container held for the given agent template.
+   * No-op if the agent isn't warmed. Intended for the agent-delete
+   * HTTP path — without this the warm container lingers until the
+   * idle-timeout sweeper fires (default 30 min), burning memory and
+   * container-slot budget on a template that no longer exists.
+   * Fire-and-forget; failures are logged but don't throw.
+   */
+  async dropWarmForAgent(agentId: string): Promise<void> {
+    const entry = this.warm.get(agentId);
+    if (!entry) return;
+    await this.reapWarmEntry(entry, "deleted");
+  }
+
   private async reapWarmEntry(
     entry: WarmContainer,
-    reason: "idle" | "cap-exceeded",
+    reason: "idle" | "cap-exceeded" | "deleted",
   ): Promise<void> {
     this.warm.delete(entry.agentId);
     poolWarmContainers.set(this.warm.size);

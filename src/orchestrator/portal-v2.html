@@ -595,46 +595,112 @@ function fmtAgo(ms) {
 function asDesignAgent(a, sessionCountById) {
   const toolsField = a.tools;
   const tools = Array.isArray(toolsField) ? toolsField : (toolsField?.also_allow || []);
+  // Denied tools come from the permission_policy discriminated union.
+  // Shape: { type:"deny", tools:[…] }  → listed tools are blocked.
+  //        { type:"always_ask", tools?:[…] } → optional confirm-list.
+  //        { type:"always_allow" }  → no deny set.
+  // The legacy `tools.deny` shape was accepted in some early builds;
+  // fall back to it so old rows still render correctly.
+  const policyType = a.permission_policy?.type || 'always_allow';
+  const policyTools = Array.isArray(a.permission_policy?.tools) ? a.permission_policy.tools : [];
+  const denied = policyType === 'deny'
+    ? policyTools
+    : (Array.isArray(toolsField?.deny) ? toolsField.deny : []);
+  const askList = policyType === 'always_ask' ? policyTools : [];
   return {
     id: a.agent_id,
-    name: a.agent_id.replace(/^agt_/, ''),
+    // Prefer the server-side name the user picked; fall back to the
+    // id-stripped form so legacy agents (created without a name) still
+    // render something readable instead of `undefined`.
+    name: (typeof a.name === 'string' && a.name.trim()) || a.agent_id.replace(/^agt_/, ''),
     model: a.model,
     version: a.version || 1,
     tools,
+    denied,
+    askList,
     mcp: Object.keys(a.mcp_servers || {}),
-    policy: a.permission_policy?.type || 'always_allow',
+    policy: policyType,
+    permissionPolicy: a.permission_policy || { type: 'always_allow' },
     sessions: sessionCountById[a.agent_id] || 0,
     cost24h: '—',
     updated: a.updated_at ? fmtAgo(a.updated_at) : '—',
     channels: a.channels || {},
     thinkingLevel: a.thinking_level || 'off',
+    // Full raw sub-objects preserved for the inspector's Config tab.
+    mcpServers: a.mcp_servers || {},
+    quota: a.quota || {},
+    callableAgents: a.callable_agents || [],
+    maxSubagentDepth: a.max_subagent_depth || 0,
+    instructions: a.instructions || '',
   };
 }
 
-function asDesignSession(s, agentById) {
+function asDesignSession(s, agentById, environmentById) {
   const agent = agentById[s.agent_id];
+  const env = s.environment_id ? environmentById?.[s.environment_id] : undefined;
   const nowOrLast = s.status === 'running' ? Date.now() : (s.last_event_at || s.created_at);
   let status = s.status;
   if (s.status === 'failed' && typeof s.error === 'string' && /quota|limit|cap/i.test(s.error)) {
     status = 'quota';
   }
+  // Quotas come from the agent template. Fall back to the old hard-
+  // coded caps only when the agent doesn't declare them (orphaned or
+  // legacy), so the meters still render something reasonable.
+  const quota = agent?.quota || {};
+  const tokensCap = quota.maxTokensPerSession ?? 50_000;
+  const costCap = quota.maxCostUsdPerSession ?? 1.00;
+  // pool_source on the response is one of: cold, warm, limited, adopt
+  // (null when no live container, e.g. idle+reaped). Map to a label
+  // the design chose: "warm-reuse" for warm, otherwise the verb.
+  const poolLabel = s.pool_source === 'warm'
+    ? 'warm-reuse'
+    : s.pool_source === 'cold'
+      ? 'cold'
+      : s.pool_source === 'limited'
+        ? 'limited'
+        : s.pool_source === 'adopt'
+          ? 'adopted'
+          : 'no container';
   return {
     id: s.session_id,
     agent: agent?.name || s.agent_id.replace(/^agt_/, ''),
     agentId: s.agent_id,
+    agentVersion: agent?.version || null,
+    agentFull: agent || null,
+    envFull: env || null,
+    // True when the agent template referenced by this session has been
+    // deleted (hard-delete, not archive). The server correctly returns
+    // 404 agent_not_found on any write to such a session — we surface
+    // it as a persistent banner + disabled composer instead of letting
+    // the user find out by trying to send.
+    orphanedAgent: !agent,
     model: agent?.model || '',
+    thinkingLevel: agent?.thinkingLevel || 'off',
     status,
     started: fmtAgo(s.created_at),
+    createdAt: s.created_at,
+    lastEventAt: s.last_event_at,
     wallMs: nowOrLast - s.created_at,
+    tokensIn: s.tokens?.input || 0,
+    tokensOut: s.tokens?.output || 0,
     tokens: (s.tokens?.input || 0) + (s.tokens?.output || 0),
-    tokensCap: 50_000,
+    tokensCap,
     cost: s.cost_usd || 0,
-    costCap: 1.00,
+    costCap,
     turns: s.turns || 0,
     env: s.environment_id || 'env_default',
-    container: s.session_id.replace(/^ses_/, 'oc-'),
-    pool: s.pool_source || 'warm-reuse',
-    bootMs: s.boot_ms || 0,
+    // Server-truth versions of env/container — used by RawTab so the
+    // raw JSON panel shows `null` when the field is unset rather than
+    // the UI-chrome fallback ("env_default", "—"). Elsewhere the UI
+    // can keep the friendly fallback.
+    envId: s.environment_id ?? null,
+    container: s.container_name || (s.container_id ? s.container_id.slice(0, 12) : '—'),
+    containerName: s.container_name ?? null,
+    containerId: s.container_id || null,
+    pool: poolLabel,
+    poolSource: s.pool_source || null,
+    bootMs: typeof s.boot_ms === 'number' ? s.boot_ms : null,
+    output: s.output,
     error: s.error,
   };
 }
@@ -669,12 +735,19 @@ const SESSIONS = [];
 const EVENTS = [];
 const AUDIT_ROWS = [];
 const ENVIRONMENTS = [];
+const VAULTS = [];
+const HEALTH = { ok: false, version: '—', commit: 'unknown', uptimeMs: 0, startTs: null };
+// Baseline labels rendered before the first pump lands. pumpSessions
+// + pumpMetrics overwrite each slot with live values. The "· 24h"
+// labels mean a real rolling 24-hour window (filtered on
+// last_event_at); "· since boot" reflects a monotonic Prometheus
+// counter that resets every orchestrator restart.
 const STATS = [
-  { label: 'Sessions · live',   value: '0',     sub: '—' },
-  { label: 'Warm pool',         value: '0',     sub: '—' },
-  { label: 'Tokens · 24h',      value: '—',     sub: '' },
-  { label: 'Cost · 24h',        value: '$0.00', sub: '' },
-  { label: 'Cold starts · 24h', value: '—',     sub: '' },
+  { label: 'Sessions · running',      value: '0',     sub: '—' },
+  { label: 'Warm pool',               value: '0',     sub: '—' },
+  { label: 'Tokens · 24h',            value: '—',     sub: '' },
+  { label: 'Cost · 24h',              value: '$0.00', sub: '' },
+  { label: 'Cold starts · since boot', value: '—',    sub: '' },
 ];
 
 // STREAMING_TOKENS will be mutated live when an event stream is open
@@ -693,7 +766,17 @@ async function pumpAgents() {
     const list = body.agents || [];
     const countById = {};
     for (const s of SESSIONS) countById[s.agentId] = (countById[s.agentId] || 0) + 1;
-    const next = list.map((a) => asDesignAgent(a, countById));
+    // Newest first. Sort the raw server rows on created_at so the
+    // "new agent just created" appears at the top of the Agents view
+    // and at the top of dropdowns/pickers that read AGENTS. Ties
+    // break on agent_id for stability.
+    const sorted = list.slice().sort((a, b) => {
+      const ta = a.created_at || 0;
+      const tb = b.created_at || 0;
+      if (tb !== ta) return tb - ta;
+      return String(b.agent_id).localeCompare(String(a.agent_id));
+    });
+    const next = sorted.map((a) => asDesignAgent(a, countById));
     AGENTS.length = 0;
     for (const a of next) AGENTS.push(a);
     LIVE_BUS.notify();
@@ -707,19 +790,66 @@ async function pumpSessions() {
     const body = await res.json();
     const list = body.sessions || [];
     const agentById = Object.fromEntries(AGENTS.map((a) => [a.id, a]));
-    const rank = { running: 0, awaiting: 1, idle: 2, quota: 3, failed: 4, ended: 5 };
+    const environmentById = Object.fromEntries(ENVIRONMENTS.map((e) => [e.id, e]));
+    // Newest first, measured on most-recent activity (last event lands
+    // → the session bubbles up). Sessions with no events yet fall back
+    // to created_at so a fresh session still pops to the top immediately
+    // after open. Status rank (running vs idle vs failed) is handled by
+    // the filter tabs above the list, not by baked-in ordering — one
+    // consistent "latest first" rule across every view.
     const next = list
-      .map((s) => asDesignSession(s, agentById))
-      .sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
+      .map((s) => asDesignSession(s, agentById, environmentById))
+      .sort((a, b) => {
+        const ra = a.lastEventAt || a.createdAt || 0;
+        const rb = b.lastEventAt || b.createdAt || 0;
+        if (rb !== ra) return rb - ra;
+        return String(b.id).localeCompare(String(a.id));
+      });
     SESSIONS.length = 0;
     for (const s of next) SESSIONS.push(s);
     const running = next.filter((s) => s.status === 'running').length;
-    const awaiting = next.filter((s) => s.status === 'awaiting').length;
-    const totalTok = next.reduce((t, s) => t + (s.tokens || 0), 0);
-    const totalCost = next.reduce((t, s) => t + (s.cost || 0), 0);
-    STATS[0] = { label: 'Sessions · live', value: String(running), sub: awaiting + ' awaiting' };
-    STATS[2] = { label: 'Tokens · 24h', value: totalTok >= 1_000_000 ? (totalTok / 1_000_000).toFixed(2) + 'M' : totalTok.toLocaleString(), sub: '' };
-    STATS[3] = { label: 'Cost · 24h', value: '$' + totalCost.toFixed(2), sub: '' };
+    // Honest rolling window. A session counts toward "last 24h" iff its
+    // last_event_at falls in that window. This overcounts slightly
+    // (the session's LIFETIME tokens get included even if only one
+    // recent event landed in the window), but it's closer to truth
+    // than the all-time sum we used to mislabel "· 24h". Proper
+    // per-event aggregation would require scanning every session's
+    // JSONL for the last day — not cheap on the UI render path.
+    const nowMs = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const active24h = next.filter((s) => (s.lastEventAt || s.createdAt || 0) >= nowMs - DAY_MS);
+    const totalTok24h  = active24h.reduce((t, s) => t + (s.tokens || 0), 0);
+    const totalCost24h = active24h.reduce((t, s) => t + (s.cost || 0), 0);
+    STATS[0] = {
+      label: 'Sessions · running',
+      value: String(running),
+      sub: active24h.length + ' active · 24h',
+    };
+    STATS[2] = {
+      label: 'Tokens · 24h',
+      value: totalTok24h >= 1_000_000
+        ? (totalTok24h / 1_000_000).toFixed(2) + 'M'
+        : totalTok24h.toLocaleString(),
+      sub: '',
+    };
+    STATS[3] = {
+      label: 'Cost · 24h',
+      value: '$' + totalCost24h.toFixed(2),
+      sub: '',
+    };
+    // If the currently-selected session has been deleted (no longer in
+    // the list), clear the selection so the App can auto-pick a live
+    // row on the next render. Without this, SessionDetail keeps
+    // holding the dead id and the event-poll keeps 404-ing. Also
+    // tear down any live SSE stream pointing at the dead session.
+    if (LIVE_SELECTED_SESSION && !next.some((s) => s.id === LIVE_SELECTED_SESSION)) {
+      LIVE_SELECTED_SESSION = null;
+      if (LIVE_EVENT_STREAM) {
+        try { LIVE_EVENT_STREAM.close(); } catch {}
+        LIVE_EVENT_STREAM = null;
+      }
+      EVENTS.length = 0;
+    }
     LIVE_BUS.notify();
   } catch {}
 }
@@ -730,6 +860,17 @@ async function pumpEventsPoll() {
   try {
     const sid = LIVE_SELECTED_SESSION;
     const res = await fetch('/v1/sessions/' + encodeURIComponent(sid) + '/events?limit=300');
+    // 404 = the session was deleted out from under the UI. Stop
+    // re-querying the dead row — otherwise the 2s poll loop (and the
+    // SSE-on-error fallback to this pump) spams the console with
+    // "failed to load resource" forever. Clearing the selection also
+    // lets the App auto-pick a fresh session on the next pumpSessions.
+    if (res.status === 404) {
+      LIVE_SELECTED_SESSION = null;
+      EVENTS.length = 0;
+      LIVE_BUS.notify();
+      return;
+    }
     if (!res.ok) return;
     const body = await res.json();
     const list = body.events || [];
@@ -774,9 +915,12 @@ function openEventStream(sid) {
     } catch {}
   };
   es.onerror = () => {
-    // Fall back to polling on SSE error — keeps the UI responsive
-    // even if the stream endpoint is disabled or the connection
-    // drops. The poll loop is idempotent via LIVE_EVENT_STREAM gate.
+    // SSE fires onerror both on transient connection drops AND on
+    // terminal 404s (session was deleted). EventSource doesn't expose
+    // the HTTP status, so we probe once via pumpEventsPoll — which
+    // now clears LIVE_SELECTED_SESSION on 404 and bails on transient
+    // errors without hammering. Keeps the UI responsive on a brief
+    // network blip without spamming the dead endpoint on deletion.
     try { es.close(); } catch {}
     if (LIVE_EVENT_STREAM === es) LIVE_EVENT_STREAM = null;
     pumpEventsPoll();
@@ -788,7 +932,14 @@ async function pumpEnvironments() {
     const res = await fetch('/v1/environments');
     if (!res.ok) return;
     const body = await res.json();
-    const list = body.environments || [];
+    // Newest first on created_at so new environments land at the top
+    // of the Environments view + the session-inspector env picker.
+    const list = (body.environments || []).slice().sort((a, b) => {
+      const ta = a.created_at || 0;
+      const tb = b.created_at || 0;
+      if (tb !== ta) return tb - ta;
+      return String(b.environment_id).localeCompare(String(a.environment_id));
+    });
     const countById = {};
     for (const s of SESSIONS) countById[s.env] = (countById[s.env] || 0) + 1;
     const next = list.map((e) => {
@@ -805,6 +956,11 @@ async function pumpEnvironments() {
         packages: packages || '—',
         net,
         sessions: countById[e.environment_id] || 0,
+        // Preserve raw fields so the ConfigTab inspector can render
+        // per-manager package lists + networking.allowed_hosts. The
+        // EnvironmentsView only reads the summary fields above.
+        packagesRaw: e.packages || {},
+        networkingRaw: e.networking || { type: 'unrestricted' },
       };
     });
     ENVIRONMENTS.length = 0;
@@ -832,20 +988,97 @@ async function pumpAudit() {
   } catch {}
 }
 
+async function pumpHealth() {
+  try {
+    const res = await fetch('/healthz');
+    if (!res.ok) return;
+    const body = await res.json();
+    HEALTH.ok = !!body.ok;
+    HEALTH.version = body.version || '—';
+    HEALTH.commit = body.commit || 'unknown';
+    HEALTH.startTs = typeof body.start_ts === 'number' ? body.start_ts : HEALTH.startTs;
+    HEALTH.uptimeMs = typeof body.uptime_ms === 'number' ? body.uptime_ms : 0;
+    LIVE_BUS.notify();
+  } catch {}
+}
+
+async function pumpVaults() {
+  try {
+    const res = await fetch('/v1/vaults');
+    if (!res.ok) return;
+    const body = await res.json();
+    // Newest first — same pattern as every other list.
+    const list = (body.vaults || []).slice().sort((a, b) => {
+      const ta = a.created_at || 0;
+      const tb = b.created_at || 0;
+      if (tb !== ta) return tb - ta;
+      return String(b.vault_id).localeCompare(String(a.vault_id));
+    });
+    VAULTS.length = 0;
+    for (const v of list) VAULTS.push(v);
+    LIVE_BUS.notify();
+  } catch {}
+}
+
+// Human-readable duration from milliseconds. Matches the sidebar-footer
+// "Gateway up 14d 2h" format — hours for under-a-day, HhMmin for short
+// uptimes, days+hours for anything longer.
+function fmtUptime(ms) {
+  if (!ms || ms < 0) return '—';
+  const s = Math.floor(ms / 1000);
+  const days = Math.floor(s / 86400);
+  const hours = Math.floor((s % 86400) / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
+
 async function pumpMetrics() {
   try {
     const res = await fetch('/metrics');
     if (!res.ok) return;
     const text = await res.text();
-    const grab = (re) => {
+    // Prometheus lines always look like:
+    //   metric_name{label1="v1",label2="v2",…} <value>
+    // Our orchestrator sets `service="openclaw-managed-agents"` as a
+    // default label, so every line has the `{…}` segment even for
+    // metrics that didn't declare their own label names. The old
+    // regex `^NAME\s+(\d+)` expected no label segment and therefore
+    // matched nothing — STATS[1]/STATS[4] silently stuck at their
+    // initial "0" / "—" baselines. Accept both shapes.
+    const grab = (name, valuePat = '\\d+') => {
+      const re = new RegExp(`^${name}(?:\\{[^}]*\\})?\\s+(${valuePat})`, 'm');
       const m = text.match(re);
       return m ? Number(m[1]) : null;
     };
-    const warmActive = grab(/^pool_warm_containers\s+(\d+)/m);
-    const activeCount = grab(/^pool_active_containers\s+(\d+)/m);
+    const warmActive = grab('pool_warm_containers');
+    const activeCount = grab('pool_active_containers');
     if (warmActive !== null) {
-      STATS[1] = { label: 'Warm pool', value: String(warmActive), sub: activeCount != null ? activeCount + ' active' : '' };
+      STATS[1] = {
+        label: 'Warm pool',
+        value: String(warmActive),
+        sub: activeCount != null ? activeCount + ' active' : '',
+      };
     }
+    // Cold starts — sum across all agent labels. Monotonic Prom
+    // counter, resets on orchestrator restart (hence "· since boot").
+    // A real 24h counter would need a time-bucketed histogram we
+    // don't persist yet.
+    const coldLines = text.match(/^pool_cold_starts_total\{[^}]*\}\s+(\d+)/gm) || [];
+    const coldTotal = coldLines.reduce((sum, line) => {
+      const m = line.match(/\s(\d+)$/);
+      return m ? sum + Number(m[1]) : sum;
+    }, 0);
+    // Avg boot from the histogram _sum / _count.
+    const bootSum = grab('container_boot_duration_seconds_sum', '[\\d.eE+-]+');
+    const bootCount = grab('container_boot_duration_seconds_count');
+    const avgSecs = bootSum != null && bootCount && bootCount > 0 ? bootSum / bootCount : null;
+    STATS[4] = {
+      label: 'Cold starts · since boot',
+      value: String(coldTotal),
+      sub: avgSecs != null ? avgSecs.toFixed(1) + 's avg' : '—',
+    };
     LIVE_BUS.notify();
   } catch {}
 }
@@ -860,7 +1093,8 @@ function liveSelectSession(id) {
 
 Object.assign(window, {
   LIVE_BUS, pumpAgents, pumpSessions, pumpEventsPoll, pumpAudit,
-  pumpEnvironments, pumpMetrics, liveSelectSession, openEventStream,
+  pumpEnvironments, pumpMetrics, pumpHealth, pumpVaults,
+  liveSelectSession, openEventStream,
 });
 
 pumpAgents();
@@ -868,6 +1102,8 @@ pumpSessions().then(() => pumpAgents());
 pumpEnvironments();
 pumpAudit();
 pumpMetrics();
+pumpHealth();
+pumpVaults();
 setInterval(() => { pumpAgents(); }, 10_000);
 setInterval(() => { pumpSessions(); }, 4_000);
 // Polling fallback runs only when there's no active SSE stream;
@@ -877,6 +1113,11 @@ setInterval(() => { pumpEventsPoll(); }, 2_000);
 setInterval(() => { pumpEnvironments(); }, 30_000);
 setInterval(() => { pumpAudit(); }, 30_000);
 setInterval(() => { pumpMetrics(); }, 10_000);
+// Uptime re-reads /healthz once a minute so the footer slowly ticks
+// up (14d 2h → 14d 3h) without hammering the endpoint. Vaults is
+// slower still — the Sidebar count is the only caller today.
+setInterval(() => { pumpHealth(); }, 60_000);
+setInterval(() => { pumpVaults(); }, 60_000);
 
 /* ===== (design's original mock arrays removed; all state now flows through pumps above) ===== */
 
@@ -919,7 +1160,7 @@ function Topbar({ route, setRoute, onTweaks }) {
         }}>prod-hetzner-cax11</Mono>
         <Badge tone="ok" style={{ marginLeft: 10, flexShrink: 0 }}>healthy</Badge>
         <Mono s={11} c="var(--ink-3)" className="oc-commit" style={{ marginLeft: 10, whiteSpace: 'nowrap', flexShrink: 0 }}>
-          commit af1ec32 · 175/175 tests
+          commit {HEALTH.commit === 'unknown' ? '—' : HEALTH.commit.slice(0, 7)} · v{HEALTH.version}
         </Mono>
       </div>
 
@@ -951,14 +1192,20 @@ function Topbar({ route, setRoute, onTweaks }) {
 }
 
 function Sidebar({ route, setRoute }) {
+  // Live counts — everything comes from the global pump arrays. Vaults
+  // polls separately via VAULTS (pumped by /v1/vaults). The "live"
+  // indicator on Sessions pulses only while there's at least one
+  // running session, so the UI stops pretending everything is hot
+  // when nothing's actually running.
+  const runningCount = SESSIONS.filter((s) => s.status === 'running').length;
   const items = [
-    { id: 'overview',    label: 'Overview',     count: null,  icon: 'home' },
-    { id: 'agents',      label: 'Agents',       count: 4,     icon: 'agents' },
-    { id: 'environments', label: 'Environments', count: 3,    icon: 'env' },
-    { id: 'sessions',    label: 'Sessions',     count: 14,    icon: 'sessions', live: true },
-    { id: 'vaults',      label: 'Vaults',       count: 2,     icon: 'vaults' },
-    { id: 'audit',       label: 'Audit log',    count: null,  icon: 'audit' },
-    { id: 'metrics',     label: 'Metrics',      count: null,  icon: 'metrics' },
+    { id: 'overview',    label: 'Overview',     count: null,              icon: 'home' },
+    { id: 'agents',      label: 'Agents',       count: AGENTS.length,     icon: 'agents' },
+    { id: 'environments',label: 'Environments', count: ENVIRONMENTS.length, icon: 'env' },
+    { id: 'sessions',    label: 'Sessions',     count: SESSIONS.length,   icon: 'sessions', live: runningCount > 0 },
+    { id: 'vaults',      label: 'Vaults',       count: VAULTS.length,     icon: 'vaults' },
+    { id: 'audit',       label: 'Audit log',    count: null,              icon: 'audit' },
+    { id: 'metrics',     label: 'Metrics',      count: null,              icon: 'metrics' },
   ];
   return (
     <aside className="oc-sidebar" style={{
@@ -1035,11 +1282,15 @@ function Sidebar({ route, setRoute }) {
             background: 'var(--accent, var(--lobster))',
             boxShadow: '0 0 0 3px color-mix(in srgb, var(--accent, var(--lobster)) 22%, transparent)',
           }} />
-          <span className="oc-sidebar-footer-text" style={{ fontSize: 12, fontWeight: 500 }}>Gateway up</span>
-          <Mono s={10} c="var(--ink-3)" className="oc-sidebar-footer-text" style={{ marginLeft: 'auto' }}>14d 2h</Mono>
+          <span className="oc-sidebar-footer-text" style={{ fontSize: 12, fontWeight: 500 }}>
+            {HEALTH.ok ? 'Gateway up' : 'Gateway down'}
+          </span>
+          <Mono s={10} c="var(--ink-3)" className="oc-sidebar-footer-text" style={{ marginLeft: 'auto' }}>
+            {fmtUptime(HEALTH.uptimeMs)}
+          </Mono>
         </div>
         <Mono s={10} c="var(--ink-3)" className="oc-sidebar-footer-text" style={{ marginTop: 4, display: 'block' }}>
-          api.openclaw.stainlu.dev
+          {window.location.host || '—'}
         </Mono>
       </div>
     </aside>
@@ -1082,6 +1333,7 @@ function Meter({ value, cap, unit = '', tone = 'ink', style }) {
 
 function SessionsList({ selectedId, onSelect, filter, setFilter }) {
   const filtered = filter === 'all' ? SESSIONS : SESSIONS.filter(s => s.status === filter);
+  const isNew = selectedId === '__new';
   return (
     <div className="oc-sessions-list" style={{
       width: 360, flexShrink: 0, height: '100%',
@@ -1090,21 +1342,27 @@ function SessionsList({ selectedId, onSelect, filter, setFilter }) {
       background: 'var(--paper)',
     }}>
       <div style={{
-        padding: '14px 16px 10px',
+        padding: '14px 16px 12px',
         borderBottom: '1px solid var(--line)',
       }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
-          <Eyebrow>Sessions · 14</Eyebrow>
-          <Mono s={10} c="var(--ink-3)" style={{ marginLeft: 'auto' }}>SSE · 5s</Mono>
+          <Eyebrow>Sessions · {SESSIONS.length}</Eyebrow>
+          <Mono s={10} c="var(--ink-3)" style={{ marginLeft: 'auto' }}>SSE · 4s</Mono>
         </div>
-        <div style={{ display: 'flex', gap: 14, marginTop: 10, flexWrap: 'wrap' }}>
-          {[
-            ['all', 'All', 14],
-            ['running', 'Running', 2],
-            ['awaiting', 'Awaits', 1],
-            ['idle', 'Idle', 1],
-            ['failed', 'Failed', 1],
-          ].map(([k, l, n]) => {
+        <div style={{ marginTop: 10, display: 'flex', gap: 6 }}>
+          <Button variant="hard" size="sm" icon="plus" onClick={() => onSelect('__new')}>New session</Button>
+        </div>
+        <div style={{ display: 'flex', gap: 14, marginTop: 12, flexWrap: 'wrap' }}>
+          {(() => {
+            const tally = (k) => SESSIONS.filter(s => s.status === k).length;
+            return [
+              ['all',      'All',    SESSIONS.length],
+              ['running',  'Running', tally('running')],
+              ['awaiting', 'Awaits',  tally('awaiting')],
+              ['idle',     'Idle',    tally('idle')],
+              ['failed',   'Failed',  tally('failed')],
+            ];
+          })().map(([k, l, n]) => {
             const active = filter === k;
             return (
               <button key={k} onClick={() => setFilter(k)} style={{
@@ -1123,6 +1381,28 @@ function SessionsList({ selectedId, onSelect, filter, setFilter }) {
         </div>
       </div>
       <div style={{ flex: 1, overflowY: 'auto' }}>
+        {isNew && (
+          <div style={{
+            padding: '12px 14px',
+            borderBottom: '1px solid var(--line)',
+            borderLeft: '2px solid var(--accent, var(--lobster))',
+            background: 'color-mix(in srgb, var(--lobster) 6%, var(--paper))',
+            display: 'flex', alignItems: 'center', gap: 10,
+          }}>
+            <div style={{
+              width: 26, height: 26, borderRadius: 4,
+              border: '1px dashed var(--ink-3)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              color: 'var(--ink-2)', flexShrink: 0,
+            }}>
+              <Icon n="plus" s={13} />
+            </div>
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontSize: 13, color: 'var(--ink)', fontWeight: 500, letterSpacing: -0.1 }}>New session</div>
+              <Mono s={10} c="var(--ink-3)" style={{ marginTop: 2 }}>draft · POST /v1/sessions</Mono>
+            </div>
+          </div>
+        )}
         {filtered.map(s => {
           const sel = s.id === selectedId;
           return (
@@ -1163,11 +1443,452 @@ function SessionsList({ selectedId, onSelect, filter, setFilter }) {
 Object.assign(window, { SessionsList, StatusBadge, Meter });
 
 
+/* ===== new_session_panel =====
+   Shown in the detail column when selectedSession === '__new'.
+   Real wiring:
+     - POST /v1/sessions         → create session with agentId + optional environmentId + vaultId
+     - POST /v1/sessions/:id/events  → fire the optional initial user.message
+   Agent/env/vault pickers read live AGENTS/ENVIRONMENTS/VAULTS arrays.
+   Quotas override is a UI stub until the backend accepts per-session caps
+   (today quotas live on the agent template — the toggle collects values
+   but only the agent/env/vault ids are actually forwarded). */
+
+function NewSessionPanel({ onCreate, onCancel }) {
+  const ctx = useApp();
+  // NewSessionPanel re-renders with its parent (App) on every
+  // LIVE_BUS.notify() tick, so picking AGENTS/ENVIRONMENTS/VAULTS
+  // straight off the globals is enough — no extra subscription.
+  const agentsAvail = ctx?.agents || AGENTS;
+  const [agentId, setAgentId] = useState(agentsAvail[0]?.id || '');
+  const [envId, setEnvId] = useState(ENVIRONMENTS[0]?.id || '');
+  const [vaultId, setVaultId] = useState('');
+  const [message, setMessage] = useState('');
+  const [quotaOverride, setQuotaOverride] = useState(false);
+  const [costCap, setCostCap] = useState(1.00);
+  const [tokenCap, setTokenCap] = useState(50);
+  const [creating, setCreating] = useState(false);
+  const [showJson, setShowJson] = useState(true);
+  const [error, setError] = useState(null);
+  const textareaRef = React.useRef(null);
+
+  // Re-sync selection if the live pump introduces/removes the current
+  // choice (e.g., agent deleted while this panel is open).
+  useEffect(() => {
+    if (!agentsAvail.some((a) => a.id === agentId) && agentsAvail[0]) {
+      setAgentId(agentsAvail[0].id);
+    }
+  }, [agentsAvail, agentId]);
+
+  const agent = agentsAvail.find((a) => a.id === agentId) || agentsAvail[0];
+  const envs = ENVIRONMENTS.length > 0 ? ENVIRONMENTS : [
+    { id: 'env_default', name: 'default', net: '—', packages: 'no extras' },
+  ];
+  const vaultOpts = [
+    { id: '', label: 'none', sub: 'no credentials' },
+    ...VAULTS.map((v) => ({
+      id: v.vault_id,
+      label: v.name || v.vault_id,
+      sub: v.user_id ? 'user ' + v.user_id : '—',
+    })),
+  ];
+
+  // Request body shown in the live preview. Only fields the
+  // orchestrator schema accepts get forwarded on submit — the
+  // quota-override object is rendered locally for transparency but
+  // dropped before POST (per-session quotas aren't wired server-side).
+  const previewBody = {
+    agentId,
+    ...(envId ? { environmentId: envId } : {}),
+    ...(vaultId ? { vaultId } : {}),
+    ...(quotaOverride ? { quotas: { maxCostUsd: costCap, maxTokens: tokenCap * 1000 } } : {}),
+    ...(message.trim() ? { initialMessage: message.trim() } : {}),
+  };
+
+  async function submit() {
+    if (creating || !agentId) return;
+    setCreating(true);
+    setError(null);
+    const startedAt = Date.now();
+    const postBody = {
+      agentId,
+      ...(envId && envId !== 'env_default' ? { environmentId: envId } : {}),
+      ...(vaultId ? { vaultId } : {}),
+    };
+    try {
+      const res = await fetch('/v1/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(postBody),
+      });
+      const ms = Date.now() - startedAt;
+      const data = await res.json().catch(() => ({}));
+      ctx?.pushToast?.({
+        method: 'POST', path: '/v1/sessions', status: res.status, ms,
+        label: res.ok
+          ? `${agent?.name || 'agent'} · ${data.session_id || '—'}`
+          : (data.message || data.error || `HTTP ${res.status}`),
+      });
+      if (!res.ok) {
+        setError(data.message || data.error || `HTTP ${res.status}`);
+        setCreating(false);
+        return;
+      }
+      const newSid = data.session_id;
+      // Optional initial message. sendMessage already pushes its own
+      // toast for the follow-up POST /events — no need to double-toast.
+      if (message.trim() && newSid && typeof ctx?.sendMessage === 'function') {
+        await ctx.sendMessage(newSid, message.trim());
+      }
+      // Kick the sessions pump so the new row shows up immediately.
+      if (typeof pumpSessions === 'function') pumpSessions();
+      setCreating(false);
+      onCreate?.(newSid);
+    } catch (err) {
+      const msg = err?.message || 'network error';
+      setError(msg);
+      setCreating(false);
+      ctx?.pushToast?.({
+        method: 'POST', path: '/v1/sessions', status: 0, ms: Date.now() - startedAt,
+        label: msg,
+      });
+    }
+  }
+
+  // Auto-focus the textarea on mount so users can start typing immediately.
+  useEffect(() => {
+    const t = setTimeout(() => textareaRef.current?.focus(), 60);
+    return () => clearTimeout(t);
+  }, []);
+
+  return (
+    <div style={{
+      flex: 1, display: 'flex', flexDirection: 'column',
+      height: '100%', background: 'var(--paper)', overflow: 'hidden',
+    }} data-screen-label="New session">
+      {/* Header */}
+      <div style={{
+        padding: '18px 28px 14px',
+        borderBottom: '1px solid var(--ink)',
+        display: 'flex', alignItems: 'baseline', gap: 14,
+      }}>
+        <div style={{ minWidth: 0 }}>
+          <Mono s={10} c="var(--ink-3)" style={{ letterSpacing: 0.6, textTransform: 'uppercase' }}>POST /v1/sessions</Mono>
+          <div style={{ marginTop: 2, display: 'flex', alignItems: 'baseline', gap: 10 }}>
+            <h1 style={{
+              margin: 0, fontFamily: 'var(--font-sans)',
+              fontWeight: 500, fontSize: 22, letterSpacing: '-0.025em', color: 'var(--ink)',
+            }}>New session</h1>
+            <Mono s={11} c="var(--ink-3)">— draft, not yet persisted</Mono>
+          </div>
+        </div>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <Button variant="ghost" size="sm" onClick={onCancel}>Cancel</Button>
+          <Button variant="hard" size="sm" icon="send" onClick={submit} disabled={creating || !agentId}>
+            {creating ? 'Creating…' : 'Create session'}
+          </Button>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ flex: 1, overflowY: 'auto' }}>
+        <div style={{
+          maxWidth: 920, margin: '0 auto', padding: '22px 28px 40px',
+          display: 'flex', flexDirection: 'column', gap: 22,
+        }}>
+          {/* Agent picker */}
+          <NsSection label="Agent" hint="Immutable config · version pinned at create-time">
+            {agentsAvail.length === 0 && (
+              <div style={{ padding: 12, fontSize: 13, color: 'var(--ink-3)' }}>
+                No agents yet — create one from the Agents view first.
+              </div>
+            )}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 8 }}>
+              {agentsAvail.map((a) => {
+                const sel = a.id === agentId;
+                return (
+                  <button key={a.id} onClick={() => setAgentId(a.id)} style={{
+                    all: 'unset', cursor: 'pointer', boxSizing: 'border-box',
+                    padding: '12px 14px',
+                    border: sel ? '1px solid var(--ink)' : '1px solid var(--line-2)',
+                    background: sel ? 'var(--paper)' : 'var(--paper-2)',
+                    borderRadius: 3,
+                    transition: 'background 100ms var(--ease), border-color 100ms var(--ease)',
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                      <span style={{ fontSize: 14, fontWeight: 500, color: 'var(--ink)', letterSpacing: -0.1 }}>{a.name}</span>
+                      <Mono s={10} c="var(--ink-3)">v{a.version}</Mono>
+                      {sel && (
+                        <span style={{
+                          marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 4,
+                          fontSize: 10, color: 'var(--ink)',
+                        }}><Icon n="check" s={11} /> selected</span>
+                      )}
+                    </div>
+                    <Mono s={11} c="var(--ink-2)" style={{ marginTop: 4 }}>{a.model}</Mono>
+                    <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+                      <NsPolicyPill p={a.policy} />
+                      <Mono s={10} c="var(--ink-3)">{a.tools.length} tools</Mono>
+                      {a.mcp.length > 0 && <Mono s={10} c="var(--ink-3)">mcp: {a.mcp.join(', ')}</Mono>}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            {agent?.policy === 'deny' && (
+              <div style={{
+                marginTop: 10, padding: '8px 12px',
+                background: 'color-mix(in srgb, var(--ink) 4%, var(--paper))',
+                border: '1px solid var(--line-2)', borderRadius: 3,
+                fontSize: 12, color: 'var(--ink-2)', lineHeight: 1.5,
+              }}>
+                <Mono s={10} c="var(--ink-3)">note ·</Mono>
+                <span style={{ color: 'var(--ink)', marginLeft: 4 }}>policy=deny</span>
+                {' '}will refuse every tool call. Sessions still run — model reasoning only.
+              </div>
+            )}
+          </NsSection>
+
+          {/* Environment + Vault row */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 22 }}>
+            <NsSection label="Environment" hint="Container image · /v1/environments">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {envs.map((e) => {
+                  const sel = e.id === envId;
+                  const sub = e.packages && e.packages !== '—' ? e.packages : (e.net || '—');
+                  return (
+                    <button key={e.id} onClick={() => setEnvId(e.id)} style={{
+                      all: 'unset', cursor: 'pointer',
+                      padding: '9px 12px', borderRadius: 3,
+                      border: '1px solid ' + (sel ? 'var(--ink)' : 'var(--line-2)'),
+                      background: sel ? 'var(--paper)' : 'transparent',
+                      display: 'flex', alignItems: 'center', gap: 10,
+                    }}>
+                      <div style={{
+                        width: 12, height: 12, borderRadius: '50%',
+                        border: '1px solid ' + (sel ? 'var(--ink)' : 'var(--ink-3)'),
+                        background: sel ? 'var(--ink)' : 'transparent',
+                        flexShrink: 0,
+                      }} />
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <Mono s={12} c="var(--ink)">{e.name}</Mono>
+                        <Mono s={10} c="var(--ink-3)" style={{ marginLeft: 8 }}>{sub}</Mono>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </NsSection>
+
+            <NsSection label="Credential vault" hint="Optional · mounts into /run/creds">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {vaultOpts.map((v) => {
+                  const sel = v.id === vaultId;
+                  return (
+                    <button key={v.id || 'none'} onClick={() => setVaultId(v.id)} style={{
+                      all: 'unset', cursor: 'pointer',
+                      padding: '9px 12px', borderRadius: 3,
+                      border: '1px solid ' + (sel ? 'var(--ink)' : 'var(--line-2)'),
+                      background: sel ? 'var(--paper)' : 'transparent',
+                      display: 'flex', alignItems: 'center', gap: 10,
+                    }}>
+                      <div style={{
+                        width: 12, height: 12, borderRadius: '50%',
+                        border: '1px solid ' + (sel ? 'var(--ink)' : 'var(--ink-3)'),
+                        background: sel ? 'var(--ink)' : 'transparent',
+                        flexShrink: 0,
+                      }} />
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <Mono s={12} c="var(--ink)">{v.label}</Mono>
+                        <Mono s={10} c="var(--ink-3)" style={{ marginLeft: 8 }}>{v.sub}</Mono>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </NsSection>
+          </div>
+
+          {/* Quotas */}
+          <NsSection label="Quotas" hint="Default: inherit agent policy">
+            <div style={{
+              padding: '12px 14px',
+              background: 'var(--paper-2)',
+              border: '1px solid var(--line-2)', borderRadius: 3,
+            }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                <input type="checkbox" checked={quotaOverride} onChange={(e) => setQuotaOverride(e.target.checked)}
+                  style={{ margin: 0, accentColor: 'var(--ink-2)' }} />
+                <span style={{ fontSize: 13, color: 'var(--ink)' }}>Override session quotas</span>
+                {!quotaOverride && <Mono s={10} c="var(--ink-3)" style={{ marginLeft: 'auto' }}>inheriting · $1.00 · 50k tok</Mono>}
+              </label>
+              {quotaOverride && (
+                <>
+                  <div style={{
+                    marginTop: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14,
+                    paddingTop: 12, borderTop: '1px dashed var(--line-2)',
+                  }}>
+                    <NsQuotaField label="maxCostUsd" value={costCap} onChange={setCostCap}
+                      step={0.10} min={0.10} max={10} fmt={(v) => '$' + v.toFixed(2)} />
+                    <NsQuotaField label="maxTokens" value={tokenCap} onChange={setTokenCap}
+                      step={10} min={10} max={500} fmt={(v) => v + 'k'} />
+                  </div>
+                  <Mono s={10} c="var(--ink-3)" style={{ marginTop: 10, display: 'block' }}>
+                    note · per-session quotas aren't forwarded to the orchestrator today — the agent's template caps still apply. Override values are recorded locally until the server accepts them.
+                  </Mono>
+                </>
+              )}
+            </div>
+          </NsSection>
+
+          {/* Initial message */}
+          <NsSection label="Initial message" hint="Optional · emits user.message immediately after 201">
+            <div style={{
+              border: '1px solid var(--line-2)', borderRadius: 4,
+              background: 'var(--paper-2)',
+              display: 'flex', flexDirection: 'column',
+            }}>
+              <textarea ref={textareaRef}
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); }
+                }}
+                placeholder="What should this agent do? ⌘↵ to create."
+                rows={5}
+                style={{
+                  width: '100%', boxSizing: 'border-box', border: 'none', outline: 'none',
+                  background: 'transparent', padding: '12px 14px',
+                  fontFamily: 'var(--font-sans)', fontSize: 14, lineHeight: 1.55,
+                  color: 'var(--ink)', resize: 'vertical', minHeight: 90,
+                  accentColor: 'var(--ink-2)',
+                }} />
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: '8px 12px',
+                borderTop: '1px solid var(--line-2)',
+                background: 'color-mix(in srgb, var(--ink) 2.5%, var(--paper))',
+              }}>
+                <Mono s={10} c="var(--ink-3)">{message.length} chars · ~{Math.max(1, Math.ceil(message.length / 4))} tokens</Mono>
+                <Mono s={10} c="var(--ink-3)" style={{ marginLeft: 'auto' }}>⌘↵ create</Mono>
+              </div>
+            </div>
+          </NsSection>
+
+          {/* Request preview */}
+          <NsSection label="Request preview"
+            right={
+              <button onClick={() => setShowJson((v) => !v)} style={{
+                all: 'unset', cursor: 'pointer',
+                fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)',
+                letterSpacing: 0.4, textTransform: 'uppercase',
+              }}>{showJson ? 'hide' : 'show'}</button>
+            }
+          >
+            {showJson && (
+              <pre style={{
+                margin: 0, padding: '12px 14px',
+                background: 'var(--ink)', color: 'var(--paper)',
+                fontFamily: 'var(--font-mono)', fontSize: 11.5, lineHeight: 1.65,
+                borderRadius: 3, overflowX: 'auto', border: '1px solid var(--ink)',
+              }}>
+{`POST /v1/sessions   ${new Date().toISOString().slice(11,19)}Z
+Content-Type: application/json
+
+${JSON.stringify(previewBody, null, 2)}`}
+              </pre>
+            )}
+          </NsSection>
+
+          {error && (
+            <div style={{
+              padding: '10px 12px',
+              border: '1px solid var(--danger)',
+              background: 'color-mix(in srgb, var(--danger) 8%, var(--card))',
+              borderRadius: 4,
+            }}>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--danger)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+                POST failed
+              </div>
+              <div style={{ marginTop: 4, fontSize: 13, color: 'var(--ink)', wordBreak: 'break-word' }}>
+                {error}
+              </div>
+            </div>
+          )}
+
+          {/* Create footer */}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 12,
+            paddingTop: 8,
+          }}>
+            <Mono s={10} c="var(--ink-3)" style={{ flex: 1 }}>
+              on 201 · session {agent?.name ? `(${agent.name})` : ''} boots · container warms from pool · first event streams within 400ms
+            </Mono>
+            <Button variant="ghost" size="sm" onClick={onCancel}>Discard</Button>
+            <Button variant="hard" size="sm" icon="send" onClick={submit} disabled={creating || !agentId}>
+              {creating ? 'Creating…' : 'Create session'}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NsSection({ label, hint, right, children }) {
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 8 }}>
+        <Mono s={10} c="var(--ink-3)" style={{ letterSpacing: 0.6, textTransform: 'uppercase' }}>{label}</Mono>
+        {hint && <Mono s={10} c="var(--ink-3)" style={{ opacity: 0.7 }}>{hint}</Mono>}
+        {right && <div style={{ marginLeft: 'auto' }}>{right}</div>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function NsPolicyPill({ p }) {
+  const map = {
+    always_allow: { label: 'always_allow', bg: 'color-mix(in srgb, #2a7a43 14%, var(--paper))', fg: '#2a7a43' },
+    always_ask:   { label: 'always_ask',   bg: 'color-mix(in srgb, var(--ink) 7%, var(--paper))', fg: 'var(--ink-2)' },
+    deny:         { label: 'deny',         bg: 'color-mix(in srgb, var(--lobster) 14%, var(--paper))', fg: 'var(--lobster-press)' },
+  };
+  const c = map[p] || map.always_ask;
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4,
+      padding: '1px 7px', borderRadius: 3,
+      fontFamily: 'var(--font-mono)', fontSize: 10,
+      background: c.bg, color: c.fg,
+    }}>{c.label}</span>
+  );
+}
+
+function NsQuotaField({ label, value, onChange, step, min, max, fmt }) {
+  return (
+    <div>
+      <Mono s={10} c="var(--ink-3)" style={{ letterSpacing: 0.4, textTransform: 'uppercase' }}>{label}</Mono>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6 }}>
+        <input type="range" min={min} max={max} step={step} value={value}
+          onChange={(e) => onChange(parseFloat(e.target.value))}
+          style={{ flex: 1, accentColor: 'var(--ink-2)' }} />
+        <Mono s={12} c="var(--ink)" style={{ minWidth: 54, textAlign: 'right' }}>{fmt(value)}</Mono>
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { NewSessionPanel });
+
+
 /* ===== session_detail ===== */
 const { useState: useStateDetail, useEffect: useEffectDetail, useRef: useRefDetail } = React;
 
 // Event row — this is the hero of the whole design.
-function EventRow({ e, streaming }) {
+// `session` (optional) is the parent session record; when present it
+// powers the `session.status_running` row's real container + boot
+// description (was previously a hardcoded mock string).
+function EventRow({ e, streaming, session }) {
   const kindTone = {
     'session.status_running':  { tag: 'status', c: 'var(--ink-3)' },
     'user.message':            { tag: 'user',   c: 'var(--ink)' },
@@ -1204,7 +1925,36 @@ function EventRow({ e, streaming }) {
   );
 
   if (e.type === 'session.status_running') {
-    return <Row><span style={{ fontSize: 12, color: 'var(--ink-3)' }}>Container <code>oc-sx-a91c8b42</code> attached · warm-pool reuse · 4.1s boot</span></Row>;
+    // Render the real container + pool + boot numbers if the parent
+    // session is available. On older sessions whose container has
+    // been reaped (pool_source=null on the response) we fall back
+    // to a truthful "no container" note rather than lying.
+    const containerName = session?.containerId
+      ? (session.containerName || session.containerId.slice(0, 12))
+      : null;
+    const bootMs = typeof session?.bootMs === 'number' ? session.bootMs : null;
+    const poolSource = session?.poolSource || null;
+    const poolLabel =
+      poolSource === 'warm' ? 'warm-pool reuse' :
+      poolSource === 'cold' ? 'cold spawn' :
+      poolSource === 'limited' ? 'cold spawn · limited' :
+      poolSource === 'adopt' ? 'adopted on restart' :
+      'no container';
+    return (
+      <Row>
+        <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+          {containerName ? (
+            <>
+              Container <code>{containerName}</code> attached · {poolLabel}
+              {bootMs != null && bootMs > 0 && <> · {(bootMs / 1000).toFixed(1)}s boot</>}
+              {bootMs === 0 && poolSource === 'warm' && <> · 0.0s boot</>}
+            </>
+          ) : (
+            <>Session state · {poolLabel}</>
+          )}
+        </span>
+      </Row>
+    );
   }
   if (e.type === 'user.message') {
     return <Row>
@@ -1311,11 +2061,16 @@ function KV({ k, v, mono }) {
 }
 
 function SessionDetail({ sessionId, sessionState, streamLen }) {
-  const s = SESSIONS.find(x => x.id === sessionId) || SESSIONS[0];
+  // Hook order note: every hook must run on every render. Keep all
+  // hooks (useApp, useRef, useEffect) BEFORE any early return, or
+  // React throws a "change in the order of Hooks called" warning.
+  const ctx = useApp();
   const scrollRef = useRefDetail(null);
   useEffectDetail(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [streamLen]);
+
+  const s = SESSIONS.find((x) => x.id === sessionId) || SESSIONS[0];
 
   // Empty-state guard: the first render after a fresh page load runs
   // before pumpSessions has any data, so `s` is undefined. The design
@@ -1332,8 +2087,33 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
   // Derive displayed events + streaming based on state tweak.
   // The design's mock-data version sliced to {2, 3, 7} events for
   // visual effect — with real live data we show the whole stream.
-  const effectiveStatus = sessionState || s.status;
-  const events = EVENTS;
+  const rawStatus = sessionState || s.status;
+  // Client-side "awaiting" derivation. The backend only exposes
+  // idle | running | failed — there's no awaiting status in the
+  // store. But the SSE stream emits agent.tool_confirmation_request
+  // frames while the confirm-tools plugin holds a pending approval,
+  // and we clear the local approval state once the user resolves.
+  // Compare against the LATEST request's toolUseId so a second
+  // approval in the same session (different tool call) re-triggers
+  // awaiting even though the earlier approval was resolved.
+  const latestReq = EVENTS.slice().reverse().find((e) => e.type === 'agent.tool_confirmation_request');
+  const resolvedForThis =
+    !!latestReq &&
+    ctx?.approval?.toolUseId === latestReq.toolUseId &&
+    (ctx.approval.status === 'approved' || ctx.approval.status === 'denied');
+  const awaiting = rawStatus === 'running' && !!latestReq && !resolvedForThis;
+  const effectiveStatus = awaiting ? 'awaiting' : rawStatus;
+  // Decorate the matching agent.tool_use event with `needsApproval:
+  // true` so EventRow can render the grey `pending` chip next to the
+  // tool card. Matches on tool_call_id (the stable link between a
+  // tool_use, its confirmation_request, and the eventual tool_result).
+  const events = latestReq && !resolvedForThis
+    ? EVENTS.map((ev) =>
+        ev.type === 'agent.tool_use' && ev.toolUseId === latestReq.toolUseId
+          ? { ...ev, needsApproval: true }
+          : ev,
+      )
+    : EVENTS;
 
   const showStream = effectiveStatus === 'running';
   const partial = STREAMING_TOKENS.slice(0, streamLen || STREAMING_TOKENS.length);
@@ -1345,7 +2125,7 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <Mono s={13} c="var(--ink)" style={{ fontWeight: 500 }}>{s.id}</Mono>
           <Icon n="copy" s={11} style={{ color: 'var(--ink-3)', cursor: 'pointer' }} />
-          <Mono s={11} c="var(--ink-3)" style={{ marginLeft: 6 }}>· {s.agent} v{4} · {s.model}</Mono>
+          <Mono s={11} c="var(--ink-3)" style={{ marginLeft: 6 }}>· {s.agent}{s.agentVersion ? ' v' + s.agentVersion : ''} · {s.model || '—'}</Mono>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
             <StatusBadge s={effectiveStatus} />
             <SessionHeaderActions sid={s.id} status={effectiveStatus} />
@@ -1386,7 +2166,7 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
             </div>
           </div>
           <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto' }}>
-            {events.map((e, i) => <EventRow key={i} e={e} />)}
+            {events.map((e, i) => <EventRow key={i} e={e} session={s} />)}
             {showStream && <StreamingRow text={partial} />}
             <SentMessagesFeed sid={s.id} />
             <CancelledBanner />
@@ -1410,9 +2190,23 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
                 </p>
               </div>
             )}
+            {s.orphanedAgent && (
+              <div style={{ padding: '24px', borderBottom: '1px solid var(--line)' }}>
+                <Badge tone="err">agent_not_found</Badge>
+                <p style={{ marginTop: 12, fontSize: 13, color: 'var(--ink)', maxWidth: '58ch', lineHeight: 1.55 }}>
+                  Agent template <Mono s={12} c="var(--ink)">{s.agentId}</Mono> has been deleted. This session is read-only — POST /events will return 404. Open a session on a live agent to continue.
+                </p>
+              </div>
+            )}
           </div>
 
-          <Composer sid={s.id} effectiveStatus={effectiveStatus} />
+          <Composer
+            sid={s.id}
+            effectiveStatus={effectiveStatus}
+            orphaned={s.orphanedAgent}
+            sessionModel={s.model}
+            sessionThinking={s.thinkingLevel}
+          />
         </div>
 
         {/* Inspector */}
@@ -1476,55 +2270,147 @@ function SessionInspector({ s, status }) {
 }
 
 function ConfigTab({ s }) {
+  // Agent template + environment are joined on the session during
+  // pumpSessions. Missing data → orphaned agent / legacy environment
+  // row (not all sessions carry environment_id). Render "—" rather
+  // than a fake value so the inspector never lies about config.
+  const agent = s.agentFull;
+  const env = s.envFull;
+  const policyType = agent?.permissionPolicy?.type || agent?.policy || 'always_allow';
+  const tools = agent?.tools || [];
+  const denied = agent?.denied || [];
+  const mcpServers = agent?.mcpServers || {};
+  const mcpKeys = Object.keys(mcpServers);
+  const quota = agent?.quota || {};
+  const netType = env?.networkingRaw?.type || 'unrestricted';
+  const allowedHosts = env?.networkingRaw?.allowed_hosts || [];
+  const packagesRaw = env?.packagesRaw || {};
+  const formatQuotaCost = quota.maxCostUsdPerSession != null
+    ? '$' + Number(quota.maxCostUsdPerSession).toFixed(2) + ' / session'
+    : '—';
+  const formatQuotaTokens = quota.maxTokensPerSession != null
+    ? Number(quota.maxTokensPerSession).toLocaleString() + ' / session'
+    : '—';
+  const formatQuotaWall = quota.maxWallDurationMs != null
+    ? formatWall(quota.maxWallDurationMs)
+    : '—';
   return (
     <>
       <Eyebrow>Agent</Eyebrow>
       <div style={{ marginTop: 6 }}>
-        <KV k="id"         v={s.agentId} mono />
-        <KV k="name"       v={s.agent} />
-        <KV k="version"    v="4 · latest" mono />
-        <KV k="model"      v={s.model} mono />
+        <KV k="id"      v={s.agentId} mono />
+        <KV k="name"    v={s.agent} />
+        <KV k="version" v={agent?.version ? `${agent.version} · latest` : '—'} mono />
+        <KV k="model"   v={s.model || '—'} mono />
+        <KV k="thinking" v={s.thinkingLevel || 'off'} mono />
       </div>
 
       <div style={{ height: 14 }} />
-      <Eyebrow>Tools · permission</Eyebrow>
+      <Eyebrow>Tools · {policyType}</Eyebrow>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 8 }}>
-        {['web.search', 'web.fetch', 'python'].map(t => (
-          <span key={t} style={{
+        {tools.length === 0 && denied.length === 0 && (
+          <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>— no tool restrictions</span>
+        )}
+        {(() => {
+          // Per-tool suffix is derived from the agent's actual
+          // permission policy, not the policy-is-always_ask shortcut
+          // the initial version used. For a `deny` policy, every tool
+          // in the deny list renders as a lobster-washed "· deny"
+          // chip; the non-deny tools render as "· allow". For
+          // `always_ask`, the ask list is "· ask", others are "· allow".
+          // For `always_allow`, everything is "· allow".
+          const deniedSet = new Set(agent?.denied || []);
+          const askSet = new Set(agent?.askList || []);
+          return tools.map(t => {
+            let suffix = 'allow';
+            let tone = 'plain';
+            if (deniedSet.has(t)) { suffix = 'deny'; tone = 'deny'; }
+            else if (askSet.has(t)) { suffix = 'ask'; tone = 'ask'; }
+            const base = {
+              fontFamily: 'var(--font-mono)', fontSize: 11,
+              padding: '2px 7px', borderRadius: 3,
+            };
+            if (tone === 'deny') {
+              return <span key={'tool-'+t} style={{
+                ...base,
+                border: '1px solid var(--lobster-soft)',
+                background: 'var(--lobster-wash)',
+                color: 'var(--lobster-press)',
+              }}>{t} · {suffix}</span>;
+            }
+            if (tone === 'ask') {
+              return <span key={'tool-'+t} style={{
+                ...base,
+                border: '1px solid var(--lobster-soft)',
+                background: 'var(--lobster-wash)',
+                color: 'var(--lobster-press)',
+              }}>{t} · {suffix}</span>;
+            }
+            return <span key={'tool-'+t} style={{
+              ...base,
+              border: '1px solid var(--line-2)',
+              background: 'var(--card)',
+              color: 'var(--ink-2)',
+            }}>{t} <span style={{ color: 'var(--ink-4)' }}>· {suffix}</span></span>;
+          });
+        })()}
+        {/* Any denied tools that aren't also in the top-level tools
+            array (should be rare — the UI wires them together) still
+            render as a standalone deny chip so they're visible. */}
+        {denied.filter(t => !tools.includes(t)).map(t => (
+          <span key={'deny-extra-'+t} style={{
             fontFamily: 'var(--font-mono)', fontSize: 11,
-            padding: '2px 7px', border: '1px solid var(--line-2)',
-            background: 'var(--card)', color: 'var(--ink-2)', borderRadius: 3,
-          }}>{t} <span style={{ color: 'var(--ink-4)' }}>· allow</span></span>
+            padding: '2px 7px', border: '1px solid var(--lobster-soft)',
+            background: 'var(--lobster-wash)', color: 'var(--lobster-press)', borderRadius: 3,
+          }}>{t} · deny</span>
         ))}
-        <span style={{
-          fontFamily: 'var(--font-mono)', fontSize: 11,
-          padding: '2px 7px', border: '1px solid var(--lobster-soft)',
-          background: 'var(--lobster-wash)', color: 'var(--lobster-press)', borderRadius: 3,
-        }}>file.write · ask</span>
       </div>
 
       <div style={{ height: 14 }} />
-      <Eyebrow>MCP servers</Eyebrow>
+      <Eyebrow>MCP servers · {mcpKeys.length}</Eyebrow>
       <div style={{ marginTop: 6 }}>
-        <KV k="linear"  v="https://mcp.linear.app/sse" mono />
-        <KV k="notion"  v="https://mcp.notion.so/sse" mono />
+        {mcpKeys.length === 0 && (
+          <div style={{ fontSize: 12, color: 'var(--ink-3)', padding: '4px 0' }}>— none configured</div>
+        )}
+        {mcpKeys.map(k => {
+          const v = mcpServers[k];
+          const label = typeof v === 'string' ? v : (v?.url || v?.command || JSON.stringify(v));
+          return <KV key={k} k={k} v={label} mono />;
+        })}
       </div>
 
       <div style={{ height: 14 }} />
       <Eyebrow>Environment</Eyebrow>
       <div style={{ marginTop: 6 }}>
-        <KV k="id"          v={s.env} mono />
-        <KV k="networking"  v="unrestricted" />
-        <KV k="pip"         v="requests, httpx" mono />
+        <KV k="id"         v={s.env} mono />
+        <KV k="networking" v={netType === 'limited'
+          ? `limited · ${allowedHosts.length} hosts`
+          : 'unrestricted'} />
+        {Object.entries(packagesRaw).filter(([, v]) => Array.isArray(v) && v.length).map(([mgr, pkgs]) => (
+          <KV key={mgr} k={mgr} v={pkgs.join(', ')} mono />
+        ))}
+        {Object.keys(packagesRaw).length === 0 && (
+          <div style={{ fontSize: 12, color: 'var(--ink-3)', padding: '4px 0' }}>— stock runtime image</div>
+        )}
       </div>
 
       <div style={{ height: 14 }} />
       <Eyebrow>Quota</Eyebrow>
       <div style={{ marginTop: 6 }}>
-        <KV k="maxCost"   v="$1.00 / session" mono />
-        <KV k="maxTokens" v="50,000 / session" mono />
-        <KV k="maxWall"   v="30 min" mono />
+        <KV k="maxCost"   v={formatQuotaCost} mono />
+        <KV k="maxTokens" v={formatQuotaTokens} mono />
+        <KV k="maxWall"   v={formatQuotaWall} mono />
       </div>
+
+      {agent?.callableAgents?.length > 0 && (
+        <>
+          <div style={{ height: 14 }} />
+          <Eyebrow>Delegation · depth {agent.maxSubagentDepth}</Eyebrow>
+          <div style={{ marginTop: 6 }}>
+            {agent.callableAgents.map(id => <KV key={id} k="callable" v={id} mono />)}
+          </div>
+        </>
+      )}
     </>
   );
 }
@@ -1567,17 +2453,31 @@ function TreeTab() {
 }
 
 function RawTab({ s }) {
+  // Mirror the real API response shape so a reader can grep the orchestrator
+  // logs for the same field names. `last_event_id` comes from the last
+  // event seen on the wire for this session (not the store — we don't
+  // persist events there). Falls back to `—` while the stream hasn't
+  // delivered anything yet.
+  const lastEv = EVENTS.length ? EVENTS[EVENTS.length - 1] : null;
+  // Raw JSON shows server-side truth (null when unset), not UI fallbacks.
   const json = {
     session_id: s.id,
     agent_id: s.agentId,
+    environment_id: s.envId,
     status: s.status,
     model: s.model,
-    tokens_in: 6_140, tokens_out: 2_272,
+    thinking_level: s.thinkingLevel,
+    tokens: { input: s.tokensIn, output: s.tokensOut },
     cost_usd: s.cost,
     turns: s.turns,
-    container: s.container,
-    environment_id: s.env,
-    last_event_id: 'evt_000042',
+    container_id: s.containerId,
+    container_name: s.containerName,
+    pool_source: s.poolSource,
+    boot_ms: s.bootMs,
+    created_at: s.createdAt,
+    last_event_at: s.lastEventAt,
+    last_event_type: lastEv?.type ?? null,
+    error: s.error ?? null,
   };
   return (
     <pre style={{
@@ -1610,7 +2510,7 @@ function OverviewView() {
       <div style={{ padding: '32px 40px 28px' }}>
         <Eyebrow>Managed Agents · 4-primitive REST API</Eyebrow>
         <h1 style={{ marginTop: 10, fontSize: 42, fontWeight: 500, letterSpacing: '-0.035em', lineHeight: 1.05 }}>
-          Autonomous agents, your cloud,<br/><span style={{ color: 'var(--ink-3)' }}>any model.</span>
+          Autonomous agents,<br/><span style={{ color: 'var(--ink-3)' }}>any model, any cloud.</span>
         </h1>
         <p style={{ marginTop: 14, maxWidth: '58ch', fontSize: 15, color: 'var(--ink-2)', lineHeight: 1.55 }}>
           One Docker container per session. HMAC-durable event queue. Real SSE streaming. Lives on your $4 Hetzner VPS or anywhere Docker runs.
@@ -2003,7 +2903,7 @@ function AppProvider({ children }) {
     if (!text.trim()) return;
     const id = 'ev_' + Math.random().toString(36).slice(2, 10);
     const startedAt = Date.now();
-    setSentMessages(m => [...m, { id, sid, text: text.trim(), at: new Date(), status: 'sending' }]);
+    setSentMessages(m => [...m, { id, sid, text: text.trim(), at: new Date(), postedAt: startedAt, status: 'sending' }]);
     const tid = pushToast({
       method: 'POST', path: `/v1/sessions/${sid}/events`,
       label: 'user.message', status: null, ms: null, pending: true,
@@ -2015,18 +2915,47 @@ function AppProvider({ children }) {
       });
       const ms = Date.now() - startedAt;
       const ok = res.ok;
-      setSentMessages(m => m.map(x => x.id === id ? { ...x, status: ok ? 'queued' : 'failed', ms } : x));
-      setToasts(ts2 => ts2.map(x => x.id === tid ? { ...x, status: res.status, ms, pending: false } : x));
-      // The real user.message event will land in EVENTS via the SSE
-      // stream (or the poll fallback). Drop the "sending" entry after
-      // a brief grace — the event stream will render the real bubble.
-      setTimeout(() => {
-        setSentMessages(m => m.filter(x => x.id !== id));
-      }, 1500);
+      // Surface the server's error body on failure. Without this the
+      // toast only shows "404 10ms" and the optimistic bubble is
+      // silently cleaned up 1.5s later — leaving no trace of what
+      // actually broke. Common case: session's agent template was
+      // deleted → `agent_not_found`.
+      let failLabel = null;
+      if (!ok) {
+        try {
+          const body = await res.clone().json();
+          failLabel = body?.message || body?.error || `HTTP ${res.status}`;
+        } catch {
+          failLabel = `HTTP ${res.status}`;
+        }
+      }
+      setSentMessages(m => m.map(x => x.id === id ? {
+        ...x,
+        status: ok ? 'queued' : 'failed',
+        ms,
+        error: ok ? undefined : failLabel,
+      } : x));
+      setToasts(ts2 => ts2.map(x => x.id === tid ? {
+        ...x,
+        status: res.status, ms, pending: false,
+        label: ok ? x.label : failLabel,
+      } : x));
+      // On success: the real user.message event will land in EVENTS via
+      // the SSE stream (or the poll fallback). Drop the "sending" entry
+      // after a brief grace — the event stream will render the real
+      // bubble. On failure: keep the failed entry on screen so the user
+      // can see what broke; they can dismiss it by reloading or sending
+      // again.
+      if (ok) {
+        setTimeout(() => {
+          setSentMessages(m => m.filter(x => x.id !== id));
+        }, 1500);
+      }
     } catch (err) {
       const ms = Date.now() - startedAt;
-      setSentMessages(m => m.map(x => x.id === id ? { ...x, status: 'failed', ms } : x));
-      setToasts(ts2 => ts2.map(x => x.id === tid ? { ...x, status: 0, ms, pending: false, label: 'network error' } : x));
+      const msg = err?.message || 'network error';
+      setSentMessages(m => m.map(x => x.id === id ? { ...x, status: 'failed', ms, error: msg } : x));
+      setToasts(ts2 => ts2.map(x => x.id === tid ? { ...x, status: 0, ms, pending: false, label: msg } : x));
     }
   }
 
@@ -2100,18 +3029,23 @@ function AppProvider({ children }) {
 
   async function resolveApproval(sid, decision) {
     if (approval.status !== 'pending') return;
-    setApproval({ status: decision, at: Date.now() });
+    // Grab the pending approval id BEFORE firing so we can stash it on
+    // the approval state. That lets the awaiting-derivation compare
+    // the latest request's toolUseId against the last-resolved one —
+    // if a fresh confirmation_request arrives with a different id,
+    // the session goes awaiting again without needing a manual reset.
+    const pendingReq = EVENTS.slice().reverse().find((e) => e.type === 'agent.tool_confirmation_request');
+    if (!pendingReq) {
+      pushToast({ method: 'POST', path: `/v1/sessions/${sid}/events`, status: 0, ms: 0, label: 'no pending approval' });
+      return;
+    }
+    setApproval({ status: decision, at: Date.now(), toolUseId: pendingReq.toolUseId });
     const startedAt = Date.now();
     const tid = pushToast({
       method: 'POST', path: `/v1/sessions/${sid}/events`,
       label: `user.tool_confirmation · ${decision}`, status: null, ms: null, pending: true,
     });
     try {
-      // Grab the pending approval id from the live event stream. The
-      // event shape carries toolUseId on the tool_confirmation_request
-      // row; we reuse it as the approval_id the orchestrator expects.
-      const pendingReq = EVENTS.slice().reverse().find(e => e.type === 'agent.tool_confirmation_request');
-      if (!pendingReq) throw new Error('no pending approval');
       const res = await fetch(`/v1/sessions/${encodeURIComponent(sid)}/events`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2121,11 +3055,11 @@ function AppProvider({ children }) {
         }),
       });
       const ms = Date.now() - startedAt;
-      setToasts(ts => ts.map(x => x.id === tid ? { ...x, status: res.status, ms, pending: false } : x));
+      setToasts((ts) => ts.map((x) => x.id === tid ? { ...x, status: res.status, ms, pending: false } : x));
     } catch (err) {
       const ms = Date.now() - startedAt;
       setApproval({ status: 'pending' }); // roll back local state on failure
-      setToasts(ts => ts.map(x => x.id === tid ? { ...x, status: 0, ms, pending: false, label: 'network error' } : x));
+      setToasts((ts) => ts.map((x) => x.id === tid ? { ...x, status: 0, ms, pending: false, label: 'network error' } : x));
     }
   }
 
@@ -2145,39 +3079,96 @@ function AppProvider({ children }) {
     });
   }
 
+  // Returns { ok: true } on success, or { ok: false, error: string } so
+  // the CreateAgentModal can keep the form fields intact on failure and
+  // render an inline error. The toast stack still records every HTTP
+  // call verbosely — the inline error is for the human.
   async function createAgent(cfg) {
     const startedAt = Date.now();
     const tid = pushToast({
       method: 'POST', path: '/v1/agents',
       label: `${cfg.name || 'agent'} · …`, status: null, ms: null, pending: true,
     });
-    try {
-      const body = {
-        model: cfg.model,
-        instructions: cfg.instructions || `You are ${cfg.name || 'an agent'}.`,
-        tools: cfg.tools?.length ? { also_allow: cfg.tools } : undefined,
-        permissionPolicy: cfg.policy ? { type: cfg.policy } : undefined,
+    // Schema shape:
+    //   tools:            flat string array (NOT {also_allow:[…]} — that was wrong).
+    //   permissionPolicy: discriminated union. always_ask accepts an
+    //                     optional `tools` list; deny REQUIRES a tools
+    //                     list of ≥1; always_allow has no tools field.
+    const body = {
+      model: cfg.model,
+      instructions: cfg.instructions || `You are ${cfg.name || 'an agent'}.`,
+      tools: cfg.tools || [],
+    };
+    // Optional schema field: stable display name. Omit when empty so
+    // the schema's optional() branch fires rather than sending "".
+    if (cfg.name) {
+      body.name = cfg.name;
+    }
+    if (cfg.policy === 'always_ask') {
+      body.permissionPolicy = { type: 'always_ask', tools: cfg.tools };
+    } else if (cfg.policy === 'deny') {
+      // Reuse the tools selection as the deny list. That's the honest
+      // mapping available without a second multi-select in the UI; a
+      // richer editor can split these later.
+      body.permissionPolicy = { type: 'deny', tools: cfg.tools };
+    } else {
+      body.permissionPolicy = { type: 'always_allow' };
+    }
+    // MCP servers. The one-click pills correspond to hosted MCP
+    // endpoints that actually exist and respond. Every one still
+    // needs an Authorization header (OAuth bearer for Linear,
+    // streamable-HTTP bearer for Notion, a GitHub PAT for GitHub)
+    // — the modal ships the URL only; credentials are bound via
+    // POST /v1/vaults + session vault binding in a follow-up pass.
+    // Users can also PATCH the agent after creation to switch a row
+    // to stdio (command+args) or add headers inline.
+    //
+    // Transport paths verified 2026-04:
+    //   Linear  — SSE at /sse
+    //   Notion  — Streamable HTTP at /mcp (NOT /sse — that 404s)
+    //   GitHub  — Streamable HTTP at /mcp/
+    // (Slack + Postgres are stdio-only; not present in the modal.)
+    if (Array.isArray(cfg.mcp) && cfg.mcp.length > 0) {
+      const KNOWN_MCP_URLS = {
+        linear: 'https://mcp.linear.app/sse',
+        notion: 'https://mcp.notion.com/mcp',
+        github: 'https://api.githubcopilot.com/mcp/',
       };
-      const res = await fetch('/v1/agents', {
+      body.mcpServers = Object.fromEntries(
+        cfg.mcp
+          .filter((k) => KNOWN_MCP_URLS[k])
+          .map((k) => [k, { url: KNOWN_MCP_URLS[k] }]),
+      );
+    }
+    let res, data, ms;
+    try {
+      res = await fetch('/v1/agents', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      const ms = Date.now() - startedAt;
-      const data = await res.json().catch(() => ({}));
-      setToasts(ts => ts.map(x => x.id === tid ? {
-        ...x, status: res.status, ms, pending: false,
-        label: `${cfg.name || 'agent'} · ${data.agent_id || '—'}`,
-      } : x));
-      if (res.ok) {
-        setCreateOpen(false);
-        // Live pump refreshes agents list on the next tick (≤10s);
-        // kick it immediately so the new agent shows up now.
-        if (typeof pumpAgents === 'function') pumpAgents();
-      }
-    } catch {
-      const ms = Date.now() - startedAt;
-      setToasts(ts => ts.map(x => x.id === tid ? { ...x, status: 0, ms, pending: false, label: 'network error' } : x));
+      ms = Date.now() - startedAt;
+      data = await res.json().catch(() => ({}));
+    } catch (err) {
+      ms = Date.now() - startedAt;
+      const msg = err?.message || 'network error';
+      setToasts(ts => ts.map(x => x.id === tid ? { ...x, status: 0, ms, pending: false, label: msg } : x));
+      return { ok: false, error: msg };
     }
+    setToasts(ts => ts.map(x => x.id === tid ? {
+      ...x, status: res.status, ms, pending: false,
+      label: res.ok
+        ? `${cfg.name || 'agent'} · ${data.agent_id || '—'}`
+        : (data.message || data.error || `HTTP ${res.status}`),
+    } : x));
+    if (!res.ok) {
+      const reason = data.message || data.error || `HTTP ${res.status}`;
+      return { ok: false, error: reason };
+    }
+    // Live pump refreshes agents list on the next tick (≤10s);
+    // kick it immediately so the new agent shows up now.
+    if (typeof pumpAgents === 'function') pumpAgents();
+    setCreateOpen(false);
+    return { ok: true, agentId: data.agent_id };
   }
 
   const value = {
@@ -2254,27 +3245,60 @@ function CreateAgentModal() {
   const [name, setName] = useState('');
   const [model, setModel] = useState('moonshot/kimi-k2.5');
   const [instructions, setInstructions] = useState('');
-  const [tools, setTools] = useState(['web.search', 'web.fetch']);
+  // Default selection picks the two most-used openclaw built-ins for a
+  // fresh agent template: `read` (file read) + `web_search`. Users can
+  // toggle pills, or leave empty (any registered tool can run) — the
+  // `valid` guard still requires at least one because the deny-policy
+  // branch needs a non-empty list.
+  const [tools, setTools] = useState(['read', 'web_search']);
   const [mcp, setMcp] = useState([]);
   const [policy, setPolicy] = useState('always_ask');
   const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
 
   if (!ctx?.createOpen) return null;
 
-  const allTools = ['web.search', 'web.fetch', 'file.read', 'file.write', 'python', 'shell', 'node.exec'];
-  const allMcp = ['linear', 'notion', 'github', 'slack', 'postgres'];
+  // Openclaw's built-in tool registry (names grepped from the shipped
+  // runtime bundle). Ordered by expected usage frequency for an
+  // average agent. These are the ONLY names openclaw recognizes as
+  // allowlist / deny / always_ask targets — older design labels like
+  // "web.search" (dot not underscore) or "file.read" do not match
+  // anything at runtime. Custom tools added via plugins would also
+  // register under their own names but are out of scope for the
+  // one-click modal.
+  const allTools = ['exec', 'read', 'write', 'edit', 'apply_patch', 'web_search'];
+  // One-click MCP endpoints. Kept to the three with verified hosted
+  // endpoints (see KNOWN_MCP_URLS in createAgent). Slack / Postgres
+  // are stdio-only and need env-based config, so they don't belong
+  // in a URL-picker. Deferred to a richer editor.
+  const allMcp = ['linear', 'notion', 'github'];
 
+  // deny requires a tools list of ≥1. always_ask / always_allow don't.
+  // "valid" guards the Create button — keep tools≥1 baseline so every
+  // policy path has at least one tool to operate on.
   const valid = name.trim().length >= 3 && tools.length >= 1;
   const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || '…';
 
-  function submit() {
+  async function submit() {
     if (!valid || submitting) return;
     setSubmitting(true);
-    setTimeout(() => {
-      ctx.createAgent({ name: name.trim(), model, tools, mcp, policy, instructions });
-      setSubmitting(false);
-      setName(''); setInstructions(''); setTools(['web.search', 'web.fetch']); setMcp([]); setPolicy('always_ask');
-    }, 480);
+    setError(null);
+    const outcome = await ctx.createAgent({
+      name: name.trim(), model, tools, mcp, policy, instructions,
+    });
+    setSubmitting(false);
+    if (outcome?.ok) {
+      // Success → provider closes the modal; reset state here so the
+      // next open starts fresh.
+      setName(''); setInstructions('');
+      setTools(['read', 'web_search']); setMcp([]);
+      setPolicy('always_ask');
+      setError(null);
+    } else {
+      // Failure → keep fields so the user can correct and retry. Show
+      // the error inline above the Cancel/Create buttons.
+      setError(outcome?.error || 'request failed');
+    }
   }
 
   const Toggle = ({ set, arr, item }) => {
@@ -2337,7 +3361,18 @@ function CreateAgentModal() {
           <div>
             <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Model</label>
             <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
-              {['moonshot/kimi-k2.5', 'anthropic/claude-4.5', 'openai/gpt-5', 'deepseek/v3'].map(m => (
+              {/* Real provider/model IDs the orchestrator passes through to
+                  openclaw's provider catalog. Anything openclaw doesn't
+                  recognize at runtime fails the first /chat/completions —
+                  these four are deployment-tested. Users can set a different
+                  model per session via POST /v1/sessions/:id/events { model }
+                  without re-creating the agent. */}
+              {[
+                'moonshot/kimi-k2.5',
+                'anthropic/claude-sonnet-4-6',
+                'openai/gpt-4.1',
+                'deepseek/deepseek-chat',
+              ].map(m => (
                 <button key={m} onClick={() => setModel(m)} style={{
                   all: 'unset', cursor: 'pointer',
                   padding: '6px 11px', fontSize: 12, fontFamily: 'var(--font-mono)',
@@ -2383,9 +3418,13 @@ function CreateAgentModal() {
             <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Permission policy</label>
             <div style={{ display: 'flex', gap: 0, marginTop: 6, border: '1px solid var(--line-2)', borderRadius: 6, overflow: 'hidden', width: 'fit-content' }}>
               {[
-                { v: 'always_ask', l: 'always_ask', d: 'Stop on every tool — safest' },
-                { v: 'allowlist',  l: 'allowlist',  d: 'Pre-approved tools only' },
-                { v: 'autonomous', l: 'autonomous', d: 'No approvals · budget-bounded' },
+                // Real schema enum: always_allow / deny / always_ask.
+                // always_ask: stop on the selected tools before running.
+                // deny:        block the selected tools outright.
+                // always_allow: no approvals (selected tools are the allowlist).
+                { v: 'always_ask',   l: 'always_ask',   d: 'Stop on each selected tool — require confirmation' },
+                { v: 'deny',         l: 'deny',         d: 'Block the selected tools outright' },
+                { v: 'always_allow', l: 'always_allow', d: 'No approvals · tools run freely' },
               ].map(p => (
                 <button key={p.v} onClick={() => setPolicy(p.v)} title={p.d} style={{
                   all: 'unset', cursor: 'pointer',
@@ -2399,6 +3438,21 @@ function CreateAgentModal() {
           </div>
         </div>
 
+        {error && (
+          <div style={{
+            margin: '0 20px', padding: '10px 12px',
+            border: '1px solid var(--danger)',
+            background: 'color-mix(in srgb, var(--danger) 8%, var(--card))',
+            borderRadius: 6, marginBottom: 14,
+          }}>
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--danger)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+              POST failed
+            </div>
+            <div style={{ marginTop: 4, fontSize: 13, color: 'var(--ink)', wordBreak: 'break-word' }}>
+              {error}
+            </div>
+          </div>
+        )}
         <div style={{ padding: '14px 20px', borderTop: '1px solid var(--ink)', display: 'flex', alignItems: 'center', gap: 10 }}>
           <span style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-3)' }}>
             idempotency-key auto · <span style={{ color: 'var(--ink-2)' }}>{'ik_' + slug.slice(0, 8)}</span>
@@ -2422,14 +3476,15 @@ function CreateAgentModal() {
 }
 
 
-function Composer({ sid, effectiveStatus }) {
+function Composer({ sid, effectiveStatus, orphaned, sessionModel, sessionThinking }) {
   const ctx = useApp();
   const [text, setText] = useState('');
   const [focused, setFocused] = useState(false);
   const taRef = React.useRef(null);
 
-  const disabled = effectiveStatus === 'failed' || ctx?.cancelState === 'cancelled';
+  const disabled = !!orphaned || effectiveStatus === 'failed' || ctx?.cancelState === 'cancelled';
   const hint =
+    orphaned ? 'Agent template deleted — this session is read-only.' :
     ctx?.cancelState === 'cancelled' ? 'Session ended — open a new one to continue.' :
     effectiveStatus === 'running' ? 'Session is running — your next message will queue.' :
     effectiveStatus === 'awaiting' ? 'Paused on tool approval — resolve above to continue.' :
@@ -2485,8 +3540,8 @@ function Composer({ sid, effectiveStatus }) {
             }}
           />
           <div style={{ display: 'flex', gap: 6, paddingTop: 6, borderTop: '1px solid var(--line)', alignItems: 'center', flexWrap: 'wrap' }}>
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', background: 'var(--paper-2)', padding: '1px 5px', borderRadius: 3 }}>moonshot/kimi-k2.5</span>
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', background: 'var(--paper-2)', padding: '1px 5px', borderRadius: 3 }}>/think medium</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', background: 'var(--paper-2)', padding: '1px 5px', borderRadius: 3 }}>{sessionModel || '—'}</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', background: 'var(--paper-2)', padding: '1px 5px', borderRadius: 3 }}>/think {sessionThinking || 'off'}</span>
             <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
               {text.length > 0 && <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)' }}>{text.length} chars</span>}
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)' }}>POST /events · <Kbd>⌘↵</Kbd></span>
@@ -2512,10 +3567,20 @@ function SentMessagesFeed({ sid }) {
   const ctx = useApp();
   const mine = ctx?.sentMessages.filter(m => m.sid === sid) || [];
   if (!mine.length) return null;
-  const baseTs = 7;
+  // Anchor on the stream's first event (LIVE_EVENT_ANCHOR) so these
+  // optimistic bubbles sit in the same timeline as the server-side
+  // rows. When the anchor hasn't been set yet (session with no prior
+  // events), fall back to the first sent message's own timestamp so
+  // subsequent messages still get meaningful relative offsets.
+  const anchor = LIVE_EVENT_ANCHOR ?? mine[0]?.postedAt ?? Date.now();
   return <>
-    {mine.map((m, i) => {
-      const t = `+00:${String(baseTs + i * 3).padStart(5, '0')}.${String(i * 117 % 1000).padStart(3, '0')}`;
+    {mine.map((m) => {
+      const postedAt = m.postedAt ?? Date.now();
+      const offsetMs = Math.max(0, postedAt - anchor);
+      const totalS = offsetMs / 1000;
+      const mm = Math.floor(totalS / 60);
+      const ss = totalS - mm * 60;
+      const t = '+' + String(mm).padStart(2, '0') + ':' + ss.toFixed(3).padStart(6, '0');
       return (
         <div key={m.id} style={{
           display: 'grid', gridTemplateColumns: '92px 92px 1fr',
@@ -2525,14 +3590,25 @@ function SentMessagesFeed({ sid }) {
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-3)' }}>{t}</span>
           <div>
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink)', fontWeight: 500 }}>user.message</span>
-            <div style={{ marginTop: 2, fontFamily: 'var(--font-mono)', fontSize: 10, color: m.status === 'sending' ? 'var(--ink-4)' : 'var(--ok)' }}>
+            <div style={{
+              marginTop: 2, fontFamily: 'var(--font-mono)', fontSize: 10,
+              color: m.status === 'sending' ? 'var(--ink-4)'
+                   : m.status === 'failed'  ? 'var(--danger)'
+                   : 'var(--ok)',
+            }}>
               {m.status === 'sending' ? 'POST…' :
                m.status === 'queued'  ? `202 · ${m.ms}ms` :
+               m.status === 'failed'  ? `failed · ${m.ms}ms` :
                m.status === 'acked'   ? 'queued' : m.status}
             </div>
           </div>
           <div>
             <p style={{ margin: 0, fontSize: 14, color: 'var(--ink)', lineHeight: 1.55, maxWidth: '62ch', whiteSpace: 'pre-wrap' }}>{m.text}</p>
+            {m.status === 'failed' && m.error && (
+              <span style={{ marginTop: 6, display: 'block', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--danger)' }}>
+                {m.error}
+              </span>
+            )}
             {m.ackNote && (
               <span style={{ marginTop: 6, display: 'block', fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)' }}>{m.ackNote}</span>
             )}
@@ -2579,52 +3655,32 @@ function CancelledBanner() {
 function ApprovalRow({ e }) {
   const ctx = useApp();
   const a = ctx?.approval || { status: 'pending' };
-  const always = ctx?.alwaysAllow?.['file.write'];
+  const always = ctx?.alwaysAllow?.[e.toolName || e.tool || 'tool'];
 
-  if (a.status === 'approved') {
+  // When the user has resolved the approval locally, render a compact
+  // muted marker where the pending card used to sit — just enough to
+  // remind them what they decided, without synthesizing a fake
+  // tool_result. The real outcome flows in as a normal
+  // agent.tool_result (approve path) or the agent's follow-up
+  // agent.message (deny path) — no mock strings here.
+  if (a.status === 'approved' || a.status === 'denied') {
+    const isAllowed = a.status === 'approved';
     return (
       <div style={{
         display: 'grid', gridTemplateColumns: '92px 92px 1fr', gap: 16,
-        padding: '12px 24px', borderBottom: '1px solid var(--line)',
+        padding: '10px 24px', borderBottom: '1px solid var(--line)',
         background: 'transparent',
       }}>
-        <Mono s={11} c="var(--ink-3)">+00:04.47…</Mono>
+        <Mono s={11} c="var(--ink-3)">{e.t}</Mono>
         <div>
-          <Mono s={11} c="var(--ok)" style={{ textTransform: 'lowercase' }}>tool·ok</Mono>
-          <div style={{ marginTop: 2 }}><Mono s={10} c="var(--ink-4)">file.write</Mono></div>
+          <Mono s={11} c={isAllowed ? 'var(--ok)' : 'var(--danger)'} style={{ textTransform: 'lowercase' }}>
+            {isAllowed ? 'approved' : 'denied'}
+          </Mono>
+          <div style={{ marginTop: 2 }}><Mono s={10} c="var(--ink-4)">{e.actor || 'user'}</Mono></div>
         </div>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 10,
-          padding: '6px 10px', border: '1px solid var(--line)', borderRadius: 6,
-          background: 'var(--paper-2)', width: 'fit-content', maxWidth: '100%',
-        }}>
-          <Icon n="check" s={12} style={{ color: 'var(--ok)' }} />
-          <Mono s={11} c="var(--ink-3)">{e.toolUseId}</Mono>
-          <span style={{ fontSize: 12, color: 'var(--ink-2)' }}>wrote research.md · 4.8 KB</span>
-        </div>
-      </div>
-    );
-  }
-  if (a.status === 'denied') {
-    return (
-      <div style={{
-        display: 'grid', gridTemplateColumns: '92px 92px 1fr', gap: 16,
-        padding: '12px 24px', borderBottom: '1px solid var(--line)',
-        background: 'transparent',
-      }}>
-        <Mono s={11} c="var(--ink-3)">+00:04.47…</Mono>
-        <div>
-          <Mono s={11} c="var(--danger)" style={{ textTransform: 'lowercase' }}>tool·denied</Mono>
-          <div style={{ marginTop: 2 }}><Mono s={10} c="var(--ink-4)">file.write</Mono></div>
-        </div>
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 10,
-          padding: '6px 10px', border: '1px solid var(--line)', borderRadius: 6,
-          background: 'var(--paper-2)', width: 'fit-content', maxWidth: '100%',
-        }}>
-          <Mono s={11} c="var(--ink-3)">{e.toolUseId}</Mono>
-          <span style={{ fontSize: 12, color: 'var(--ink-2)' }}>denied_by_user · agent will continue</span>
-        </div>
+        <Mono s={11} c="var(--ink-3)" style={{ alignSelf: 'center' }}>
+          {isAllowed ? 'allow' : 'deny'} · POSTed user.tool_confirmation · toolUseId {e.toolUseId}
+        </Mono>
       </div>
     );
   }
@@ -2816,8 +3872,26 @@ function App() {
     : view === 'metrics' ? <PlaceholderView title="Metrics" sub="Prometheus · /metrics · not shown in this mockup" />
     : (
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }} data-screen-label="Sessions split">
-        <SessionsList selectedId={selectedSession} onSelect={setSelectedSession} filter={filter} setFilter={setFilter} />
-        <SessionDetail sessionId={selectedSession} sessionState={tweaks.sessionState} streamLen={streamLen} />
+        <SessionsList selectedId={selectedSession} onSelect={(id) => {
+          setSelectedSession(id);
+          // Every real session id triggers the SSE subscription; the
+          // __new sentinel does not (it's a panel, not a session).
+          if (id && id !== '__new' && typeof liveSelectSession === 'function') {
+            liveSelectSession(id);
+          }
+        }} filter={filter} setFilter={setFilter} />
+        {selectedSession === '__new'
+          ? <NewSessionPanel
+              onCreate={(newSid) => {
+                setSelectedSession(newSid);
+                if (newSid && typeof liveSelectSession === 'function') liveSelectSession(newSid);
+              }}
+              onCancel={() => {
+                const fallback = SESSIONS.find((s) => s.id !== '__new')?.id || null;
+                setSelectedSession(fallback);
+              }}
+            />
+          : <SessionDetail sessionId={selectedSession} sessionState={tweaks.sessionState} streamLen={streamLen} />}
       </div>
     );
 

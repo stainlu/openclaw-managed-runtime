@@ -331,7 +331,12 @@ CREATE TABLE IF NOT EXISTS session_containers (
   container_name TEXT NOT NULL,
   container_port INTEGER NOT NULL,
   gateway_token TEXT NOT NULL,
-  claimed_at INTEGER NOT NULL
+  claimed_at INTEGER NOT NULL,
+  -- Pool telemetry. NULL boot_ms only for adopt-at-restart (we didn't spawn it).
+  -- pool_source ∈ { cold, warm, limited, adopt }. Neither column is indexed —
+  -- they're read only when joining a single session row in the HTTP response.
+  boot_ms INTEGER,
+  pool_source TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_containers_container ON session_containers(container_id);
@@ -1219,10 +1224,12 @@ class SqliteSessionContainerStore implements SessionContainerStore {
     this.upsertStmt = db.prepare(
       `INSERT INTO session_containers (
          session_id, agent_id, container_id, container_name,
-         container_port, gateway_token, claimed_at
+         container_port, gateway_token, claimed_at,
+         boot_ms, pool_source
        ) VALUES (
          @session_id, @agent_id, @container_id, @container_name,
-         @container_port, @gateway_token, @claimed_at
+         @container_port, @gateway_token, @claimed_at,
+         @boot_ms, @pool_source
        )
        ON CONFLICT(session_id) DO UPDATE SET
          agent_id = excluded.agent_id,
@@ -1230,11 +1237,14 @@ class SqliteSessionContainerStore implements SessionContainerStore {
          container_name = excluded.container_name,
          container_port = excluded.container_port,
          gateway_token = excluded.gateway_token,
-         claimed_at = excluded.claimed_at`,
+         claimed_at = excluded.claimed_at,
+         boot_ms = excluded.boot_ms,
+         pool_source = excluded.pool_source`,
     );
     this.getStmt = db.prepare(
       `SELECT session_id, agent_id, container_id, container_name,
-              container_port, gateway_token, claimed_at
+              container_port, gateway_token, claimed_at,
+              boot_ms, pool_source
        FROM session_containers WHERE session_id = ?`,
     );
     this.deleteStmt = db.prepare(
@@ -1242,7 +1252,8 @@ class SqliteSessionContainerStore implements SessionContainerStore {
     );
     this.listStmt = db.prepare(
       `SELECT session_id, agent_id, container_id, container_name,
-              container_port, gateway_token, claimed_at
+              container_port, gateway_token, claimed_at,
+              boot_ms, pool_source
        FROM session_containers`,
     );
   }
@@ -1256,6 +1267,8 @@ class SqliteSessionContainerStore implements SessionContainerStore {
       container_port: entry.containerPort,
       gateway_token: entry.gatewayToken,
       claimed_at: entry.claimedAt,
+      boot_ms: entry.bootMs,
+      pool_source: entry.poolSource,
     });
   }
 
@@ -1282,9 +1295,25 @@ type SessionContainerRow = {
   container_port: number;
   gateway_token: string;
   claimed_at: number;
+  boot_ms: number | null;
+  pool_source: string | null;
 };
 
 function rowToSessionContainer(row: SessionContainerRow): SessionContainer {
+  // pool_source is NOT NULL in the schema for rows written after this
+  // migration lands, but pre-migration rows default to NULL. Coerce
+  // unknown/legacy values to "cold" — the only meaningful fallback for
+  // the "session was spawned once by some older build" case. The
+  // alternative ("adopt") would mis-attribute a real spawn as an
+  // orchestrator-restart reattach, which is the higher-impact lie.
+  const sourceRaw = row.pool_source;
+  const source: SessionContainer["poolSource"] =
+    sourceRaw === "warm" ||
+    sourceRaw === "cold" ||
+    sourceRaw === "limited" ||
+    sourceRaw === "adopt"
+      ? sourceRaw
+      : "cold";
   return {
     sessionId: row.session_id,
     agentId: row.agent_id,
@@ -1293,6 +1322,8 @@ function rowToSessionContainer(row: SessionContainerRow): SessionContainer {
     containerPort: row.container_port,
     gatewayToken: row.gateway_token,
     claimedAt: row.claimed_at,
+    bootMs: row.boot_ms,
+    poolSource: source,
   };
 }
 
@@ -1544,6 +1575,20 @@ export class SqliteStore implements Store {
     }
     if (versionsCols.length > 0 && !versionsCols.some((c) => c.name === "channels_json")) {
       this.db.exec("ALTER TABLE agent_versions ADD COLUMN channels_json TEXT");
+    }
+    // Pool telemetry on session_containers. Pre-migration rows predate the
+    // moment the orchestrator started recording where a container came
+    // from, so we can't retroactively backfill a true value. Leaving the
+    // column NULL is fine — rowToSessionContainer coerces NULL pool_source
+    // to "cold" and the bootMs=null signal shows as "boot —" in the UI.
+    const scCols = this.db.pragma("table_info(session_containers)") as Array<{
+      name: string;
+    }>;
+    if (scCols.length > 0 && !scCols.some((c) => c.name === "boot_ms")) {
+      this.db.exec("ALTER TABLE session_containers ADD COLUMN boot_ms INTEGER");
+    }
+    if (scCols.length > 0 && !scCols.some((c) => c.name === "pool_source")) {
+      this.db.exec("ALTER TABLE session_containers ADD COLUMN pool_source TEXT");
     }
 
     this.agents = new SqliteAgentStore(this.db);

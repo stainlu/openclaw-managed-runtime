@@ -468,10 +468,14 @@ export const PostToolConfirmationSchema = z.object({
   type: z.literal("user.tool_confirmation"),
   /** The approval request ID from the `agent.tool_confirmation_request` SSE event. */
   toolUseId: z.string().min(1, "toolUseId is required"),
-  /** "allow" proceeds with execution; "deny" blocks it (with optional message). */
+  /** "allow" proceeds with execution; "deny" blocks it. */
   result: z.enum(["allow", "deny"]),
-  /** Optional explanation when denying (forwarded to the agent). */
-  denyMessage: z.string().optional(),
+  // NOTE: denyMessage is intentionally absent. OpenClaw's
+  // plugin.approval.resolve RPC does not accept a message payload
+  // (returns INVALID_REQUEST on unknown params), so we cannot round-
+  // trip an explanation to the agent via the approval channel.
+  // Clients that need to explain a denial can post a follow-up
+  // user.message once the session flips back to idle.
 });
 
 // Parse with .default() so that a bare `{ content }` is treated as user.message.

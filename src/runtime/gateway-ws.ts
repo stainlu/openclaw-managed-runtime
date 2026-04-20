@@ -343,13 +343,13 @@ export class GatewayWebSocketClient {
   async approvalResolve(
     id: string,
     decision: "allow-once" | "deny",
-    denyMessage?: string,
   ): Promise<unknown> {
-    return this.request("plugin.approval.resolve", {
-      id,
-      decision,
-      ...(denyMessage ? { denyMessage } : {}),
-    });
+    // OpenClaw's plugin.approval.resolve accepts only {id, decision};
+    // any extra field (denyMessage, reason, etc.) fails the request
+    // with INVALID_REQUEST. If future openclaw versions support an
+    // explanation payload, add it back here under whatever name they
+    // choose.
+    return this.request("plugin.approval.resolve", { id, decision });
   }
 
   /**

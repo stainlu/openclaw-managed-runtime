@@ -345,6 +345,24 @@ export type SessionContainer = {
   /** Per-container auth token. Required for WS reconnect after restart. */
   gatewayToken: string;
   claimedAt: number;
+  /**
+   * Wall-clock milliseconds the pool spent acquiring this container from
+   * the caller's perspective. Definition varies by `poolSource`:
+   *   - "cold" / "limited" — full spawn duration (create + /readyz + WS).
+   *   - "warm" — 0 (container was already ready when the session claimed it).
+   *   - "adopt" — null (the orchestrator did not spawn it).
+   * Drives the inspector's "boot 4.1s" sub-label and the
+   * container_boot_duration_seconds histogram.
+   */
+  bootMs: number | null;
+  /**
+   * Where this session's container came from. One of:
+   *   - "cold"    — fresh spawn (no warm entry available, no limited networking).
+   *   - "warm"    — claimed a pre-warmed container from the warm pool.
+   *   - "limited" — fresh spawn with egress-proxy sidecar (networking:limited).
+   *   - "adopt"   — adopted on orchestrator restart from an already-running container.
+   */
+  poolSource: "cold" | "warm" | "limited" | "adopt";
 };
 
 export interface SessionContainerStore {

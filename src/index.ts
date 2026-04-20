@@ -4,6 +4,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getLogger, rootLogger } from "./log.js";
 import {
+  containerBootDurationSeconds,
+  poolColdStartsTotal,
   sessionJsonlBytesMax,
   sessionJsonlBytesSum,
   sessionJsonlOverThreshold,
@@ -160,11 +162,19 @@ async function main(): Promise<void> {
   const idleTimeoutMs = envInt("OPENCLAW_IDLE_TIMEOUT_MS", 10 * 60_000);
   const sweepIntervalMs = envInt("OPENCLAW_SWEEP_INTERVAL_MS", 60_000);
   // Warm pool is bounded so a host with many agent templates does not
-  // accumulate one persistent container per template. Default 5 warm
-  // containers at 2 GiB each is comfortable on a 4-8 GiB host. Warm
-  // idle timeout defaults to the active timeout — if a warm container
-  // has been waiting that long unclaimed, its agent is rarely used.
-  const maxWarmContainers = envInt("OPENCLAW_MAX_WARM_CONTAINERS", 5);
+  // accumulate one persistent container per template.
+  //
+  // DEFAULT IS 0 (off). An "unclaimed" openclaw container is NOT idle
+  // — its gateway + ACPX runtime + plugin sidecars hold ~250% CPU each
+  // even without a session. On a dedicated cloud VM (e.g. Hetzner CAX11)
+  // that's a deliberate trade for sub-second first-event latency. On a
+  // developer laptop it saturates the system within seconds.
+  //
+  // Cloud deploy scripts explicitly set this env (typically 3–5). Local
+  // `docker compose up` on a laptop leaves it unset, so no warms spawn
+  // and every first event pays ~10 s cold-spawn. That's the right
+  // default — expensive idle capacity is opt-in.
+  const maxWarmContainers = envInt("OPENCLAW_MAX_WARM_CONTAINERS", 0);
   // Warm-pool TTL. Default 30 min so a user who opens the portal,
   // sends a message, reads the result, and comes back 15 minutes
   // later still hits a hot container instead of waiting through
@@ -268,7 +278,7 @@ async function main(): Promise<void> {
     // post-create), so without this SQLite mapping adoption would
     // misclassify every claimed-warm container as an orphan and
     // kill its running session. See SessionContainerStore docstring.
-    onContainerClaimed: ({ sessionId, agentId, container }) => {
+    onContainerClaimed: ({ sessionId, agentId, container, source, bootMs }) => {
       store.sessionContainers.put({
         sessionId,
         agentId,
@@ -277,7 +287,15 @@ async function main(): Promise<void> {
         containerPort: gatewayPort,
         gatewayToken: container.token,
         claimedAt: Date.now(),
+        bootMs,
+        poolSource: source,
       });
+      if (source === "cold" || source === "limited") {
+        poolColdStartsTotal.inc({ agent_id: agentId });
+        if (bootMs != null) {
+          containerBootDurationSeconds.observe(bootMs / 1000);
+        }
+      }
     },
     onContainerReleased: (sessionId) => {
       store.sessionContainers.delete(sessionId);
@@ -599,6 +617,46 @@ async function main(): Promise<void> {
     auditRetentionHandle.unref();
   }
 
+  // Startup warm-up. The in-memory warm pool doesn't survive restart
+  // (startup-adoption kills every __warm__-labeled container it finds),
+  // so without this the first user action on any existing template
+  // pays a full cold-spawn. Pick the top-N templates ranked by most
+  // recent session activity and fire-and-forget a warm for each.
+  //
+  // Bounded by `warm_max` so we never spawn more warms than the pool
+  // will hold (the pool would just evict-oldest otherwise — wasteful).
+  // Delegating agents are filtered out to keep the warm-pool-exception
+  // invariant (see warmForAgent docstring in router.ts).
+  try {
+    const liveAgents = store.agents
+      .list()
+      .filter((a) => !a.archivedAt)
+      .filter((a) => a.callableAgents.length === 0 && a.maxSubagentDepth === 0);
+    const lastEventByAgent = new Map<string, number>();
+    for (const s of store.sessions.list()) {
+      const ts = s.lastEventAt ?? s.createdAt;
+      const prev = lastEventByAgent.get(s.agentId) ?? 0;
+      if (ts > prev) lastEventByAgent.set(s.agentId, ts);
+    }
+    const ranked = liveAgents
+      .sort((a, b) => (lastEventByAgent.get(b.agentId) ?? 0) - (lastEventByAgent.get(a.agentId) ?? 0))
+      .slice(0, maxWarmContainers);
+    if (ranked.length > 0) {
+      log.info(
+        { count: ranked.length, agent_ids: ranked.map((a) => a.agentId) },
+        "startup warm-up queued",
+      );
+      for (const agent of ranked) {
+        void router.warmForAgent(agent.agentId).catch((err) => {
+          log.warn({ err, agent_id: agent.agentId }, "startup warm-up failed (non-fatal)");
+        });
+      }
+    }
+  } catch (err) {
+    // Warming is best-effort — never block startup on it.
+    log.warn({ err }, "startup warm-up pass threw (non-fatal)");
+  }
+
   await startServer(
     {
       agents: store.agents,
@@ -612,6 +670,9 @@ async function main(): Promise<void> {
       version,
       apiToken: apiToken || undefined,
       rateLimitRpm: rateLimitRpm > 0 ? rateLimitRpm : undefined,
+      sessionContainers: store.sessionContainers,
+      startTs: Date.now(),
+      commitSha: process.env.OPENCLAW_COMMIT,
     },
     { port },
   );
