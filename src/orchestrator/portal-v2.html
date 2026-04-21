@@ -988,6 +988,13 @@ function openEventStream(sid) {
     const eid = data.event_id || '';
     if (eid && SEEN_EVENT_IDS.has(eid)) return;
     if (eid) SEEN_EVENT_IDS.add(eid);
+    // Dedup status events by type — heartbeat can re-emit the same
+    // status (e.g. session.status_failed) on every cycle. Only keep
+    // the first one; subsequent emissions with the same type are
+    // silently dropped.
+    if (data.type && data.type.startsWith('session.status_')) {
+      if (EVENTS.some(e => e.type === data.type)) return;
+    }
     if (LIVE_EVENT_ANCHOR == null) LIVE_EVENT_ANCHOR = data.created_at;
     EVENTS.push(asDesignEvent(data, LIVE_EVENT_ANCHOR));
     LIVE_BUS.notify();
@@ -4301,7 +4308,11 @@ function App() {
   // Whenever the selected session changes, tell the pump to open
   // the SSE stream for that session.
   useEffect(() => {
-    if (typeof liveSelectSession === 'function') liveSelectSession(selectedSession);
+    // __new is a UI-only sentinel for the "New session" panel — not a
+    // real session id. Don't open an SSE stream for it (causes 404).
+    if (selectedSession && selectedSession !== '__new' && typeof liveSelectSession === 'function') {
+      liveSelectSession(selectedSession);
+    }
   }, [selectedSession]);
 
   useEffect(() => {

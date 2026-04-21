@@ -447,7 +447,8 @@ export class AgentRouter {
       });
 
       const effectiveThinking = args.thinkingLevel ?? agent.thinkingLevel;
-      if (args.model || effectiveThinking !== "off") {
+      const streamIsFirstTurn = session.turns <= 1;
+      if ((args.model || effectiveThinking !== "off") && !streamIsFirstTurn) {
         const wsClient = this.pool.getWsClient(args.sessionId);
         if (!wsClient) {
           throw new RouterError(
@@ -463,7 +464,7 @@ export class AgentRouter {
         } catch (patchErr) {
           log.warn(
             { session_id: args.sessionId, err: patchErr },
-            "WS patch failed (session may not exist yet) — proceeding without patch",
+            "WS patch failed — proceeding without patch",
           );
         }
       }
@@ -1516,7 +1517,13 @@ export class AgentRouter {
 
         const effectiveThinking = thinkingLevelOverride ?? agent.thinkingLevel;
         const needsPatch = Boolean(modelOverride) || effectiveThinking !== "off";
-        if (needsPatch) {
+        // Pi creates the session key on the first HTTP POST. Before that,
+        // sessions.patch can't find the key and times out (10s wasted).
+        // Skip the patch on the first turn — Pi will use the model's
+        // default thinking level. Subsequent turns have a key and patch
+        // instantly.
+        const isFirstTurn = currentSession ? currentSession.turns <= 1 : true;
+        if (needsPatch && !isFirstTurn) {
           const wsClient = this.pool.getWsClient(sessionId);
           if (!wsClient) {
             throw new RouterError(
@@ -1531,14 +1538,9 @@ export class AgentRouter {
           try {
             await wsClient.patch(canonicalKey, patch);
           } catch (patchErr) {
-            // The session key may not exist yet in Pi on the first turn
-            // (Pi creates it on the first chat.completions POST). Log and
-            // proceed — the first POST will create the session, and the
-            // thinking level will apply on subsequent turns. Better than
-            // failing the entire turn over a patch timeout.
             log.warn(
               { session_id: sessionId, err: patchErr },
-              "WS patch failed (session may not exist yet) — proceeding without patch",
+              "WS patch failed — proceeding without patch",
             );
           }
         }
