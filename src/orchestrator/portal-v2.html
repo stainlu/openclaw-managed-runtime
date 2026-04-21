@@ -660,7 +660,7 @@ function asDesignSession(s, agentById, environmentById) {
   const env = s.environment_id ? environmentById?.[s.environment_id] : undefined;
   const nowOrLast = s.status === 'running' ? Date.now() : (s.last_event_at || s.created_at);
   let status = s.status;
-  if (s.status === 'failed' && typeof s.error === 'string' && /quota|limit|cap/i.test(s.error)) {
+  if (s.status === 'failed' && typeof s.error === 'string' && /quota_exceeded|maxCostUsdPerSession|maxTokensPerSession|maxWallDurationMs/i.test(s.error)) {
     status = 'quota';
   }
   // Quotas come from the agent template. Fall back to the old hard-

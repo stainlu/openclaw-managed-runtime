@@ -173,7 +173,6 @@ async function main() {
       maxTokensPerSession: 50_000,
       maxWallDurationMs: 1_800_000,
     },
-    thinkingLevel: "medium",
   });
   console.log("  ✓", a1.agent_id, a1.name);
 
