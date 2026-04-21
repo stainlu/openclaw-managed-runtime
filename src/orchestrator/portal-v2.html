@@ -734,8 +734,16 @@ function asDesignEvent(e, anchorTs) {
   const base = { id: e.event_id || '', t, type: e.type };
   const contentStr = typeof e.content === 'string' ? e.content : JSON.stringify(e.content ?? '');
   if (e.type === 'user.message') return { ...base, actor: 'user', text: contentStr };
-  if (e.type === 'agent.message') return { ...base, actor: 'agent', text: contentStr };
-  if (e.type === 'agent.thinking') return { ...base, actor: 'agent', text: contentStr };
+  if (e.type === 'agent.message') {
+    const m = e.model || e.model_id;
+    const short = m ? m.replace(/^[^/]+\//, '') : 'agent';
+    return { ...base, actor: short, text: contentStr, model: m, tokensIn: e.tokens_in || e.tokens?.input, tokensOut: e.tokens_out || e.tokens?.output, costUsd: e.cost_usd };
+  }
+  if (e.type === 'agent.thinking') {
+    const m = e.model || e.model_id;
+    const short = m ? m.replace(/^[^/]+\//, '') : 'agent';
+    return { ...base, actor: short, text: contentStr, model: m };
+  }
   if (e.type === 'agent.tool_use') {
     return { ...base, actor: 'agent', tool: e.tool_name || '(tool)', args: e.tool_arguments || {}, toolUseId: e.tool_call_id };
   }
@@ -2010,10 +2018,13 @@ function EventRow({ e, streaming, session }) {
     'agent.thinking':          { tag: 'think',  c: 'var(--ink-3)' },
     'agent.message':           { tag: 'reply',  c: 'var(--ink)' },
     'agent.tool_use':          { tag: 'tool·use', c: 'var(--ink-2)' },
-    'agent.tool_result':       { tag: 'tool·ok',  c: 'var(--ok)' },
+    'agent.tool_result':       null,
     'agent.tool_confirmation_request': { tag: 'approve?', c: 'var(--lobster-press)' },
   };
-  const k = kindTone[e.type] || { tag: e.type, c: 'var(--ink-3)' };
+  let k = kindTone[e.type] || { tag: e.type, c: 'var(--ink-3)' };
+  if (e.type === 'agent.tool_result') {
+    k = e.isError ? { tag: 'tool·err', c: 'var(--danger)' } : { tag: 'tool·ok', c: 'var(--ok)' };
+  }
 
   // Shared row shell: mono timestamp + type tag + content
   const Row = ({ children, approveRow }) => (
@@ -2083,15 +2094,22 @@ function EventRow({ e, streaming, session }) {
         fontSize: 13, color: 'var(--ink-3)', fontStyle: 'italic',
         lineHeight: 1.55, maxWidth: '62ch',
       }}>{e.text}</div>
+      {e.model && <Mono s={10} c="var(--ink-4)" style={{ marginTop: 4 }}>{e.model}</Mono>}
     </Row>;
   }
   if (e.type === 'agent.message') {
-    // The final reply. Rendered plain (no italic, full ink) so it
-    // reads like natural text, matching the design. e.text is the
-    // stringified content set by asDesignEvent — for agent.message
-    // Pi stores a plain string, so no further parsing needed.
+    const toks = (e.tokensIn || 0) + (e.tokensOut || 0);
     return <Row>
-      <p style={{ margin: 0, fontSize: 14, color: 'var(--ink)', lineHeight: 1.6, maxWidth: '62ch', whiteSpace: 'pre-wrap' }}>{e.text}</p>
+      <div>
+        <p style={{ margin: 0, fontSize: 14, color: 'var(--ink)', lineHeight: 1.6, maxWidth: '62ch', whiteSpace: 'pre-wrap' }}
+           dangerouslySetInnerHTML={{ __html: (e.text || '').replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code style="background:var(--paper-2);padding:1px 4px;border-radius:3px;font-size:0.9em">$1</code>') }} />
+        {(toks > 0 || e.model) && (
+          <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>
+            {toks > 0 && <Mono s={10} c="var(--ink-3)">↓ {toks} tok</Mono>}
+            {e.model && <Mono s={10} c="var(--ink-4)">{e.model}</Mono>}
+          </div>
+        )}
+      </div>
     </Row>;
   }
   if (e.type === 'agent.tool_use') {
@@ -2121,15 +2139,16 @@ function EventRow({ e, streaming, session }) {
     </Row>;
   }
   if (e.type === 'agent.tool_result') {
+    const isErr = !!e.isError;
     return <Row>
       <div style={{
         display: 'flex', alignItems: 'center', gap: 10,
-        padding: '6px 10px', border: '1px solid var(--line)', borderRadius: 6,
-        background: 'var(--paper-2)',
+        padding: '6px 10px', border: `1px solid ${isErr ? 'var(--lobster-soft)' : 'var(--line)'}`, borderRadius: 6,
+        background: isErr ? 'var(--lobster-wash)' : 'var(--paper-2)',
       }}>
-        <Icon n="check" s={12} style={{ color: 'var(--ok)' }} />
+        <Icon n={isErr ? 'close' : 'check'} s={12} style={{ color: isErr ? 'var(--danger)' : 'var(--ok)' }} />
         <Mono s={11} c="var(--ink-3)">{e.toolUseId}</Mono>
-        <span style={{ fontSize: 12, color: 'var(--ink-2)' }}>{e.summary}</span>
+        <span style={{ fontSize: 12, color: isErr ? 'var(--danger)' : 'var(--ink-2)' }}>{e.summary}</span>
       </div>
     </Row>;
   }
@@ -2158,7 +2177,7 @@ function EventRow({ e, streaming, session }) {
 }
 
 // The streaming "agent.message" row currently being emitted token-by-token
-function StreamingRow({ text }) {
+function StreamingRow() {
   return (
     <div style={{
       display: 'grid',
@@ -2167,25 +2186,17 @@ function StreamingRow({ text }) {
       padding: '12px 24px',
       borderBottom: '1px solid var(--line)',
     }}>
-      <Mono s={11} c="var(--ink-3)">+00:05.12…</Mono>
+      <Mono s={11} c="var(--ink-3)">…</Mono>
       <div>
         <Mono s={11} c="var(--ink)" style={{ fontWeight: 500 }}>reply</Mono>
-        <div style={{ marginTop: 2 }}><Mono s={10} c="var(--ink-4)">kimi-k2.5</Mono></div>
       </div>
-      <div>
-        <p style={{ margin: 0, fontSize: 14, color: 'var(--ink)', lineHeight: 1.55, maxWidth: '62ch' }}>
-          <span dangerouslySetInnerHTML={{ __html: text.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>') }} />
-          <span style={{
-            display: 'inline-block', width: '0.55ch', height: 14,
-            background: 'var(--ink)', verticalAlign: '-2px',
-            marginLeft: 2, animation: 'oc-blink 1.1s steps(2,end) infinite',
-          }} />
-        </p>
-        <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>
-          <Mono s={10} c="var(--ink-3)">↓ 128 tok</Mono>
-          <Mono s={10} c="var(--ink-3)">42 tok/s</Mono>
-          <Mono s={10} c="var(--ink-3)">streaming…</Mono>
-        </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{
+          display: 'inline-block', width: '0.55ch', height: 14,
+          background: 'var(--ink)', verticalAlign: '-2px',
+          animation: 'oc-blink 1.1s steps(2,end) infinite',
+        }} />
+        <Mono s={10} c="var(--ink-3)">streaming…</Mono>
       </div>
     </div>
   );
@@ -2309,7 +2320,7 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
           </div>
           <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto' }}>
             {events.map((e, i) => <EventRow key={e.id || e.t + ':' + i} e={e} session={s} />)}
-            {showStream && <StreamingRow text={partial} />}
+            {showStream && <StreamingRow />}
             <SentMessagesFeed sid={s.id} />
             <CancelledBanner />
             {effectiveStatus === 'quota' && (
