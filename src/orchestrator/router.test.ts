@@ -367,10 +367,11 @@ describe("AgentRouter.cancel — pre-abort checks", () => {
     });
   });
 
-  it("throws no_active_container when running session has no pool entry", async () => {
-    // Cancel path requires a live WS to abort. If the container was
-    // already torn down (eg. it crashed right before cancel), we surface
-    // the error rather than silently no-op the abort.
+  it("cancels gracefully when running session has no pool entry (acquire phase)", async () => {
+    // When cancel is called while the session is still acquiring a
+    // container (no WS client yet), it should transition the session
+    // to idle instead of throwing — the background task will detect
+    // the flag and abort after acquire completes.
     const pool = {
       getWsClient: (_id: string): GatewayWebSocketClient | undefined => undefined,
     };
@@ -386,10 +387,8 @@ describe("AgentRouter.cancel — pre-abort checks", () => {
     const session = router.createSession(agent.agentId);
     store.sessions.beginRun(session.sessionId);
 
-    await expect(router.cancel(session.sessionId)).rejects.toMatchObject({
-      name: "RouterError",
-      code: "no_active_container",
-    });
+    const result = await router.cancel(session.sessionId);
+    expect(result.status).toBe("idle");
   });
 
   it("drains the queue and pending approvals then marks the session idle", async () => {

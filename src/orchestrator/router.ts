@@ -130,6 +130,13 @@ export class AgentRouter {
    *  `plugin.approval.requested`. Read by the SSE handler to emit
    *  `agent.tool_confirmation_request` events. Cleared on confirm/cancel/delete. */
   private readonly pendingApprovals = new Map<string, PendingApproval[]>();
+  /**
+   * Sessions whose cancel was requested while the background task was
+   * still in the acquire phase (no container / WS client yet). The
+   * cancel handler sets the flag; executeInBackground checks it after
+   * acquiring and aborts before posting to the container.
+   */
+  private readonly cancelledDuringAcquire = new Set<string>();
 
   constructor(
     private readonly agents: AgentStore,
@@ -1002,10 +1009,15 @@ export class AgentRouter {
     }
     const wsClient = this.pool.getWsClient(sessionId);
     if (!wsClient) {
-      throw new RouterError(
-        "no_active_container",
-        `session ${sessionId} is running but has no live container`,
-      );
+      // Session is running but no container yet — still in the acquire
+      // phase. Set a flag so executeInBackground aborts after acquire
+      // returns, and transition the session to idle immediately so the
+      // client isn't stuck.
+      log.info({ session_id: sessionId }, "cancel during acquire phase — flagging");
+      this.cancelledDuringAcquire.add(sessionId);
+      this.queue.clear(sessionId);
+      this.pendingApprovals.delete(sessionId);
+      return this.sessions.endRunCancelled(sessionId) ?? session;
     }
     const canonicalKey = `agent:main:${sessionId}`;
     try {
@@ -1013,7 +1025,6 @@ export class AgentRouter {
     } catch (err) {
       throw wrapWsError(err, "cancel_failed");
     }
-    // Drain queued events and pending approvals.
     this.queue.clear(sessionId);
     this.pendingApprovals.delete(sessionId);
     return this.sessions.endRunCancelled(sessionId) ?? session;
@@ -1213,6 +1224,14 @@ export class AgentRouter {
     );
     Object.assign(timings, tick("acquire_total", cursor));
     cursor = Date.now();
+
+    // Check if cancel was requested while we were acquiring.
+    if (this.cancelledDuringAcquire.has(sessionId)) {
+      this.cancelledDuringAcquire.delete(sessionId);
+      log.info({ session_id: sessionId }, "acquire completed but session was cancelled during it — aborting");
+      return;
+    }
+
     log.info(
       { session_id: sessionId, total_pre_llm_ms: cursor - t0, ...timings },
       "turn pre-LLM timings (receipt → chat.completions dispatch)",
@@ -1445,11 +1464,9 @@ export class AgentRouter {
    * is still healthy — leave it in the pool.
    */
   private handleBackgroundFailure(sessionId: string, err: unknown): void {
+    this.cancelledDuringAcquire.delete(sessionId);
     const current = this.sessions.get(sessionId);
     if (current?.status !== "running") {
-      // Session was cancelled or otherwise transitioned. The error is the
-      // cancellation propagating through the in-flight HTTP request.
-      // Don't evict, don't fail.
       return;
     }
     // Drop any queued events and pending approvals.
