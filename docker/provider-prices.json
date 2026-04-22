@@ -15,6 +15,7 @@
 
   "moonshot": {
     "kimi-k2.5":              { "input": 0.60, "output": 3.00, "cacheRead": 0.10, "cacheWrite": 0 },
+    "kimi-k2.6":              { "input": 0.60, "output": 3.00, "cacheRead": 0.10, "cacheWrite": 0 },
     "kimi-k2-thinking":       { "input": 0.60, "output": 2.50, "cacheRead": 0.15, "cacheWrite": 0 },
     "kimi-k2-thinking-turbo": { "input": 1.15, "output": 8.00, "cacheRead": 0.15, "cacheWrite": 0 },
     "kimi-k2-turbo":          { "input": 1.15, "output": 8.00, "cacheRead": 0.15, "cacheWrite": 0 }

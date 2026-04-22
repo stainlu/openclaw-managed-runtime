@@ -30,7 +30,7 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
-MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.5}"
+MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.6}"
 POLL_INTERVAL_SEC=2
 MAX_POLL_SEC=300
 

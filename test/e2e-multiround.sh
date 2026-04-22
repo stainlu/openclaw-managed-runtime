@@ -60,7 +60,7 @@ set -euo pipefail
 # ---------- config ----------
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
-MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.5}"
+MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.6}"
 # Conservative cadences — model latency varies wildly by provider.
 POLL_INTERVAL_SEC=2
 IDLE_POLL_MAX_SEC=360      # enough for a cold spawn + multi-tool turn

@@ -153,64 +153,112 @@ async function main() {
   console.log("  ✓", v4.vault_id, v4.name, "(no credentials)");
 
   // --- Agents ---------------------------------------------------------
-  // Real openclaw tool names only: exec, read, write, edit, apply_patch,
-  // web_search. MCP servers use verified hosted endpoints (Linear SSE,
-  // Notion /mcp). Agent templates demonstrate a policy spread:
-  // always_ask, always_allow, deny-list, ask-list.
+  // tools: [] means the agent gets ALL 53 built-in OpenClaw skills.
+  // We only restrict via permissionPolicy (deny/always_ask).
+  // Four templates showcase all four permission patterns.
   console.log("\n== agents ==");
   const a1 = await api("POST", "/v1/agents", {
     name: "research-assistant",
-    model: "moonshot/kimi-k2.5",
-    tools: ["read", "write", "web_search"],
-    instructions: "You are a research assistant. Find primary sources, cite them, and save summaries to the workspace.",
-    permissionPolicy: { type: "always_ask" },
+    model: "moonshot/kimi-k2.6",
+    tools: [],
+    instructions: `You are a research agent. Given a question or topic:
+
+1. Decompose it into 3-5 concrete sub-questions that, answered together, cover the topic.
+2. For each sub-question, use web_search to find authoritative sources. Prefer primary sources, official docs, and peer-reviewed work over blog posts and aggregators.
+3. Use web_fetch to read the most promising sources in full — don't skim. Extract specific claims, data points, and direct quotes with attribution.
+4. If the research involves structured data, use exec to write and run a Python or Node script that processes, filters, or visualizes the data.
+5. Synthesize a report answering the original question. Structure it by sub-question, cite every non-obvious claim inline (author, title, URL, date), and close with a "confidence & gaps" section noting where sources disagreed or coverage was thin.
+6. Write the final report to the workspace and, if a Notion database is connected, create a page there for team visibility.
+
+Be skeptical. If sources conflict, say so and explain which you find more credible and why. Don't paper over uncertainty with confident-sounding prose.`,
+    permissionPolicy: { type: "always_allow" },
     mcpServers: {
       linear: { url: "https://mcp.linear.app/sse" },
       notion: { url: "https://mcp.notion.com/mcp" },
     },
     quota: {
-      maxCostUsdPerSession: 1.0,
-      maxTokensPerSession: 50_000,
-      maxWallDurationMs: 1_800_000,
+      maxCostUsdPerSession: 10.0,
+      maxTokensPerSession: 1_000_000,
+      maxWallDurationMs: 14_400_000,
     },
-    thinkingLevel: "medium",
+    thinkingLevel: "high",
   });
-  console.log("  ✓", a1.agent_id, a1.name);
+  console.log("  ✓", a1.agent_id, a1.name, "(always_allow · all tools)");
 
   const a2 = await api("POST", "/v1/agents", {
     name: "code-reviewer",
-    model: "moonshot/kimi-k2.5",
-    tools: ["read", "edit", "apply_patch", "exec"],
-    instructions: "You review code diffs for correctness, security, and style. Suggest edits via apply_patch.",
-    permissionPolicy: { type: "always_allow" },
+    model: "moonshot/kimi-k2.6",
+    tools: [],
+    instructions: `You are a code reviewer. When handed a file, diff, or description of a change:
+
+1. Read the relevant files to understand the full context — not just the changed lines, but the surrounding module, its callers, and its tests.
+2. Assess correctness: does the change do what the author intended? Are there edge cases, off-by-one errors, or race conditions?
+3. Assess security: check for OWASP top 10 vulnerabilities — injection, XSS, broken auth, sensitive data exposure. If uncertain, use web_search to check the latest advisory for the library in question.
+4. Assess maintainability: naming clarity, unnecessary complexity, dead code, missing error handling at system boundaries.
+5. For each issue found, show the exact fix using edit or apply_patch — don't just describe what should change. Explain why the fix matters in one sentence.
+6. Summarize: list what's good (acknowledge solid work), what must change before merge, and what's optional-but-recommended.
+
+Running commands (exec) and applying patches (apply_patch) require your approval — the reviewer should never silently modify code.`,
+    permissionPolicy: { type: "always_ask", tools: ["exec", "apply_patch"] },
     quota: {
-      maxCostUsdPerSession: 0.5,
-      maxTokensPerSession: 30_000,
+      maxCostUsdPerSession: 5.0,
+      maxTokensPerSession: 500_000,
+      maxWallDurationMs: 7_200_000,
     },
+    thinkingLevel: "medium",
   });
-  console.log("  ✓", a2.agent_id, a2.name);
+  console.log("  ✓", a2.agent_id, a2.name, "(always_ask · exec, apply_patch)");
 
   const a3 = await api("POST", "/v1/agents", {
     name: "inbox-triage",
-    model: "moonshot/kimi-k2.5",
-    tools: ["read", "write"],
-    instructions: "You triage incoming messages, label them, and draft replies. Never execute arbitrary code.",
+    model: "moonshot/kimi-k2.6",
+    tools: [],
+    instructions: `You triage incoming messages. For each message or batch of messages:
+
+1. Read the message content. Classify each into exactly one category: bug-report, feature-request, question, praise, spam, or escalation.
+2. Assign a priority: P0 (service down, data loss), P1 (broken feature, workaround exists), P2 (minor issue, cosmetic), P3 (nice-to-have, low urgency).
+3. If the message references a product feature or error, use web_search to check for known issues, changelogs, or documentation that could inform the response.
+4. Draft a reply for each non-spam message. Lead with the direct answer or acknowledgment, then supporting context, then one proactive next step if relevant. Match the sender's tone — be warm but don't pad.
+5. Write a triage summary to the workspace as a structured file: one row per message with category, priority, one-line synopsis, and draft reply.
+6. For P0/P1 messages, flag them prominently at the top of the summary with a recommended escalation path.
+
+You cannot run arbitrary code or apply patches — your role is classification and communication, not remediation.`,
     permissionPolicy: { type: "deny", tools: ["exec", "apply_patch"] },
+    quota: {
+      maxCostUsdPerSession: 5.0,
+      maxTokensPerSession: 500_000,
+      maxWallDurationMs: 3_600_000,
+    },
+    thinkingLevel: "medium",
   });
-  console.log("  ✓", a3.agent_id, a3.name);
+  console.log("  ✓", a3.agent_id, a3.name, "(deny · exec, apply_patch)");
 
   const a4 = await api("POST", "/v1/agents", {
     name: "repo-scan",
-    model: "moonshot/kimi-k2.5",
-    tools: ["read", "exec", "web_search"],
-    instructions: "You scan a repository for a security report. Read files, run read-only commands, search docs.",
-    permissionPolicy: { type: "always_ask", tools: ["exec"] },
+    model: "moonshot/kimi-k2.6",
+    tools: [],
+    instructions: `You perform security audits on repositories. Every action requires human approval.
+
+1. Start by reading the project structure: package manifests (package.json, requirements.txt, go.mod), config files, and the entrypoint. Build a mental model of the stack, dependencies, and attack surface.
+2. Scan source files methodically. Check for: hardcoded secrets (API keys, tokens, passwords in source or config), SQL injection (string concatenation in queries), XSS (unsanitized user input in templates), command injection (user input in exec/spawn calls), path traversal, insecure deserialization, and broken access control.
+3. Review dependency manifests. Use web_search to check each direct dependency against the CVE/NVD database and recent security advisories. Flag any dependency with a known critical or high CVE.
+4. Check authentication and authorization patterns: are tokens validated? Are secrets in env vars or hardcoded? Is HTTPS enforced? Are CORS headers restrictive?
+5. Produce a structured report written to the workspace:
+   - Executive summary (1 paragraph: overall posture, highest-severity finding, recommended immediate action)
+   - Findings table: severity (critical/high/medium/low), category, affected file:line, description, remediation
+   - Dependency audit: each flagged dependency, its CVE ID, affected version range, and upgrade target
+6. Never auto-remediate. Your role is to find and report. Fixes are the developer's decision.
+
+Be thorough but honest — false positives erode trust. If you're uncertain about a finding, say so and explain your reasoning.`,
+    permissionPolicy: { type: "always_ask" },
     quota: {
-      maxCostUsdPerSession: 0.25,
-      maxWallDurationMs: 600_000,
+      maxCostUsdPerSession: 5.0,
+      maxTokensPerSession: 500_000,
+      maxWallDurationMs: 7_200_000,
     },
+    thinkingLevel: "high",
   });
-  console.log("  ✓", a4.agent_id, a4.name);
+  console.log("  ✓", a4.agent_id, a4.name, "(always_ask · all tools)");
 
   // --- Sessions -------------------------------------------------------
   // Just the shell (POST /v1/sessions with no initial event). Sessions

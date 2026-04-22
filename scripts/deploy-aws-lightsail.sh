@@ -58,7 +58,7 @@ PROVIDER_KEY_NAMES=(
 )
 
 # Default test model matches the local smoke path.
-DEFAULT_TEST_MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.5}"
+DEFAULT_TEST_MODEL="${OPENCLAW_TEST_MODEL:-moonshot/kimi-k2.6}"
 
 # ------------------------------------------------------------------------------
 # Helpers
