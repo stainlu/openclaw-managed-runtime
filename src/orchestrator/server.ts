@@ -264,6 +264,7 @@ function sessionResponse(
     pool_source: containerRow?.poolSource ?? null,
     container_id: containerRow?.containerId ?? null,
     container_name: containerRow?.containerName ?? null,
+    parent_session_id: session.parentSessionId,
   };
 }
 
@@ -836,6 +837,7 @@ export function buildApp(deps: ServerDeps): Hono {
     // will allow N-1 further spawns from its own container.
     const parentTokenHeader = c.req.header("x-openclaw-parent-token");
     let remainingSubagentDepthOverride: number | undefined;
+    let parentSessionId: string | undefined;
     if (parentTokenHeader) {
       const payload = deps.tokenMinter.verify(parentTokenHeader);
       if (!payload) {
@@ -863,6 +865,7 @@ export function buildApp(deps: ServerDeps): Hono {
         );
       }
       remainingSubagentDepthOverride = payload.remainingDepth - 1;
+      parentSessionId = payload.parentSessionId;
     }
 
     if (parsed.data.environmentId) {
@@ -877,6 +880,7 @@ export function buildApp(deps: ServerDeps): Hono {
         environmentId: parsed.data.environmentId,
         remainingSubagentDepth: remainingSubagentDepthOverride,
         vaultId: parsed.data.vaultId,
+        parentSessionId,
       });
       // Proactive warm-up: start booting the container in the background
       // so it's ready (or nearly ready) by the time the first event arrives.

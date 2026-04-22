@@ -267,9 +267,11 @@ export interface SessionStore {
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
     vaultId?: string;
+    parentSessionId?: string;
   }): Session;
   get(sessionId: string): Session | undefined;
   list(): Session[];
+  listByParent(parentSessionId: string): Session[];
   delete(sessionId: string): boolean;
   beginRun(sessionId: string): Session | undefined;
   endRunSuccess(sessionId: string, usage: RunUsage): Session | undefined;

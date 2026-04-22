@@ -722,6 +722,7 @@ function asDesignSession(s, agentById, environmentById) {
     bootMs: typeof s.boot_ms === 'number' ? s.boot_ms : null,
     output: s.output,
     error: s.error,
+    parentSessionId: s.parent_session_id || null,
   };
 }
 
@@ -2427,7 +2428,7 @@ function SessionInspector({ s, status }) {
       </div>
       <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px' }}>
         {tab === 'config' && <ConfigTab s={s} />}
-        {tab === 'tree' && <TreeTab />}
+        {tab === 'tree' && <TreeTab s={s} />}
         {tab === 'raw' && <RawTab s={s} />}
       </div>
     </aside>
@@ -2580,19 +2581,55 @@ function ConfigTab({ s }) {
   );
 }
 
-function TreeTab() {
-  const tree = [
-    { depth: 0, id: 'sx_a91c8b42', name: 'research-assistant', status: 'running', tokens: '8.4k', cost: '$0.063' },
-    { depth: 1, id: 'sx_child_01', name: 'web-analyzer',        status: 'running', tokens: '2.1k', cost: '$0.019' },
-    { depth: 2, id: 'sx_child_02', name: 'fact-check',          status: 'ended',   tokens: '0.8k', cost: '$0.004' },
-    { depth: 1, id: 'sx_child_03', name: 'doc-writer',          status: 'idle',    tokens: '0',    cost: '$0.000' },
-  ];
+function TreeTab({ s }) {
+  const children = SESSIONS.filter(c => c.parentSessionId === s.id);
+
+  function buildTree(parentId, depth) {
+    const kids = SESSIONS.filter(c => c.parentSessionId === parentId);
+    const nodes = [];
+    for (const kid of kids) {
+      nodes.push({ ...kid, depth });
+      nodes.push(...buildTree(kid.id, depth + 1));
+    }
+    return nodes;
+  }
+
+  const tree = buildTree(s.id, 1);
+
+  if (tree.length === 0) {
+    return (
+      <>
+        <Eyebrow>Delegation tree</Eyebrow>
+        <div style={{ marginTop: 14, fontSize: 13, color: 'var(--ink-3)' }}>
+          No subagent sessions.
+        </div>
+        <p style={{ marginTop: 10, fontSize: 12, color: 'var(--ink-4)', lineHeight: 1.5 }}>
+          Agents with <Mono s={11} c="var(--ink-3)">callableAgents</Mono> and <Mono s={11} c="var(--ink-3)">maxSubagentDepth {'>'} 0</Mono> can spawn child sessions via the in-container <Mono s={11} c="var(--ink-3)">call_agent</Mono> tool.
+        </p>
+      </>
+    );
+  }
+
+  const maxDepth = Math.max(...tree.map(n => n.depth));
+
   return (
     <>
-      <Eyebrow>Delegation tree · depth 2 / 3</Eyebrow>
+      <Eyebrow>Delegation tree · depth {maxDepth}</Eyebrow>
       <div style={{ marginTop: 10 }}>
-        {tree.map((n, i) => (
-          <div key={i} style={{
+        <div style={{
+          display: 'grid', gridTemplateColumns: '1fr auto auto',
+          alignItems: 'center', gap: 8,
+          padding: '8px 0', borderBottom: '1px solid var(--line)',
+        }}>
+          <div>
+            <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--ink)' }}>{s.agent}</span>
+            <Mono s={10} c="var(--ink-3)">{s.id}</Mono>
+          </div>
+          <StatusBadge s={s.status} />
+          <Mono s={10} c="var(--ink-2)">{'$' + s.cost.toFixed(3)}</Mono>
+        </div>
+        {tree.map((n) => (
+          <div key={n.id} style={{
             display: 'grid', gridTemplateColumns: '1fr auto auto',
             alignItems: 'center', gap: 8,
             padding: '8px 0', paddingLeft: n.depth * 16,
@@ -2600,13 +2637,13 @@ function TreeTab() {
           }}>
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                {n.depth > 0 && <span style={{ color: 'var(--ink-4)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>└─</span>}
-                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--ink)' }}>{n.name}</span>
+                <span style={{ color: 'var(--ink-4)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>└─</span>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--ink)' }}>{n.agent}</span>
               </div>
               <Mono s={10} c="var(--ink-3)">{n.id}</Mono>
             </div>
             <StatusBadge s={n.status} />
-            <Mono s={10} c="var(--ink-2)">{n.cost}</Mono>
+            <Mono s={10} c="var(--ink-2)">{'$' + n.cost.toFixed(3)}</Mono>
           </div>
         ))}
       </div>

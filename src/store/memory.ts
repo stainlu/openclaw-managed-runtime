@@ -173,6 +173,7 @@ class InMemorySessionStore implements SessionStore {
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
     vaultId?: string;
+    parentSessionId?: string;
   }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
     const session: Session = {
@@ -190,6 +191,7 @@ class InMemorySessionStore implements SessionStore {
       createdAt: Date.now(),
       lastEventAt: null,
       vaultId: args.vaultId ?? null,
+      parentSessionId: args.parentSessionId ?? null,
     };
     this.sessions.set(sessionId, session);
     return session;
@@ -201,6 +203,12 @@ class InMemorySessionStore implements SessionStore {
 
   list(): Session[] {
     return Array.from(this.sessions.values());
+  }
+
+  listByParent(parentSessionId: string): Session[] {
+    return Array.from(this.sessions.values()).filter(
+      (s) => s.parentSessionId === parentSessionId,
+    );
   }
 
   delete(sessionId: string): boolean {

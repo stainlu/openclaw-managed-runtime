@@ -83,6 +83,7 @@ type SessionRow = {
   created_at: number;
   last_event_at: number | null;
   vault_id: string | null;
+  parent_session_id: string | null;
 };
 
 /** True when at least one channel is enabled on the agent — used to
@@ -148,6 +149,7 @@ function rowToSession(r: SessionRow): Session {
     createdAt: r.created_at,
     lastEventAt: r.last_event_at,
     vaultId: r.vault_id,
+    parentSessionId: r.parent_session_id ?? null,
   };
 }
 
@@ -229,7 +231,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   error TEXT,
   created_at INTEGER NOT NULL,
   last_event_at INTEGER,
-  vault_id TEXT
+  vault_id TEXT,
+  parent_session_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id);
@@ -617,6 +620,7 @@ class SqliteSessionStore implements SessionStore {
   private readonly endCancelledStmt: Database.Statement;
   private readonly addUsageStmt: Database.Statement;
   private readonly bumpTurnsStmt: Database.Statement;
+  private readonly listByParentStmt: Database.Statement;
   private readonly failRunningStmt: Database.Statement;
 
   constructor(private readonly db: Database.Database) {
@@ -625,15 +629,16 @@ class SqliteSessionStore implements SessionStore {
         session_id, agent_id, environment_id, status, ephemeral,
         remaining_subagent_depth,
         tokens_in, tokens_out, cost_usd,
-        error, created_at, last_event_at, vault_id
+        error, created_at, last_event_at, vault_id, parent_session_id
        ) VALUES (
         @session_id, @agent_id, @environment_id, 'idle', @ephemeral,
         @remaining_subagent_depth,
-        0, 0, 0, NULL, @created_at, NULL, @vault_id
+        0, 0, 0, NULL, @created_at, NULL, @vault_id, @parent_session_id
        )`,
     );
     this.getStmt = db.prepare(`SELECT * FROM sessions WHERE session_id = ?`);
     this.listStmt = db.prepare(`SELECT * FROM sessions ORDER BY created_at ASC`);
+    this.listByParentStmt = db.prepare(`SELECT * FROM sessions WHERE parent_session_id = ? ORDER BY created_at ASC`);
     this.deleteStmt = db.prepare(`DELETE FROM sessions WHERE session_id = ?`);
     this.beginRunStmt = db.prepare(
       `UPDATE sessions
@@ -686,12 +691,14 @@ class SqliteSessionStore implements SessionStore {
     ephemeral?: boolean;
     remainingSubagentDepth?: number;
     vaultId?: string;
+    parentSessionId?: string;
   }): Session {
     const sessionId = args.sessionId ?? `ses_${nanoid()}`;
     const environmentId = args.environmentId ?? null;
     const ephemeral = args.ephemeral ?? false;
     const remainingSubagentDepth = args.remainingSubagentDepth ?? 0;
     const vaultId = args.vaultId ?? null;
+    const parentSessionId = args.parentSessionId ?? null;
     const createdAt = Date.now();
     this.insertStmt.run({
       session_id: sessionId,
@@ -701,6 +708,7 @@ class SqliteSessionStore implements SessionStore {
       remaining_subagent_depth: remainingSubagentDepth,
       created_at: createdAt,
       vault_id: vaultId,
+      parent_session_id: parentSessionId,
     });
     return {
       sessionId,
@@ -717,6 +725,7 @@ class SqliteSessionStore implements SessionStore {
       createdAt,
       lastEventAt: null,
       vaultId,
+      parentSessionId,
     };
   }
 
@@ -727,6 +736,11 @@ class SqliteSessionStore implements SessionStore {
 
   list(): Session[] {
     const rows = this.listStmt.all() as SessionRow[];
+    return rows.map(rowToSession);
+  }
+
+  listByParent(parentSessionId: string): Session[] {
+    const rows = this.listByParentStmt.all(parentSessionId) as SessionRow[];
     return rows.map(rowToSession);
   }
 
@@ -1521,6 +1535,12 @@ export class SqliteStore implements Store {
         "ALTER TABLE sessions ADD COLUMN turns INTEGER NOT NULL DEFAULT 0",
       );
     }
+    if (!sessionsCols.some((c) => c.name === "parent_session_id")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT");
+    }
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)",
+    );
     // mcp_oauth columns on vault_credentials. Pre-migration rows are
     // all static_bearer with these NULL, which matches their type.
     const vaultCredsCols = this.db.pragma("table_info(vault_credentials)") as Array<{
