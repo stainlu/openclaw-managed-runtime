@@ -604,6 +604,52 @@ const LIVE_BUS = (() => {
   };
 })();
 
+function renderMarkdown(src) {
+  if (!src) return '';
+  let html = src
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // fenced code blocks
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) =>
+    `<pre style="background:var(--paper-2);border:1px solid var(--line);border-radius:6px;padding:12px 14px;font-family:var(--font-mono);font-size:12px;line-height:1.5;overflow-x:auto;margin:8px 0">${code.trimEnd()}</pre>`
+  );
+  // tables
+  html = html.replace(/((?:^\|.+\|\s*\n)+)/gm, (block) => {
+    const rows = block.trim().split('\n').filter(r => r.trim());
+    if (rows.length < 2) return block;
+    const isSep = (r) => /^\|[\s\-:|]+\|$/.test(r.trim());
+    const parseRow = (r) => r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+    let headerIdx = -1;
+    for (let i = 0; i < rows.length; i++) { if (isSep(rows[i])) { headerIdx = i; break; } }
+    let out = '<table style="border-collapse:collapse;margin:8px 0;font-size:13px;width:100%">';
+    for (let i = 0; i < rows.length; i++) {
+      if (isSep(rows[i])) continue;
+      const cells = parseRow(rows[i]);
+      const isHead = headerIdx > 0 && i < headerIdx;
+      const tag = isHead ? 'th' : 'td';
+      const style = `style="border:1px solid var(--line);padding:6px 10px;text-align:left;${isHead ? 'font-weight:500;background:var(--paper-2)' : ''}"`;
+      out += '<tr>' + cells.map(c => `<${tag} ${style}>${c}</${tag}>`).join('') + '</tr>';
+    }
+    return out + '</table>';
+  });
+  // headings
+  html = html.replace(/^#### (.+)$/gm, '<h4 style="margin:12px 0 4px;font-size:13px;font-weight:600;color:var(--ink)">$1</h4>');
+  html = html.replace(/^### (.+)$/gm, '<h3 style="margin:14px 0 4px;font-size:14px;font-weight:600;color:var(--ink)">$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2 style="margin:16px 0 6px;font-size:15px;font-weight:600;letter-spacing:-0.01em;color:var(--ink)">$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1 style="margin:18px 0 6px;font-size:17px;font-weight:600;letter-spacing:-0.02em;color:var(--ink)">$1</h1>');
+  // unordered lists
+  html = html.replace(/^- (.+)$/gm, '<div style="padding-left:16px;margin:2px 0"><span style="color:var(--ink-3)">·</span> $1</div>');
+  // ordered lists
+  html = html.replace(/^(\d+)\. (.+)$/gm, '<div style="padding-left:16px;margin:2px 0"><span style="color:var(--ink-3)">$1.</span> $2</div>');
+  // inline: bold, italic, code, links
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  html = html.replace(/`([^`]+)`/g, '<code style="background:var(--paper-2);padding:1px 4px;border-radius:3px;font-size:0.9em;font-family:var(--font-mono)">$1</code>');
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--ink);text-decoration:underline">$1</a>');
+  // paragraphs: collapse double newlines
+  html = html.replace(/\n\n+/g, '</p><p style="margin:8px 0">');
+  return html;
+}
+
 function fmtAgo(ms) {
   const diff = Date.now() - ms;
   if (diff < 60_000) return Math.max(1, Math.round(diff / 1000)) + 's ago';
@@ -2114,8 +2160,8 @@ function EventRow({ e, streaming, session }) {
     const toks = (e.tokensIn || 0) + (e.tokensOut || 0);
     return <Row>
       <div>
-        <p style={{ margin: 0, fontSize: 14, color: 'var(--ink)', lineHeight: 1.6, maxWidth: '62ch', whiteSpace: 'pre-wrap' }}
-           dangerouslySetInnerHTML={{ __html: (e.text || '').replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code style="background:var(--paper-2);padding:1px 4px;border-radius:3px;font-size:0.9em">$1</code>') }} />
+        <div style={{ margin: 0, fontSize: 14, color: 'var(--ink)', lineHeight: 1.6, maxWidth: '62ch' }}
+           dangerouslySetInnerHTML={{ __html: renderMarkdown(e.text) }} />
         {(toks > 0 || e.model) && (
           <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>
             {toks > 0 && <Mono s={10} c="var(--ink-3)">↓ {toks} tok</Mono>}
