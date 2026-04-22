@@ -623,6 +623,23 @@ Covering `router.ts` and `pool.ts` in unit tests is harder because both take con
 - **Credential passthrough.** Provider API keys are passed as env vars from the orchestrator into each spawned container. A future item replaces this with cloud-native secret managers (AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, etc.) via an upstream OpenClaw `SecretRef` extension.
 - **Gateway WebSocket control plane.** The orchestrator opens one WebSocket per live container and runs the operator handshake with `controlUi.dangerouslyDisableDeviceAuth: true` set in the generated `openclaw.json`. That flag is safe because the gateway is bound to `openclaw-net` (a private Docker bridge), only the orchestrator ever reaches it, and the per-container token is random 32-byte hex. Never enable that flag on a gateway bound to a public interface.
 
+## Sandbox model
+
+The isolation boundary is **per-agent, not per-session**. Each agent gets its own Docker container with process, network, and resource isolation. But all sessions for the same agent share a single `/workspace` bind mount at `<hostStateRoot>/<agentId>/`.
+
+**What's isolated:**
+- **Between agents:** full Docker-level isolation. Different containers, different bind mounts, different networks (when using `networking: limited`). Agent A cannot access Agent B's filesystem, processes, or network.
+- **From the host:** containers run as non-root (`openclaw` user, UID from `Dockerfile.runtime`). No ports published to host. Reachable only by container name over `openclaw-net`.
+
+**What's shared:**
+- **Between sessions on the same agent:** the workspace. Session A and Session B on the same agent read/write the same `/workspace`. Pi's `SessionManager` takes an exclusive SQLite lock on the workspace directory, so only one container per agent runs at a time — concurrent sessions on the same agent are serialized, not parallel.
+
+This is inherited from Pi's single-user design. Pi organizes all sessions under one agent directory (`<agentId>/agents/main/sessions/`). The workspace mount is per-agent because Pi assumes one user per agent workspace. Our orchestrator creates multi-user semantics for different agents but not for multiple sessions of the same agent.
+
+**Why this is acceptable today:** our deployment model is one orchestrator per tenant (strategy §"Deployment model"). All sessions within one orchestrator belong to the same trust domain — same customer, same API key. Session A reading Session B's files is not a security boundary violation.
+
+**When it won't be enough:** if a future deployment needs multi-user isolation within one orchestrator (different end-users on the same agent, different trust levels), per-session workspace isolation is required. This would mean separate bind mounts per session and a shim layer to bridge Pi's single-directory assumption. Tracked as a future architecture item.
+
 ## Swapping providers
 
 The runtime is provider-agnostic. To switch a running agent or the smoke default off Moonshot:
