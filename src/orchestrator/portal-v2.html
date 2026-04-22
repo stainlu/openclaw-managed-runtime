@@ -2914,6 +2914,157 @@ function EnvironmentsView() {
   );
 }
 
+function MetricsView() {
+  const [raw, setRaw] = useState(null);
+  const [lastFetch, setLastFetch] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const res = await fetch('/metrics');
+        if (!res.ok) return;
+        const text = await res.text();
+        if (!cancelled) { setRaw(text); setLastFetch(Date.now()); }
+      } catch {}
+    }
+    load();
+    const h = setInterval(load, 10_000);
+    return () => { cancelled = true; clearInterval(h); };
+  }, []);
+
+  if (!raw) return (
+    <div style={{ height: '100%', display: 'grid', placeItems: 'center', background: 'var(--paper)' }}>
+      <Mono s={12} c="var(--ink-3)">Loading /metrics...</Mono>
+    </div>
+  );
+
+  const grab = (name, pat = '[\\d.eE+-]+') => {
+    const re = new RegExp(`^${name}(?:\\{[^}]*\\})?\\s+(${pat})`, 'm');
+    const m = raw.match(re);
+    return m ? Number(m[1]) : null;
+  };
+  const grabLabelled = (name) => {
+    const re = new RegExp(`^${name}\\{([^}]*)\\}\\s+([\\d.eE+-]+)`, 'gm');
+    const results = [];
+    let m;
+    while ((m = re.exec(raw)) !== null) results.push({ labels: m[1], value: Number(m[2]) });
+    return results;
+  };
+
+  const active = grab('pool_active_containers') ?? 0;
+  const warm = grab('pool_warm_containers') ?? 0;
+  const coldLines = grabLabelled('pool_cold_starts_total');
+  const coldTotal = coldLines.reduce((s, e) => s + e.value, 0);
+  const bootSum = grab('container_boot_duration_seconds_sum');
+  const bootCount = grab('container_boot_duration_seconds_count');
+  const avgBoot = bootSum && bootCount ? (bootSum / bootCount) : null;
+  const spawnSum = grab('pool_spawn_duration_seconds_sum');
+  const spawnCount = grab('pool_spawn_duration_seconds_count');
+  const avgSpawn = spawnSum && spawnCount ? (spawnSum / spawnCount) : null;
+  const runSum = grab('session_run_duration_seconds_sum');
+  const runCount = grab('session_run_duration_seconds_count');
+  const avgRun = runSum && runCount ? (runSum / runCount) : null;
+  const runFails = grab('session_run_failures_total') ?? 0;
+  const agentsCreated = grab('agents_created_total') ?? 0;
+  const quotaCost = grabLabelled('quota_rejections_total').find(e => e.labels.includes('cost'));
+  const quotaTokens = grabLabelled('quota_rejections_total').find(e => e.labels.includes('tokens'));
+  const quotaDuration = grabLabelled('quota_rejections_total').find(e => e.labels.includes('duration'));
+  const rateLimitToken = grabLabelled('rate_limit_rejections_total').find(e => e.labels.includes('token'));
+  const rateLimitIp = grabLabelled('rate_limit_rejections_total').find(e => e.labels.includes('ip'));
+  const jsonlMax = grab('session_jsonl_bytes_max');
+  const jsonlSum = grab('session_jsonl_bytes_sum');
+  const jsonlOver = grab('session_jsonl_over_threshold') ?? 0;
+  const evtMsg = grabLabelled('session_events_total').find(e => e.labels.includes('user.message'));
+  const evtTool = grabLabelled('session_events_total').find(e => e.labels.includes('tool_confirmation'));
+  const httpTotal = grabLabelled('http_requests_total');
+  const http2xx = httpTotal.filter(e => e.labels.includes('status="2')).reduce((s, e) => s + e.value, 0);
+  const http4xx = httpTotal.filter(e => e.labels.includes('status="4')).reduce((s, e) => s + e.value, 0);
+  const http5xx = httpTotal.filter(e => e.labels.includes('status="5')).reduce((s, e) => s + e.value, 0);
+  const httpAll = httpTotal.reduce((s, e) => s + e.value, 0);
+  const acquireLines = grabLabelled('pool_acquire_total');
+  const acqWarm = acquireLines.find(e => e.labels.includes('warm'))?.value ?? 0;
+  const acqSpawn = acquireLines.find(e => e.labels.includes('spawn'))?.value ?? 0;
+  const acqActive = acquireLines.find(e => e.labels.includes('active'))?.value ?? 0;
+
+  const fmtBytes = (b) => {
+    if (b == null) return '—';
+    if (b < 1024) return b + ' B';
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+    return (b / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
+  const Card = ({ label, value, sub }) => (
+    <div style={{
+      padding: '16px 20px', background: 'var(--card)',
+      border: '1px solid var(--line)', borderRadius: 6,
+    }}>
+      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>{label}</div>
+      <div style={{ marginTop: 6, fontSize: 28, fontWeight: 500, letterSpacing: '-0.03em', color: 'var(--ink)' }}>{value}</div>
+      {sub && <div style={{ marginTop: 4, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-3)' }}>{sub}</div>}
+    </div>
+  );
+
+  const Section = ({ title, children }) => (
+    <div style={{ marginBottom: 32 }}>
+      <Eyebrow style={{ marginBottom: 12 }}>{title}</Eyebrow>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12 }}>
+        {children}
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ height: '100%', overflowY: 'auto' }}>
+      <div style={{ padding: '28px 40px 20px', borderBottom: '1px solid var(--ink)' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+          <Eyebrow>prometheus · /metrics</Eyebrow>
+          <Mono s={10} c="var(--ink-3)">refreshes every 10s{lastFetch ? ' · ' + fmtAgo(lastFetch) : ''}</Mono>
+        </div>
+        <h1 style={{ marginTop: 8, fontSize: 36, fontWeight: 500, letterSpacing: '-0.035em' }}>Metrics</h1>
+        <p style={{ marginTop: 8, maxWidth: '56ch', fontSize: 14, color: 'var(--ink-2)' }}>
+          Live Prometheus counters and gauges. All values reset on orchestrator restart. Scrape <Mono s={12} c="var(--ink-2)">/metrics</Mono> for Grafana.
+        </p>
+      </div>
+
+      <div style={{ padding: '24px 40px' }}>
+        <Section title="Container pool">
+          <Card label="Active containers" value={active} sub="per-session, currently serving" />
+          <Card label="Warm containers" value={warm} sub={'target ' + (HEALTH.maxWarm || 0)} />
+          <Card label="Cold starts" value={coldTotal} sub={avgBoot != null ? avgBoot.toFixed(1) + 's avg boot' : 'no boots yet'} />
+          <Card label="Acquires · warm" value={acqWarm} sub="reused from warm pool" />
+          <Card label="Acquires · spawn" value={acqSpawn} sub="fresh container created" />
+          <Card label="Acquires · active" value={acqActive} sub="existing session container" />
+        </Section>
+
+        <Section title="Agent runs">
+          <Card label="Avg run duration" value={avgRun != null ? avgRun.toFixed(1) + 's' : '—'} sub={runCount ? runCount + ' runs total' : null} />
+          <Card label="Run failures" value={runFails} sub="excludes client cancellations" />
+          <Card label="Avg spawn time" value={avgSpawn != null ? avgSpawn.toFixed(1) + 's' : '—'} sub={spawnCount ? spawnCount + ' spawns' : null} />
+          <Card label="Events posted" value={(evtMsg?.value ?? 0) + (evtTool?.value ?? 0)} sub={`${evtMsg?.value ?? 0} messages · ${evtTool?.value ?? 0} confirmations`} />
+        </Section>
+
+        <Section title="HTTP">
+          <Card label="Total requests" value={httpAll} sub={`${http2xx} ok · ${http4xx} 4xx · ${http5xx} 5xx`} />
+          <Card label="Agents created" value={agentsCreated} sub="since boot" />
+        </Section>
+
+        <Section title="Quotas & rate limits">
+          <Card label="Quota rejections" value={(quotaCost?.value ?? 0) + (quotaTokens?.value ?? 0) + (quotaDuration?.value ?? 0)}
+            sub={`cost ${quotaCost?.value ?? 0} · tokens ${quotaTokens?.value ?? 0} · duration ${quotaDuration?.value ?? 0}`} />
+          <Card label="Rate limit hits" value={(rateLimitToken?.value ?? 0) + (rateLimitIp?.value ?? 0)}
+            sub={`token ${rateLimitToken?.value ?? 0} · ip ${rateLimitIp?.value ?? 0}`} />
+        </Section>
+
+        <Section title="Storage">
+          <Card label="JSONL disk total" value={fmtBytes(jsonlSum)} sub={jsonlOver > 0 ? jsonlOver + ' over threshold' : 'all within limits'} />
+          <Card label="Largest session JSONL" value={fmtBytes(jsonlMax)} />
+        </Section>
+      </div>
+    </div>
+  );
+}
+
 function PlaceholderView({ title, sub }) {
   return (
     <div style={{ height: '100%', display: 'grid', placeItems: 'center', background: 'var(--paper)' }}>
@@ -4749,7 +4900,7 @@ function App() {
     : view === 'environments' ? <EnvironmentsView />
     : view === 'audit' ? <AuditView />
     : view === 'vaults' ? <VaultsView />
-    : view === 'metrics' ? <PlaceholderView title="Metrics" sub="Prometheus · /metrics · not shown in this mockup" />
+    : view === 'metrics' ? <MetricsView />
     : (
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }} data-screen-label="Sessions split">
         <SessionsList selectedId={selectedSession} onSelect={(id) => {
