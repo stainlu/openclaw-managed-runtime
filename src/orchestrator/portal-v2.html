@@ -3952,7 +3952,7 @@ function CreateAgentModal() {
   // toggle pills, or leave empty (any registered tool can run) — the
   // `valid` guard still requires at least one because the deny-policy
   // branch needs a non-empty list.
-  const [tools, setTools] = useState(['read', 'web_search']);
+  const [tools, setTools] = useState([]);
   const [mcp, setMcp] = useState([]);
   const [policy, setPolicy] = useState('always_ask');
   const [submitting, setSubmitting] = useState(false);
@@ -3978,7 +3978,7 @@ function CreateAgentModal() {
   // deny requires a tools list of ≥1. always_ask / always_allow don't.
   // "valid" guards the Create button — keep tools≥1 baseline so every
   // policy path has at least one tool to operate on.
-  const valid = name.trim().length >= 3 && tools.length >= 1;
+  const valid = name.trim().length >= 3;
   const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || '…';
 
   async function submit() {
@@ -3993,7 +3993,7 @@ function CreateAgentModal() {
       // Success → provider closes the modal; reset state here so the
       // next open starts fresh.
       setName(''); setInstructions('');
-      setTools(['read', 'web_search']); setMcp([]);
+      setTools([]); setMcp([]);
       setPolicy('always_ask');
       setError(null);
     } else {
@@ -4103,7 +4103,7 @@ function CreateAgentModal() {
           </div>
 
           <div>
-            <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Tools · {tools.length}</label>
+            <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Tools · {tools.length === 0 ? 'all (default)' : tools.length + ' selected'}</label>
             <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
               {allTools.map(t => <Toggle key={t} set={setTools} arr={tools} item={t} />)}
             </div>
