@@ -303,13 +303,18 @@ async function main(): Promise<void> {
     renameWorkspaceOnClaim: (warmHostPath, sessionId) => {
       const session = store.sessions.get(sessionId);
       if (!session) return;
+      // warmHostPath is a HOST-side path (for dockerode). Convert to the
+      // in-process equivalent by swapping the prefix. Both point to the
+      // same bind-mounted volume, just different absolute paths.
+      const warmRelSuffix = warmHostPath.slice(hostStateRoot.length);
+      const sourcePath = join(stateRoot, warmRelSuffix);
       const targetPath = join(stateRoot, session.agentId, "sessions", sessionId);
-      if (warmHostPath === targetPath) return;
+      if (sourcePath === targetPath) return;
       try {
         mkdirSync(dirname(targetPath), { recursive: true });
-        renameSync(warmHostPath, targetPath);
+        renameSync(sourcePath, targetPath);
       } catch (err) {
-        log.warn({ err, session_id: sessionId, from: warmHostPath, to: targetPath },
+        log.warn({ err, session_id: sessionId, from: sourcePath, to: targetPath },
           "warm workspace rename failed — session will still work but path mismatch may occur");
       }
     },

@@ -1,4 +1,4 @@
-import { readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Event } from "../orchestrator/types.js";
 
@@ -289,7 +289,16 @@ export class PiJsonlEventReader {
   }
 
   private sessionsDir(agentId: string, sessionId: string): string {
-    return join(this.stateRoot, agentId, "sessions", sessionId, "agents", "main", "sessions");
+    // Per-session workspace path (post-migration). Falls back to the old
+    // per-agent path for sessions created before the migration shipped.
+    const perSession = join(this.stateRoot, agentId, "sessions", sessionId, "agents", "main", "sessions");
+    try {
+      accessSync(join(perSession, "sessions.json"));
+      return perSession;
+    } catch {
+      // Pre-migration session: JSONL lives at the old per-agent path.
+      return join(this.stateRoot, agentId, "agents", "main", "sessions");
+    }
   }
 
   private sessionsJsonPath(agentId: string, sessionId: string): string {
