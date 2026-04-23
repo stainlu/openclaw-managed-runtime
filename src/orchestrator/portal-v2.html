@@ -4210,7 +4210,7 @@ function Toaster() {
 function CreateAgentModal() {
   const ctx = useApp();
   const [name, setName] = useState('');
-  const [model, setModel] = useState('moonshot/kimi-k2.6');
+  const [model, setModel] = useState('anthropic/claude-opus-4-7');
   const [instructions, setInstructions] = useState('');
   // Default selection picks the two most-used openclaw built-ins for a
   // fresh agent template: `read` (file read) + `web_search`. Users can
@@ -4327,28 +4327,43 @@ function CreateAgentModal() {
 
           <div>
             <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Model</label>
-            <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
-              {/* Real provider/model IDs the orchestrator passes through to
-                  openclaw's provider catalog. Anything openclaw doesn't
-                  recognize at runtime fails the first /chat/completions —
-                  these four are deployment-tested. Users can set a different
-                  model per session via POST /v1/sessions/:id/events { model }
-                  without re-creating the agent. */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 6 }}>
               {[
-                'moonshot/kimi-k2.6',
-                'anthropic/claude-sonnet-4-6',
-                'openai/gpt-4.1',
-                'deepseek/deepseek-chat',
-              ].map(m => (
-                <button key={m} onClick={() => setModel(m)} style={{
-                  all: 'unset', cursor: 'pointer',
-                  padding: '6px 11px', fontSize: 12, fontFamily: 'var(--font-mono)',
-                  border: '1px solid ' + (m === model ? 'var(--ink)' : 'var(--line-2)'),
-                  background: m === model ? 'var(--ink)' : 'var(--card)',
-                  color: m === model ? 'var(--paper)' : 'var(--ink-2)',
-                  borderRadius: 6,
-                }}>{m}</button>
+                { label: 'Anthropic', models: ['anthropic/claude-opus-4-7', 'anthropic/claude-opus-4-6'] },
+                { label: 'OpenAI', models: ['openai/gpt-5.4'] },
+                { label: 'Google', models: ['google/gemini-3.1-pro-preview', 'google/gemini-3.1-flash-lite-preview'] },
+                { label: 'xAI', models: ['xai/grok-4.2-fast', 'xai/grok-4.1-fast'] },
+                { label: 'Moonshot', models: ['moonshot/kimi-k2.6', 'moonshot/kimi-k2.5'] },
+                { label: 'Qwen', models: ['qwen/qwen-3.6-plus'] },
+                { label: 'MiniMax', models: ['minimax/minimax-m2.7', 'minimax/minimax-m2.5'] },
+                { label: 'GLM', models: ['glm/glm-5.1', 'glm/glm-5'] },
+              ].map(g => (
+                <div key={g.label} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                  <Mono s={9} c="var(--ink-4)" style={{ width: 52, flexShrink: 0 }}>{g.label}</Mono>
+                  {g.models.map(m => (
+                    <button key={m} onClick={() => setModel(m)} style={{
+                      all: 'unset', cursor: 'pointer',
+                      padding: '4px 9px', fontSize: 11, fontFamily: 'var(--font-mono)',
+                      border: '1px solid ' + (m === model ? 'var(--ink)' : 'var(--line-2)'),
+                      background: m === model ? 'var(--ink)' : 'var(--card)',
+                      color: m === model ? 'var(--paper)' : 'var(--ink-2)',
+                      borderRadius: 6,
+                    }}>{m.split('/').slice(1).join('/')}</button>
+                  ))}
+                </div>
               ))}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Mono s={9} c="var(--ink-4)" style={{ width: 52, flexShrink: 0 }}>Custom</Mono>
+                <input value={model} onChange={e => setModel(e.target.value)} placeholder="provider/model-id"
+                  style={{
+                    flex: 1, border: '1px solid var(--line-2)', borderRadius: 6,
+                    padding: '4px 9px', fontSize: 11, fontFamily: 'var(--font-mono)',
+                    background: 'var(--card)', color: 'var(--ink)', outline: 'none',
+                  }}
+                  onFocus={e => e.target.style.borderColor = 'var(--ink)'}
+                  onBlur={e => e.target.style.borderColor = 'var(--line-2)'}
+                />
+              </div>
             </div>
           </div>
 
@@ -5193,6 +5208,20 @@ function App() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw', background: 'var(--paper)', overflow: 'hidden' }}>
+      {AUTH.user?.tier === 'anonymous' && (
+        <div style={{
+          padding: '6px 18px', background: 'var(--ink)', color: 'var(--paper)',
+          fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12,
+          fontFamily: 'var(--font-mono)', letterSpacing: '0.02em', flexShrink: 0,
+        }}>
+          <span>Demo · limited to {AUTH.user?.expires_at ? Math.max(0, Math.round((AUTH.user.expires_at - Date.now()) / 3600000)) + 'h remaining' : '24h'} · 3 agents · 5 sessions</span>
+          <button onClick={() => window.location.href = '/auth/github'} style={{
+            all: 'unset', cursor: 'pointer', padding: '2px 10px',
+            border: '1px solid var(--paper)', borderRadius: 4,
+            fontSize: 11, fontWeight: 500,
+          }}>Sign in with GitHub for more</button>
+        </div>
+      )}
       <Topbar route={route} setRoute={setRoute} onTweaks={() => setShowTweaks(s => !s)} />
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         <Sidebar route={route} setRoute={setRoute} />

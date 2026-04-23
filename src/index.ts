@@ -99,6 +99,7 @@ function collectPassthroughEnv(): Record<string, string> {
     "XAI_API_KEY",
     "TOGETHER_API_KEY",
     "OPENROUTER_API_KEY",
+    "ZENMUX_API_KEY",
     "FIREWORKS_API_KEY",
     "GROQ_API_KEY",
     // OpenTelemetry — forwarded verbatim so operators can point openclaw's

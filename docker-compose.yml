@@ -98,6 +98,7 @@ services:
       # https://<your-host>/auth/github/callback
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      ZENMUX_API_KEY: ${ZENMUX_API_KEY:-}
       # Master key for vault credential encryption-at-rest. 32 bytes as
       # 64 hex chars (or base64 / base64url). Unset = orchestrator
       # generates + persists in SQLite (fine for dev, but then key
