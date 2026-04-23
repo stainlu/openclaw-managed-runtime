@@ -12,7 +12,7 @@ import type {
   NetworkingSpec,
   SpawnOptions,
 } from "../runtime/container.js";
-import { GatewayWsError } from "../runtime/gateway-ws.js";
+import { GatewayWebSocketClient, GatewayWsError } from "../runtime/gateway-ws.js";
 import type { ParentTokenMinter } from "../runtime/parent-token.js";
 import type { SessionContainerPool } from "../runtime/pool.js";
 import type { PiJsonlEventReader } from "../store/pi-jsonl.js";
@@ -120,6 +120,7 @@ export type PendingApproval = {
   approvalId: string;
   sessionId: string;
   toolName: string;
+  toolCallId?: string;
   description: string;
   arrivedAt: number;
 };
@@ -130,6 +131,15 @@ export class AgentRouter {
    *  `plugin.approval.requested`. Read by the SSE handler to emit
    *  `agent.tool_confirmation_request` events. Cleared on confirm/cancel/delete. */
   private readonly pendingApprovals = new Map<string, PendingApproval[]>();
+  /** One plugin-approval WS subscription pair per active session. */
+  private readonly approvalSubscriptions = new Map<
+    string,
+    {
+      wsClient: GatewayWebSocketClient;
+      unsubscribeRequested: () => void;
+      unsubscribeResolved: () => void;
+    }
+  >();
   /**
    * Sessions whose cancel was requested while the background task was
    * still in the acquire phase (no container / WS client yet). The
@@ -152,6 +162,142 @@ export class AgentRouter {
   /** Return any pending approval requests for a session (non-destructive). */
   getPendingApprovals(sessionId: string): PendingApproval[] {
     return this.pendingApprovals.get(sessionId) ?? [];
+  }
+
+  private replacePendingApprovals(sessionId: string, approvals: PendingApproval[]): void {
+    if (approvals.length === 0) {
+      this.pendingApprovals.delete(sessionId);
+      return;
+    }
+    const deduped = new Map<string, PendingApproval>();
+    for (const approval of approvals) {
+      deduped.set(approval.approvalId, approval);
+    }
+    this.pendingApprovals.set(sessionId, [...deduped.values()]);
+  }
+
+  private upsertPendingApproval(sessionId: string, approval: PendingApproval): void {
+    const pending = this.pendingApprovals.get(sessionId) ?? [];
+    const idx = pending.findIndex((item) => item.approvalId === approval.approvalId);
+    if (idx >= 0) pending[idx] = approval;
+    else pending.push(approval);
+    this.pendingApprovals.set(sessionId, pending);
+  }
+
+  private removePendingApproval(sessionId: string, approvalId: string): void {
+    const pending = this.pendingApprovals.get(sessionId);
+    if (!pending) return;
+    const next = pending.filter((item) => item.approvalId !== approvalId);
+    if (next.length === 0) this.pendingApprovals.delete(sessionId);
+    else this.pendingApprovals.set(sessionId, next);
+  }
+
+  private clearApprovalSubscriptions(sessionId: string): void {
+    const current = this.approvalSubscriptions.get(sessionId);
+    if (!current) return;
+    try {
+      current.unsubscribeRequested();
+    } catch {
+      /* best-effort */
+    }
+    try {
+      current.unsubscribeResolved();
+    } catch {
+      /* best-effort */
+    }
+    this.approvalSubscriptions.delete(sessionId);
+  }
+
+  private parsePendingApproval(
+    sessionId: string,
+    payload: unknown,
+  ): PendingApproval | undefined {
+    const root = isRecord(payload) ? payload : undefined;
+    const request = isRecord(root?.request) ? root.request : undefined;
+    const approvalId = asNonEmptyString(root?.id);
+    if (!approvalId) return undefined;
+    return {
+      approvalId,
+      sessionId,
+      toolName:
+        asNonEmptyString(request?.toolName) ??
+        asNonEmptyString(root?.toolName) ??
+        asNonEmptyString(request?.title) ??
+        asNonEmptyString(root?.title) ??
+        "",
+      toolCallId:
+        asNonEmptyString(request?.toolCallId) ??
+        asNonEmptyString(root?.toolCallId) ??
+        undefined,
+      description:
+        asNonEmptyString(request?.description) ??
+        asNonEmptyString(root?.description) ??
+        "",
+      arrivedAt: asFiniteNumber(root?.createdAtMs) ?? Date.now(),
+    };
+  }
+
+  private async syncPendingApprovals(
+    sessionId: string,
+    wsClient: GatewayWebSocketClient,
+  ): Promise<void> {
+    try {
+      const records = await wsClient.approvalList();
+      const approvals = records
+        .map((record) => this.parsePendingApproval(sessionId, record))
+        .filter((approval): approval is PendingApproval => approval !== undefined);
+      this.replacePendingApprovals(sessionId, approvals);
+    } catch (err) {
+      log.warn(
+        { err, session_id: sessionId },
+        "approval-list sync failed",
+      );
+    }
+  }
+
+  private async ensureApprovalSubscriptions(
+    sessionId: string,
+    wsClient: GatewayWebSocketClient,
+  ): Promise<void> {
+    const existing = this.approvalSubscriptions.get(sessionId);
+    if (existing?.wsClient === wsClient) {
+      await this.syncPendingApprovals(sessionId, wsClient);
+      return;
+    }
+    this.clearApprovalSubscriptions(sessionId);
+
+    const unsubscribeRequested = wsClient.onEvent("plugin.approval.requested", (payload) => {
+      const approval = this.parsePendingApproval(sessionId, payload);
+      if (!approval) return;
+      this.upsertPendingApproval(sessionId, approval);
+      log.info(
+        {
+          session_id: sessionId,
+          tool_name: approval.toolName,
+          tool_call_id: approval.toolCallId,
+          approval_id: approval.approvalId,
+        },
+        "tool approval requested",
+      );
+    });
+
+    const unsubscribeResolved = wsClient.onEvent("plugin.approval.resolved", (payload) => {
+      const root = isRecord(payload) ? payload : undefined;
+      const approvalId = asNonEmptyString(root?.id);
+      if (!approvalId) return;
+      this.removePendingApproval(sessionId, approvalId);
+      log.info(
+        { session_id: sessionId, approval_id: approvalId, decision: asNonEmptyString(root?.decision) ?? "" },
+        "tool approval resolved",
+      );
+    });
+
+    this.approvalSubscriptions.set(sessionId, {
+      wsClient,
+      unsubscribeRequested,
+      unsubscribeResolved,
+    });
+    await this.syncPendingApprovals(sessionId, wsClient);
   }
 
   /**
@@ -453,6 +599,13 @@ export class AgentRouter {
         bypassWarmPool: this.shouldBypassWarmPool(running),
       });
 
+      if (agent.permissionPolicy.type === "always_ask") {
+        const wsClient = this.pool.getWsClient(args.sessionId);
+        if (wsClient) {
+          await this.ensureApprovalSubscriptions(args.sessionId, wsClient);
+        }
+      }
+
       const effectiveThinking = args.thinkingLevel ?? agent.thinkingLevel;
       const streamIsFirstTurn = session.turns <= 1;
       if ((args.model || effectiveThinking !== "off") && !streamIsFirstTurn) {
@@ -565,6 +718,7 @@ export class AgentRouter {
           const tokensIn = latest?.tokensIn ?? 0;
           const tokensOut = latest?.tokensOut ?? 0;
           const costUsd = latest?.costUsd ?? 0;
+          router.pendingApprovals.delete(args.sessionId);
           router.sessions.endRunSuccess(args.sessionId, { tokensIn, tokensOut, costUsd });
           return;
         }
@@ -573,6 +727,8 @@ export class AgentRouter {
           { session_id: args.sessionId, error: outcome.error },
           "streaming run failed",
         );
+        router.pendingApprovals.delete(args.sessionId);
+        router.clearApprovalSubscriptions(args.sessionId);
         await router.pool.evictSession(args.sessionId).catch(() => {
           /* best-effort */
         });
@@ -586,6 +742,8 @@ export class AgentRouter {
       // WS patch / initial HTTP may have left it in a bad state.
       const msg = err instanceof Error ? err.message : String(err);
       sessionRunFailuresTotal.inc();
+      this.pendingApprovals.delete(args.sessionId);
+      this.clearApprovalSubscriptions(args.sessionId);
       await this.pool.evictSession(args.sessionId).catch(() => {
         /* best-effort */
       });
@@ -1060,16 +1218,10 @@ export class AgentRouter {
         `session ${sessionId} has no live container for tool confirmation`,
       );
     }
-    // Pop the resolved approval from the pending queue.
-    const pending = this.pendingApprovals.get(sessionId);
-    if (pending) {
-      const idx = pending.findIndex((a) => a.approvalId === approvalId);
-      if (idx >= 0) pending.splice(idx, 1);
-      if (pending.length === 0) this.pendingApprovals.delete(sessionId);
-    }
     const wsDecision = decision === "allow" ? "allow-once" : "deny";
     try {
       await wsClient.approvalResolve(approvalId, wsDecision);
+      this.removePendingApproval(sessionId, approvalId);
     } catch (err) {
       throw wrapWsError(err, "confirm_tool_failed");
     }
@@ -1323,6 +1475,7 @@ export class AgentRouter {
       return;
     }
 
+    this.pendingApprovals.delete(sessionId);
     this.sessions.endRunSuccess(sessionId, usage);
   }
 
@@ -1365,6 +1518,9 @@ export class AgentRouter {
     // the check still lands on us. `unsubscribe` guards against double-fire.
     const wsClient = this.pool.getWsClient(sessionId);
     if (wsClient) {
+      if (agent.permissionPolicy.type === "always_ask") {
+        await this.ensureApprovalSubscriptions(sessionId, wsClient);
+      }
       const canonicalKey = `agent:main:${sessionId}`;
       unsubscribe = wsClient.onEvent("chat", (payload) => {
         const p = payload as
@@ -1420,6 +1576,7 @@ export class AgentRouter {
       const tokensIn = latest?.tokensIn ?? 0;
       const tokensOut = latest?.tokensOut ?? 0;
       const costUsd = latest?.costUsd ?? 0;
+      this.pendingApprovals.delete(sessionId);
       this.sessions.endRunSuccess(sessionId, { tokensIn, tokensOut, costUsd });
       log.info(
         { session_id: sessionId, cost_usd: costUsd },
@@ -1451,6 +1608,8 @@ export class AgentRouter {
       "adopted session run failed post-restart",
     );
     this.queue.clear(sessionId);
+    this.pendingApprovals.delete(sessionId);
+    this.clearApprovalSubscriptions(sessionId);
     await this.pool.evictSession(sessionId).catch(() => {
       /* best-effort */
     });
@@ -1480,6 +1639,7 @@ export class AgentRouter {
     // Drop any queued events and pending approvals.
     const dropped = this.queue.clear(sessionId);
     this.pendingApprovals.delete(sessionId);
+    this.clearApprovalSubscriptions(sessionId);
     if (dropped > 0) {
       log.warn(
         { session_id: sessionId, dropped_events: dropped },
@@ -1525,20 +1685,7 @@ export class AgentRouter {
         if (agent.permissionPolicy.type === "always_ask") {
           const wsClient = this.pool.getWsClient(sessionId);
           if (wsClient) {
-            wsClient.onEvent("plugin.approval.requested", (payload) => {
-              const p = payload as Record<string, unknown> | undefined;
-              const approvalId = String(p?.id ?? "");
-              const toolName = String(p?.toolName ?? p?.title ?? "");
-              const description = String(p?.description ?? "");
-              if (!approvalId) return;
-              const list = this.pendingApprovals.get(sessionId) ?? [];
-              list.push({ approvalId, sessionId, toolName, description, arrivedAt: Date.now() });
-              this.pendingApprovals.set(sessionId, list);
-              log.info(
-                { session_id: sessionId, tool_name: toolName, approval_id: approvalId },
-                "tool approval requested",
-              );
-            });
+            await this.ensureApprovalSubscriptions(sessionId, wsClient);
           }
         }
 
@@ -1709,6 +1856,18 @@ type ChatCompletionResponse = {
   choices?: Array<{ message?: { content?: string } }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
 
 export type RouterErrorCode =
   | "agent_not_found"

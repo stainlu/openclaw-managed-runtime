@@ -353,6 +353,16 @@ export class GatewayWebSocketClient {
   }
 
   /**
+   * Return the gateway's current pending plugin approvals for this
+   * container. Used to rehydrate approval state after reconnect/adopt
+   * and to recover from missed broadcasts.
+   */
+  async approvalList(): Promise<unknown[]> {
+    const payload = await this.request("plugin.approval.list", {});
+    return Array.isArray(payload) ? payload : [];
+  }
+
+  /**
    * Close the underlying socket and reject every outstanding request. Safe
    * to call more than once. After close(), the client cannot be reused.
    */

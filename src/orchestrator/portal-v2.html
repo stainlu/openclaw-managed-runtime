@@ -735,18 +735,7 @@ function asDesignSession(s, agentById, environmentById) {
   const quota = agent?.quota || {};
   const tokensCap = quota.maxTokensPerSession ?? 50_000;
   const costCap = quota.maxCostUsdPerSession ?? 1.00;
-  // pool_source on the response is one of: cold, warm, limited, adopt
-  // (null when no live container, e.g. idle+reaped). Map to a label
-  // the design chose: "warm-reuse" for warm, otherwise the verb.
-  const poolLabel = s.pool_source === 'warm'
-    ? 'warm-reuse'
-    : s.pool_source === 'cold'
-      ? 'cold'
-      : s.pool_source === 'limited'
-        ? 'limited'
-        : s.pool_source === 'adopt'
-          ? 'adopted'
-          : s.status === 'running' ? 'booting...' : 'no container';
+  const poolLabel = poolLabelFromRaw(status, s.pool_source || null);
   return {
     id: s.session_id,
     agent: agent?.name || s.agent_id.replace(/^agt_/, ''),
@@ -792,6 +781,18 @@ function asDesignSession(s, agentById, environmentById) {
   };
 }
 
+function poolLabelFromRaw(status, poolSource) {
+  return poolSource === 'warm'
+    ? 'warm-reuse'
+    : poolSource === 'cold'
+      ? 'cold'
+      : poolSource === 'limited'
+        ? 'limited'
+        : poolSource === 'adopt'
+          ? 'adopted'
+          : status === 'running' ? 'booting...' : 'no container';
+}
+
 function asDesignEvent(e, anchorTs) {
   const offsetMs = Math.max(0, e.created_at - anchorTs);
   const totalS = offsetMs / 1000;
@@ -819,7 +820,25 @@ function asDesignEvent(e, anchorTs) {
     return { ...base, actor: e.tool_name || 'tool', toolUseId: e.tool_call_id, summary, isError: !!e.is_error };
   }
   if (e.type === 'agent.tool_confirmation_request') {
-    return { ...base, actor: 'orchestrator', toolUseId: e.approval_id || e.tool_call_id, policy: 'always_ask', prompt: contentStr };
+    return {
+      ...base,
+      actor: 'orchestrator',
+      approvalId: e.approval_id,
+      toolCallId: e.tool_call_id,
+      toolUseId: e.approval_id || e.tool_call_id,
+      policy: 'always_ask',
+      prompt: contentStr,
+    };
+  }
+  if (e.type === 'session.container_attached' || e.type === 'session.container_detached') {
+    return {
+      ...base,
+      actor: 'orchestrator',
+      containerId: e.container_id || null,
+      containerName: e.container_name || null,
+      poolSource: e.pool_source || null,
+      bootMs: typeof e.boot_ms === 'number' ? e.boot_ms : null,
+    };
   }
   if (e.type.startsWith('session.')) return { ...base, actor: 'orchestrator' };
   return { ...base, actor: 'system', text: contentStr };
@@ -854,6 +873,23 @@ let LIVE_EVENT_STREAM = null; // EventSource or null
 let LIVE_EVENT_ANCHOR = null;
 let SEEN_EVENT_IDS = new Set();
 let _onUserMessageEvent = null;
+
+function syncSessionDerived(session) {
+  session.container = session.containerName || (session.containerId ? session.containerId.slice(0, 12) : '—');
+  session.pool = poolLabelFromRaw(session.status, session.poolSource || null);
+  return session;
+}
+
+function patchLiveSession(sessionId, patch) {
+  const idx = SESSIONS.findIndex((s) => s.id === sessionId);
+  if (idx === -1) return;
+  const next = {
+    ...SESSIONS[idx],
+    ...patch,
+  };
+  syncSessionDerived(next);
+  SESSIONS[idx] = next;
+}
 
 async function pumpAgents() {
   if (AUTH.required && !AUTH.token) return;
@@ -1019,6 +1055,8 @@ const SSE_EVENT_TYPES = [
   'session.status_idle',
   'session.status_running',
   'session.status_failed',
+  'session.container_attached',
+  'session.container_detached',
   'session.model_change',
   'session.thinking_level_change',
   'user.message',
@@ -1057,6 +1095,26 @@ function openEventStream(sid) {
       data.created_at = typeof data.ts === 'number' ? data.ts : Date.now();
     }
     const eid = data.event_id || '';
+    if (data.type && data.type.startsWith('session.status_')) {
+      patchLiveSession(sid, {
+        status: data.type.replace(/^session\.status_/, ''),
+        lastEventAt: data.created_at || Date.now(),
+      });
+    } else if (data.type === 'session.container_attached') {
+      patchLiveSession(sid, {
+        containerId: data.container_id || null,
+        containerName: data.container_name || null,
+        poolSource: data.pool_source || null,
+        bootMs: typeof data.boot_ms === 'number' ? data.boot_ms : null,
+      });
+    } else if (data.type === 'session.container_detached') {
+      patchLiveSession(sid, {
+        containerId: null,
+        containerName: null,
+        poolSource: null,
+        bootMs: null,
+      });
+    }
     if (eid && SEEN_EVENT_IDS.has(eid)) return;
     if (eid) SEEN_EVENT_IDS.add(eid);
     // Dedup status events by type — heartbeat can re-emit the same
@@ -2108,6 +2166,8 @@ function EventRow({ e, streaming, session }) {
   const kindTone = {
     'session.status_running':  { tag: 'status', c: 'var(--ink-3)' },
     'session.status_failed':   { tag: 'status', c: 'var(--lobster)' },
+    'session.container_attached': { tag: 'container', c: 'var(--ink-3)' },
+    'session.container_detached': { tag: 'container', c: 'var(--ink-4)' },
     'user.message':            { tag: 'user',   c: 'var(--ink)' },
     'agent.thinking':          { tag: 'think',  c: 'var(--ink-3)' },
     'agent.message':           { tag: 'reply',  c: 'var(--ink)' },
@@ -2173,6 +2233,33 @@ function EventRow({ e, streaming, session }) {
           ) : (
             <>Session state · {poolLabel}</>
           )}
+        </span>
+      </Row>
+    );
+  }
+  if (e.type === 'session.container_attached') {
+    const containerName = e.containerName || (e.containerId ? e.containerId.slice(0, 12) : '—');
+    const poolLabel =
+      e.poolSource === 'warm' ? 'warm-pool reuse' :
+      e.poolSource === 'cold' ? 'cold spawn' :
+      e.poolSource === 'limited' ? 'cold spawn · limited' :
+      e.poolSource === 'adopt' ? 'adopted on restart' :
+      'attached';
+    return (
+      <Row>
+        <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+          Container <code>{containerName}</code> attached · {poolLabel}
+          {typeof e.bootMs === 'number' && e.bootMs > 0 && <> · {(e.bootMs / 1000).toFixed(1)}s boot</>}
+          {e.bootMs === 0 && e.poolSource === 'warm' && <> · 0.0s boot</>}
+        </span>
+      </Row>
+    );
+  }
+  if (e.type === 'session.container_detached') {
+    return (
+      <Row>
+        <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+          Container released
         </span>
       </Row>
     );
@@ -2393,17 +2480,18 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
   const latestReq = EVENTS.slice().reverse().find((e) => e.type === 'agent.tool_confirmation_request');
   const resolvedForThis =
     !!latestReq &&
+    ctx?.approval?.sessionId === s.id &&
     ctx?.approval?.toolUseId === latestReq.toolUseId &&
     (ctx.approval.status === 'approved' || ctx.approval.status === 'denied');
   const awaiting = rawStatus === 'running' && !!latestReq && !resolvedForThis;
   const effectiveStatus = awaiting ? 'awaiting' : rawStatus;
   // Decorate the matching agent.tool_use event with `needsApproval:
   // true` so EventRow can render the grey `pending` chip next to the
-  // tool card. Matches on tool_call_id (the stable link between a
-  // tool_use, its confirmation_request, and the eventual tool_result).
+  // tool card. Match on tool_call_id; approval_id is the resolver key
+  // for POST /user.tool_confirmation, not the tool-call linkage key.
   const events = latestReq && !resolvedForThis
     ? EVENTS.map((ev) =>
-        ev.type === 'agent.tool_use' && ev.toolUseId === latestReq.toolUseId
+        ev.type === 'agent.tool_use' && latestReq.toolCallId && ev.toolUseId === latestReq.toolCallId
           ? { ...ev, needsApproval: true }
           : ev,
       )
@@ -3913,10 +4001,10 @@ function AppProvider({ children }) {
   }
 
   async function resolveApproval(sid, decision) {
-    if (approval.status !== 'pending') return;
+    if (approval.status === 'submitting') return;
     // Grab the pending approval id BEFORE firing so we can stash it on
     // the approval state. That lets the awaiting-derivation compare
-    // the latest request's toolUseId against the last-resolved one —
+    // the latest request's approval id against the last-resolved one —
     // if a fresh confirmation_request arrives with a different id,
     // the session goes awaiting again without needing a manual reset.
     const pendingReq = EVENTS.slice().reverse().find((e) => e.type === 'agent.tool_confirmation_request');
@@ -3924,7 +4012,7 @@ function AppProvider({ children }) {
       pushToast({ method: 'POST', path: `/v1/sessions/${sid}/events`, status: 0, ms: 0, label: 'no pending approval' });
       return;
     }
-    setApproval({ status: decision, at: Date.now(), toolUseId: pendingReq.toolUseId });
+    setApproval({ status: 'submitting', at: Date.now(), sessionId: sid, toolUseId: pendingReq.toolUseId });
     const startedAt = Date.now();
     const tid = pushToast({
       method: 'POST', path: `/v1/sessions/${sid}/events`,
@@ -3940,11 +4028,32 @@ function AppProvider({ children }) {
         }),
       });
       const ms = Date.now() - startedAt;
-      setToasts((ts) => ts.map((x) => x.id === tid ? { ...x, status: res.status, ms, pending: false } : x));
+      let body = {};
+      try {
+        body = await res.clone().json();
+      } catch {}
+      if (res.ok) {
+        setApproval({ status: decision, at: Date.now(), sessionId: sid, toolUseId: pendingReq.toolUseId });
+      } else {
+        setApproval({ status: 'pending' });
+      }
+      setToasts((ts) => ts.map((x) => x.id === tid ? {
+        ...x,
+        status: res.status,
+        ms,
+        pending: false,
+        label: res.ok ? x.label : (body.message || body.error || `HTTP ${res.status}`),
+      } : x));
     } catch (err) {
       const ms = Date.now() - startedAt;
       setApproval({ status: 'pending' }); // roll back local state on failure
-      setToasts((ts) => ts.map((x) => x.id === tid ? { ...x, status: 0, ms, pending: false, label: 'network error' } : x));
+      setToasts((ts) => ts.map((x) => x.id === tid ? {
+        ...x,
+        status: 0,
+        ms,
+        pending: false,
+        label: err?.message || 'network error',
+      } : x));
     }
   }
 
@@ -4637,6 +4746,14 @@ function ApprovalRow({ e }) {
   const ctx = useApp();
   const a = ctx?.approval || { status: 'pending' };
   const always = ctx?.alwaysAllow?.[e.toolName || e.tool || 'tool'];
+  const isResolvedForThis =
+    a.sessionId === LIVE_SELECTED_SESSION &&
+    a.toolUseId === (e.approvalId || e.toolUseId) &&
+    (a.status === 'approved' || a.status === 'denied');
+  const isSubmittingThis =
+    a.sessionId === LIVE_SELECTED_SESSION &&
+    a.toolUseId === (e.approvalId || e.toolUseId) &&
+    a.status === 'submitting';
 
   // When the user has resolved the approval locally, render a compact
   // muted marker where the pending card used to sit — just enough to
@@ -4644,7 +4761,7 @@ function ApprovalRow({ e }) {
   // tool_result. The real outcome flows in as a normal
   // agent.tool_result (approve path) or the agent's follow-up
   // agent.message (deny path) — no mock strings here.
-  if (a.status === 'approved' || a.status === 'denied') {
+  if (isResolvedForThis) {
     const isAllowed = a.status === 'approved';
     return (
       <div style={{
@@ -4685,8 +4802,10 @@ function ApprovalRow({ e }) {
         </div>
         <p style={{ margin: '6px 0 10px', fontSize: 13, color: 'var(--ink-2)', lineHeight: 1.5, maxWidth: '58ch' }}>{e.prompt}</p>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          <Button variant="hard" size="sm" icon="check" onClick={() => ctx.resolveApproval(LIVE_SELECTED_SESSION, 'approved')}>Approve</Button>
-          <Button variant="secondary" size="sm" onClick={() => ctx.resolveApproval(LIVE_SELECTED_SESSION, 'denied')}>Deny</Button>
+          <Button variant="hard" size="sm" icon="check" disabled={isSubmittingThis} onClick={() => ctx.resolveApproval(LIVE_SELECTED_SESSION, 'approved')}>
+            {isSubmittingThis ? 'Approving…' : 'Approve'}
+          </Button>
+          <Button variant="secondary" size="sm" disabled={isSubmittingThis} onClick={() => ctx.resolveApproval(LIVE_SELECTED_SESSION, 'denied')}>Deny</Button>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--ink-2)', cursor: 'pointer', paddingLeft: 4 }}>
             <input type="checkbox" checked={!!always} onChange={() => ctx.toggleAlwaysAllow(e.toolName || 'tool')}
               style={{ accentColor: 'var(--ink)' }} />

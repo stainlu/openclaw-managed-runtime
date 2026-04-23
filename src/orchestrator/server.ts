@@ -340,6 +340,14 @@ export function buildApp(deps: ServerDeps): Hono {
     return c.get("authRole") === "admin" ? null : (c.get("userId") ?? null);
   }
 
+  function getScopedSession(c: any, sessionId: string): Session | undefined {
+    const session = deps.sessions.get(sessionId);
+    if (!session) return undefined;
+    const userId = getUserId(c);
+    if (userId && session.userId !== userId) return undefined;
+    return session;
+  }
+
   // ---------- Auth endpoints (no /v1/ prefix — infrastructure, not API) ----------
 
   app.post("/auth/anonymous", async (c) => {
@@ -971,9 +979,10 @@ export function buildApp(deps: ServerDeps): Hono {
         parentSessionId,
         userId: getUserId(c) ?? undefined,
       });
-      // Proactive warm-up: start booting the container in the background
-      // so it's ready (or nearly ready) by the time the first event arrives.
-      // Fire-and-forget — failure is non-fatal; the first event cold-spawns.
+      // Proactive warm-up for sessions eligible to claim the generic
+      // template warm pool. Sessions with dedicated container config
+      // (vault creds, limited networking, package preinstalls) skip this
+      // and cold-spawn on first event instead. Fire-and-forget.
       addContext({ agentId: parsed.data.agentId, sessionId: session.sessionId });
       writeAudit(deps.audit, c, {
         action: "session.create",
@@ -1010,7 +1019,7 @@ export function buildApp(deps: ServerDeps): Hono {
 
   app.get("/v1/sessions/:sessionId", (c) => {
     const sessionId = c.req.param("sessionId");
-    const session = deps.sessions.get(sessionId);
+    const session = getScopedSession(c, sessionId);
     if (!session) {
       return c.json({ error: "session_not_found" }, 404);
     }
@@ -1019,7 +1028,7 @@ export function buildApp(deps: ServerDeps): Hono {
 
   app.delete("/v1/sessions/:sessionId", (c) => {
     const sessionId = c.req.param("sessionId");
-    const session = deps.sessions.get(sessionId);
+    const session = getScopedSession(c, sessionId);
     if (!session) {
       writeAudit(deps.audit, c, {
         action: "session.delete",
@@ -1045,6 +1054,9 @@ export function buildApp(deps: ServerDeps): Hono {
 
   app.post("/v1/sessions/:sessionId/events", async (c) => {
     const sessionId = c.req.param("sessionId");
+    if (!getScopedSession(c, sessionId)) {
+      return c.json({ error: "session_not_found" }, 404);
+    }
     const body = await c.req.json().catch(() => ({}));
     const parsed = PostEventRequestSchema.safeParse(body);
     if (!parsed.success) {
@@ -1093,6 +1105,14 @@ export function buildApp(deps: ServerDeps): Hono {
 
   app.post("/v1/sessions/:sessionId/cancel", async (c) => {
     const sessionId = c.req.param("sessionId");
+    if (!getScopedSession(c, sessionId)) {
+      writeAudit(deps.audit, c, {
+        action: "session.cancel",
+        target: sessionId,
+        outcome: "session_not_found",
+      });
+      return c.json({ error: "session_not_found" }, 404);
+    }
     try {
       const session = await deps.router.cancel(sessionId);
       writeAudit(deps.audit, c, {
@@ -1117,6 +1137,9 @@ export function buildApp(deps: ServerDeps): Hono {
 
   app.get("/v1/sessions/:sessionId/logs", async (c) => {
     const sessionId = c.req.param("sessionId");
+    if (!getScopedSession(c, sessionId)) {
+      return c.json({ error: "session_not_found" }, 404);
+    }
     const tailParam = c.req.query("tail");
     const tail = tailParam ? Math.max(1, Math.min(10_000, Number(tailParam) || 200)) : 200;
     try {
@@ -1129,6 +1152,14 @@ export function buildApp(deps: ServerDeps): Hono {
 
   app.post("/v1/sessions/:sessionId/compact", async (c) => {
     const sessionId = c.req.param("sessionId");
+    if (!getScopedSession(c, sessionId)) {
+      writeAudit(deps.audit, c, {
+        action: "session.compact",
+        target: sessionId,
+        outcome: "session_not_found",
+      });
+      return c.json({ error: "session_not_found" }, 404);
+    }
     try {
       const session = await deps.router.compact(sessionId);
       writeAudit(deps.audit, c, {
@@ -1153,7 +1184,7 @@ export function buildApp(deps: ServerDeps): Hono {
 
   app.get("/v1/sessions/:sessionId/events", (c) => {
     const sessionId = c.req.param("sessionId");
-    const session = deps.sessions.get(sessionId);
+    const session = getScopedSession(c, sessionId);
     if (!session) {
       return c.json({ error: "session_not_found" }, 404);
     }
@@ -1182,6 +1213,7 @@ export function buildApp(deps: ServerDeps): Hono {
         // Track session status so we can emit synthetic status events
         // when the session transitions between idle/running/failed.
         let lastEmittedStatus = session.status;
+        let lastContainerSig: string | null = null;
         const emitStatusEvent = async (status: string) => {
           if (sse.aborted || sse.closed) return;
           await sse.writeSSE({
@@ -1193,10 +1225,53 @@ export function buildApp(deps: ServerDeps): Hono {
             }),
           });
         };
+        const emitContainerEventIfChanged = async () => {
+          if (sse.aborted || sse.closed) return;
+          const current = deps.sessionContainers.get(sessionId);
+          const sig = current
+            ? [
+                current.containerId,
+                current.containerName,
+                current.poolSource,
+                current.bootMs ?? "",
+                current.claimedAt,
+              ].join("|")
+            : null;
+          if (sig === lastContainerSig) return;
+          // Don't emit an initial "detached" frame for the common case
+          // where the stream opens before acquire has claimed anything.
+          if (!current && lastContainerSig === null) return;
+          lastContainerSig = sig;
+          if (!current) {
+            await sse.writeSSE({
+              event: "session.container_detached",
+              data: JSON.stringify({
+                session_id: sessionId,
+                type: "session.container_detached",
+                created_at: Date.now(),
+              }),
+            });
+            return;
+          }
+          await sse.writeSSE({
+            event: "session.container_attached",
+            id: `container:${current.containerId}:${current.claimedAt}`,
+            data: JSON.stringify({
+              session_id: sessionId,
+              type: "session.container_attached",
+              created_at: current.claimedAt,
+              container_id: current.containerId,
+              container_name: current.containerName,
+              pool_source: current.poolSource,
+              boot_ms: current.bootMs,
+            }),
+          });
+        };
 
         // Emit the initial session status so the client knows the
         // starting state without having to query GET /v1/sessions/:id.
         await emitStatusEvent(lastEmittedStatus);
+        await emitContainerEventIfChanged();
 
         // Track emitted approval IDs to avoid duplicates.
         const emittedApprovalIds = new Set<string>();
@@ -1215,6 +1290,7 @@ export function buildApp(deps: ServerDeps): Hono {
                 content: approval.description,
                 created_at: approval.arrivedAt,
                 tool_name: approval.toolName,
+                tool_call_id: approval.toolCallId,
                 approval_id: approval.approvalId,
               }),
             });
@@ -1234,6 +1310,9 @@ export function buildApp(deps: ServerDeps): Hono {
               /* best-effort */
             });
           }
+          emitContainerEventIfChanged().catch(() => {
+            /* best-effort */
+          });
           emitPendingApprovals().catch(() => { /* best-effort */ });
           sse
             .writeSSE({
@@ -1265,6 +1344,7 @@ export function buildApp(deps: ServerDeps): Hono {
               lastEmittedStatus = current.status;
               await emitStatusEvent(lastEmittedStatus);
             }
+            await emitContainerEventIfChanged();
             await emitPendingApprovals();
 
             await sse.writeSSE({
@@ -1281,6 +1361,7 @@ export function buildApp(deps: ServerDeps): Hono {
           if (finalSession && finalSession.status !== lastEmittedStatus) {
             await emitStatusEvent(finalSession.status);
           }
+          await emitContainerEventIfChanged();
         } finally {
           clearInterval(heartbeat);
         }
@@ -1403,6 +1484,7 @@ export function buildApp(deps: ServerDeps): Hono {
     // Session resolution.
     const headerSessionKey = c.req.header("x-openclaw-session-key");
     const sessionKey = headerSessionKey ?? body.user;
+    const callerUserId = getUserId(c) ?? undefined;
     let session: Session;
     let isEphemeral = false;
 
@@ -1421,6 +1503,17 @@ export function buildApp(deps: ServerDeps): Hono {
       }
       const existing = deps.sessions.get(sessionKey);
       if (existing) {
+        if (callerUserId && existing.userId !== callerUserId) {
+          return c.json(
+            {
+              error: {
+                message: `session ${sessionKey} not found`,
+                type: "not_found_error",
+              },
+            },
+            404,
+          );
+        }
         if (existing.agentId !== agentId) {
           return c.json(
             {
@@ -1447,6 +1540,7 @@ export function buildApp(deps: ServerDeps): Hono {
           sessionId: sessionKey,
           ephemeral: false,
           remainingSubagentDepth: agent.maxSubagentDepth,
+          userId: callerUserId,
         });
       }
     } else {
@@ -1454,6 +1548,7 @@ export function buildApp(deps: ServerDeps): Hono {
         agentId,
         ephemeral: true,
         remainingSubagentDepth: agent.maxSubagentDepth,
+        userId: callerUserId,
       });
       isEphemeral = true;
     }
@@ -1723,7 +1818,7 @@ export function buildApp(deps: ServerDeps): Hono {
     try {
       let session: Session;
       if (parsed.data.sessionId) {
-        const existing = deps.sessions.get(parsed.data.sessionId);
+        const existing = getScopedSession(c, parsed.data.sessionId);
         if (!existing) {
           return c.json({ error: "session_not_found" }, 404);
         }
@@ -1732,7 +1827,9 @@ export function buildApp(deps: ServerDeps): Hono {
         }
         session = existing;
       } else {
-        session = deps.router.createSession(agentId);
+        session = deps.router.createSession(agentId, {
+          userId: getUserId(c) ?? undefined,
+        });
       }
       const result = await deps.router.runEvent({
         sessionId: session.sessionId,

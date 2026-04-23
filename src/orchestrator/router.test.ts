@@ -536,3 +536,138 @@ describe("AgentRouter.getPendingApprovals", () => {
     expect(router.getPendingApprovals("ses_whatever")).toEqual([]);
   });
 });
+
+class FakeApprovalWs {
+  readonly listeners = new Map<string, Set<(payload: unknown) => void>>();
+  pending: unknown[] = [];
+  resolveImpl: (id: string, decision: string) => Promise<void> = async () => {};
+
+  onEvent(eventName: string, handler: (payload: unknown) => void): () => void {
+    const set = this.listeners.get(eventName) ?? new Set<(payload: unknown) => void>();
+    set.add(handler);
+    this.listeners.set(eventName, set);
+    return () => {
+      set.delete(handler);
+      if (set.size === 0) this.listeners.delete(eventName);
+    };
+  }
+
+  async approvalList(): Promise<unknown[]> {
+    return this.pending;
+  }
+
+  async approvalResolve(id: string, decision: string): Promise<void> {
+    await this.resolveImpl(id, decision);
+  }
+
+  emit(eventName: string, payload: unknown): void {
+    for (const handler of this.listeners.get(eventName) ?? []) {
+      handler(payload);
+    }
+  }
+
+  listenerCount(eventName: string): number {
+    return this.listeners.get(eventName)?.size ?? 0;
+  }
+}
+
+describe("AgentRouter approval flow", () => {
+  it("keeps a pending approval when approvalResolve fails", async () => {
+    const fakeWs = new FakeApprovalWs();
+    fakeWs.resolveImpl = async () => {
+      throw new Error("ws down");
+    };
+    const { router } = makeRouter({
+      poolStub: {
+        getWsClient: () => fakeWs as unknown as GatewayWebSocketClient,
+      },
+    });
+    (router as any).pendingApprovals.set("ses_1", [{
+      approvalId: "ap_1",
+      sessionId: "ses_1",
+      toolName: "write",
+      toolCallId: "call_1",
+      description: "write file?",
+      arrivedAt: 1,
+    }]);
+
+    await expect(router.confirmTool("ses_1", "ap_1", "allow")).rejects.toMatchObject({
+      name: "RouterError",
+      code: "confirm_tool_failed",
+    });
+    expect(router.getPendingApprovals("ses_1")).toHaveLength(1);
+    expect(router.getPendingApprovals("ses_1")[0]?.approvalId).toBe("ap_1");
+  });
+
+  it("rehydrates pending approvals from the gateway list with toolCallId metadata", async () => {
+    const fakeWs = new FakeApprovalWs();
+    fakeWs.pending = [{
+      id: "ap_1",
+      createdAtMs: 123,
+      request: {
+        toolName: "write",
+        toolCallId: "call_1",
+        description: "The agent wants to write a file.",
+      },
+    }];
+    const { router } = makeRouter();
+
+    await (router as any).ensureApprovalSubscriptions(
+      "ses_1",
+      fakeWs as unknown as GatewayWebSocketClient,
+    );
+
+    expect(router.getPendingApprovals("ses_1")).toEqual([{
+      approvalId: "ap_1",
+      sessionId: "ses_1",
+      toolName: "write",
+      toolCallId: "call_1",
+      description: "The agent wants to write a file.",
+      arrivedAt: 123,
+    }]);
+  });
+
+  it("deduplicates approval listeners per session and clears on resolved events", async () => {
+    const fakeWs = new FakeApprovalWs();
+    const { router } = makeRouter();
+
+    await (router as any).ensureApprovalSubscriptions(
+      "ses_1",
+      fakeWs as unknown as GatewayWebSocketClient,
+    );
+    await (router as any).ensureApprovalSubscriptions(
+      "ses_1",
+      fakeWs as unknown as GatewayWebSocketClient,
+    );
+
+    expect(fakeWs.listenerCount("plugin.approval.requested")).toBe(1);
+    expect(fakeWs.listenerCount("plugin.approval.resolved")).toBe(1);
+
+    fakeWs.emit("plugin.approval.requested", {
+      id: "ap_1",
+      createdAtMs: 123,
+      request: {
+        title: "Tool requires confirmation: write",
+        toolName: "write",
+        toolCallId: "call_1",
+        description: "desc",
+      },
+    });
+    fakeWs.emit("plugin.approval.requested", {
+      id: "ap_1",
+      createdAtMs: 124,
+      request: {
+        title: "Tool requires confirmation: write",
+        toolName: "write",
+        toolCallId: "call_1",
+        description: "desc",
+      },
+    });
+
+    expect(router.getPendingApprovals("ses_1")).toHaveLength(1);
+    expect(router.getPendingApprovals("ses_1")[0]?.toolCallId).toBe("call_1");
+
+    fakeWs.emit("plugin.approval.resolved", { id: "ap_1", decision: "allow-once" });
+    expect(router.getPendingApprovals("ses_1")).toEqual([]);
+  });
+});
