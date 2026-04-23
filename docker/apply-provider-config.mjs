@@ -153,6 +153,29 @@ if (overrides && overrides[providerId] && Array.isArray(providerConfig.models)) 
       `[apply-provider-config] applied price overrides to ${patched} ${providerId} model(s) from provider-prices.json\n`,
     );
   }
+  // Inject models that exist in the price table but not yet in the
+  // bundled catalog (e.g. kimi-k2.6 released after the pinned openclaw
+  // version). Without this, new models work at runtime but report $0.
+  const knownIds = new Set(providerConfig.models.map((m) => m.id));
+  let injected = 0;
+  for (const [modelId, row] of Object.entries(table)) {
+    if (knownIds.has(modelId)) continue;
+    providerConfig.models.push({
+      id: modelId,
+      cost: {
+        input: row.input ?? 0,
+        output: row.output ?? 0,
+        cacheRead: row.cacheRead ?? 0,
+        cacheWrite: row.cacheWrite ?? 0,
+      },
+    });
+    injected++;
+  }
+  if (injected > 0) {
+    process.stdout.write(
+      `[apply-provider-config] injected ${injected} missing ${providerId} model(s) from provider-prices.json\n`,
+    );
+  }
 }
 
 writeFileSync(configPath, JSON.stringify(cfg, null, 2), "utf8");
