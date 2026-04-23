@@ -2310,6 +2310,8 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
   const ctx = useApp();
   const scrollRef = useRefDetail(null);
   const stickToBottom = useRefDetail(true);
+  const s = SESSIONS.find((x) => x.id === sessionId) || SESSIONS[0];
+  const isRunning = s?.status === 'running';
   useEffectDetail(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -2320,12 +2322,10 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
   useEffectDetail(() => {
-    if (stickToBottom.current && scrollRef.current) {
+    if ((isRunning || stickToBottom.current) && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [streamLen]);
-
-  const s = SESSIONS.find((x) => x.id === sessionId) || SESSIONS[0];
+  }, [streamLen, isRunning]);
 
   // Empty-state guard: the first render after a fresh page load runs
   // before pumpSessions has any data, so `s` is undefined. The design
@@ -3845,7 +3845,7 @@ function AppProvider({ children }) {
     const body = {
       model: cfg.model,
       instructions: cfg.instructions || `You are ${cfg.name || 'an agent'}.`,
-      tools: cfg.tools || [],
+      tools: cfg.tools?.length === 6 ? [] : (cfg.tools || []),
     };
     // Optional schema field: stable display name. Omit when empty so
     // the schema's optional() branch fires rather than sending "".
@@ -4078,7 +4078,8 @@ function CreateAgentModal() {
   // toggle pills, or leave empty (any registered tool can run) — the
   // `valid` guard still requires at least one because the deny-policy
   // branch needs a non-empty list.
-  const [tools, setTools] = useState([]);
+  const allTools = ['exec', 'read', 'write', 'edit', 'apply_patch', 'web_search'];
+  const [tools, setTools] = useState([...allTools]);
   const [mcp, setMcp] = useState([]);
   const [policy, setPolicy] = useState('always_ask');
   const [submitting, setSubmitting] = useState(false);
@@ -4094,7 +4095,6 @@ function CreateAgentModal() {
   // anything at runtime. Custom tools added via plugins would also
   // register under their own names but are out of scope for the
   // one-click modal.
-  const allTools = ['exec', 'read', 'write', 'edit', 'apply_patch', 'web_search'];
   // One-click MCP endpoints. Kept to the three with verified hosted
   // endpoints (see KNOWN_MCP_URLS in createAgent). Slack / Postgres
   // are stdio-only and need env-based config, so they don't belong
@@ -4119,7 +4119,7 @@ function CreateAgentModal() {
       // Success → provider closes the modal; reset state here so the
       // next open starts fresh.
       setName(''); setInstructions('');
-      setTools([]); setMcp([]);
+      setTools([...allTools]); setMcp([]);
       setPolicy('always_ask');
       setError(null);
     } else {
@@ -4229,7 +4229,7 @@ function CreateAgentModal() {
           </div>
 
           <div>
-            <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Tools · {tools.length === 0 ? 'all (default)' : tools.length + ' selected'}</label>
+            <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Tools · {tools.length === allTools.length ? 'all (default)' : tools.length + ' selected'}</label>
             <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
               {allTools.map(t => <Toggle key={t} set={setTools} arr={tools} item={t} />)}
             </div>
