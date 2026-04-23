@@ -4337,6 +4337,7 @@ function CreateAgentModal() {
                 { label: 'Qwen', models: ['qwen/qwen-3.6-plus'] },
                 { label: 'MiniMax', models: ['minimax/minimax-m2.7', 'minimax/minimax-m2.5'] },
                 { label: 'GLM', models: ['glm/glm-5.1', 'glm/glm-5'] },
+                { label: 'Tencent', models: ['tencent/hy3-preview'] },
               ].map(g => (
                 <div key={g.label} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                   <Mono s={9} c="var(--ink-4)" style={{ width: 52, flexShrink: 0 }}>{g.label}</Mono>
