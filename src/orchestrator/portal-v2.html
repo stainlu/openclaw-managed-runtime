@@ -746,7 +746,7 @@ function asDesignSession(s, agentById, environmentById) {
         ? 'limited'
         : s.pool_source === 'adopt'
           ? 'adopted'
-          : 'no container';
+          : s.status === 'running' ? 'booting...' : 'no container';
   return {
     id: s.session_id,
     agent: agent?.name || s.agent_id.replace(/^agt_/, ''),
@@ -1761,11 +1761,8 @@ function NewSessionPanel({ onCreate, onCancel }) {
     }
   }
 
-  // Auto-focus the textarea on mount so users can start typing immediately.
-  useEffect(() => {
-    const t = setTimeout(() => textareaRef.current?.focus(), 60);
-    return () => clearTimeout(t);
-  }, []);
+  // No auto-focus — the panel should start scrolled to the top (Agent
+  // picker). The user scrolls down to the message textarea naturally.
 
   return (
     <div style={{
