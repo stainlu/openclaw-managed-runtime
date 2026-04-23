@@ -2308,6 +2308,9 @@ function SessionDetail({ sessionId, sessionState, streamLen }) {
   // hooks (useApp, useRef, useEffect) BEFORE any early return, or
   // React throws a "change in the order of Hooks called" warning.
   const ctx = useApp();
+  useEffectDetail(() => {
+    ctx?.clearCancelState?.();
+  }, [sessionId]);
   const scrollRef = useRefDetail(null);
   const stickToBottom = useRefDetail(true);
   const s = SESSIONS.find((x) => x.id === sessionId) || SESSIONS[0];
@@ -4099,7 +4102,7 @@ function AppProvider({ children }) {
     sentMessages, sendMessage,
     approval, resolveApproval,
     alwaysAllow, toggleAlwaysAllow,
-    cancelState, cancelSession, restartSession,
+    cancelState, cancelSession, restartSession, clearCancelState: () => setCancelState(null),
     toasts, pushToast, dismissToast,
     createOpen, setCreateOpen,
     createEnvOpen, setCreateEnvOpen, createEnvironment,
