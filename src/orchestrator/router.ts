@@ -466,6 +466,20 @@ export class AgentRouter {
   }
 
   /**
+   * Tear down any live runtime resources for a session without deleting the
+   * session metadata itself. Used by DELETE /v1/sessions so the container,
+   * queue, pending approvals, and persistent session↔container mapping do
+   * not outlive the session row.
+   */
+  async disposeSessionRuntime(sessionId: string): Promise<void> {
+    this.cancelledDuringAcquire.delete(sessionId);
+    this.queue.clear(sessionId);
+    this.pendingApprovals.delete(sessionId);
+    this.clearApprovalSubscriptions(sessionId);
+    await this.pool.evictSession(sessionId);
+  }
+
+  /**
    * Post a user.message to an existing session. Behavior depends on
    * session status:
    *

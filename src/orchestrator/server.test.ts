@@ -12,6 +12,7 @@ function makeApp() {
   const routerCalls = {
     warmForAgent: [] as string[],
     dropWarmForAgent: [] as string[],
+    disposeSessionRuntime: [] as string[],
   };
 
   const events = {
@@ -65,6 +66,10 @@ function makeApp() {
     },
     async dropWarmForAgent(agentId: string) {
       routerCalls.dropWarmForAgent.push(agentId);
+      return;
+    },
+    async disposeSessionRuntime(sessionId: string) {
+      routerCalls.disposeSessionRuntime.push(sessionId);
       return;
     },
     async runEvent(args: { sessionId: string; content: string }) {
@@ -337,5 +342,23 @@ describe("session ownership in the HTTP API", () => {
     expect(routerCalls.dropWarmForAgent).toEqual([agent.agentId]);
     expect(routerCalls.warmForAgent).toContain(agent.agentId);
     expect(store.agents.get(agent.agentId)?.model).toBe("openai/gpt-5.4");
+  });
+
+  it("evicts live runtime state before deleting a session", async () => {
+    const { app, store, routerCalls } = makeApp();
+    const agent = createAgent(store);
+    const session = store.sessions.create({
+      agentId: agent.agentId,
+      userId: null,
+    });
+
+    const res = await req(app, `/v1/sessions/${session.sessionId}`, {
+      method: "DELETE",
+      token: "admin-secret",
+    });
+
+    expect(res.status).toBe(200);
+    expect(routerCalls.disposeSessionRuntime).toEqual([session.sessionId]);
+    expect(store.sessions.get(session.sessionId)).toBeUndefined();
   });
 });

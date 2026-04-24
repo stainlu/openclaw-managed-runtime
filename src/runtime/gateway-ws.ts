@@ -105,6 +105,10 @@ export class GatewayWebSocketClient {
 
   constructor(private readonly cfg: GatewayWsConfig) {}
 
+  isConnected(): boolean {
+    return this.connected && !this.closed;
+  }
+
   /**
    * Subscribe to gateway broadcast events. Returns an unsubscribe function.
    * Used by the orchestrator to listen for `plugin.approval.requested`

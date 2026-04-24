@@ -677,6 +677,9 @@ export function buildApp(deps: ServerDeps): Hono {
       outcome: archived ? "ok" : "agent_not_found",
     });
     if (!archived) return c.json({ error: "agent_not_found" }, 404);
+    void deps.router.dropWarmForAgent(agentId).catch((err) => {
+      log.warn({ err, agent_id: agentId }, "drop-warm-for-agent after archive failed (non-fatal)");
+    });
     return c.json(agentResponse(archived));
   });
 
@@ -1036,7 +1039,7 @@ export function buildApp(deps: ServerDeps): Hono {
     return c.json(sessionResponse(session, deps.events, deps.sessionContainers));
   });
 
-  app.delete("/v1/sessions/:sessionId", (c) => {
+  app.delete("/v1/sessions/:sessionId", async (c) => {
     const sessionId = c.req.param("sessionId");
     const session = getScopedSession(c, sessionId);
     if (!session) {
@@ -1047,8 +1050,19 @@ export function buildApp(deps: ServerDeps): Hono {
       });
       return c.json({ error: "session_not_found" }, 404);
     }
-    // Drop the Pi JSONL + sessions.json entry on disk first, then the
-    // orchestrator-side metadata row.
+    // Tear down the live runtime first so sticky session containers do
+    // not outlive their session row. Only once the container is gone do
+    // we delete the persisted JSONL / metadata.
+    try {
+      await deps.router.disposeSessionRuntime(sessionId);
+    } catch (err) {
+      writeAudit(deps.audit, c, {
+        action: "session.delete",
+        target: sessionId,
+        outcome: err instanceof RouterError ? err.code : "error",
+      });
+      return handleRouterError(err, c);
+    }
     deps.events.deleteBySession(session.agentId, session.sessionId);
     deps.sessions.delete(sessionId);
     writeAudit(deps.audit, c, {

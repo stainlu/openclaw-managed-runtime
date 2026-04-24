@@ -9,14 +9,19 @@ vi.mock("./gateway-ws.js", () => {
   const instances: FakeWs[] = [];
   class FakeWs {
     readonly closeCount = { n: 0 };
+    private connected = false;
     constructor(public readonly cfg: unknown) {
       instances.push(this);
     }
     async connect(): Promise<void> {
-      /* noop */
+      this.connected = true;
     }
     async close(): Promise<void> {
+      this.connected = false;
       this.closeCount.n += 1;
+    }
+    isConnected(): boolean {
+      return this.connected;
     }
     async abort(): Promise<void> {
       /* noop */
@@ -413,6 +418,39 @@ describe("SessionContainerPool.warmForAgent", () => {
     expect(runtime.stopped.has("cnt_1")).toBe(true);
     await pool.shutdown();
   });
+
+  it("does not exceed maxWarmContainers when different agents warm concurrently", async () => {
+    const { pool, runtime } = makePool({ maxWarmContainers: 1 });
+    runtime.readyDelayMs = 25;
+
+    await Promise.all([
+      pool.warmForAgent("agt_a", baseSpawnOptions("warm-a")),
+      pool.warmForAgent("agt_b", baseSpawnOptions("warm-b")),
+    ]);
+
+    expect(runtime.calls.filter((c) => c.kind === "spawn")).toHaveLength(1);
+    await pool.shutdown();
+  });
+
+  it("cancels an inflight warm when dropWarmForAgent is called", async () => {
+    const { pool, runtime } = makePool();
+    runtime.readyDelayMs = 25;
+
+    const warming = pool.warmForAgent("agt_x", baseSpawnOptions());
+    await new Promise((r) => setImmediate(r));
+    await pool.dropWarmForAgent("agt_x");
+    await warming;
+
+    const c = await pool.acquireForSession({
+      sessionId: "ses_after_drop",
+      spawnOptions: baseSpawnOptions(),
+      agentId: "agt_x",
+    });
+
+    expect(c.id).toBe("cnt_2");
+    expect(runtime.stopped.has("cnt_1")).toBe(true);
+    await pool.shutdown();
+  });
 });
 
 describe("SessionContainerPool.evictSession", () => {
@@ -501,6 +539,29 @@ describe("SessionContainerPool.reapIdle", () => {
     await pool.shutdown();
   });
 
+  it("keeps sticky sessions alive when shouldReapSession returns false", async () => {
+    const { pool, runtime } = makePool({
+      idleTimeoutMs: 50,
+      shouldReapSession: (id) => id === "ses_ephemeral",
+    });
+    await pool.acquireForSession({
+      sessionId: "ses_sticky",
+      spawnOptions: baseSpawnOptions(),
+    });
+    await pool.acquireForSession({
+      sessionId: "ses_ephemeral",
+      spawnOptions: baseSpawnOptions(),
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    // @ts-expect-error — private reapIdle
+    await pool.reapIdle();
+    const sessionsLeft = pool.snapshot().map((e) => e.sessionId);
+    expect(sessionsLeft).toEqual(["ses_sticky"]);
+    expect(runtime.stopped.has("cnt_1")).toBe(false);
+    expect(runtime.stopped.has("cnt_2")).toBe(true);
+    await pool.shutdown();
+  });
+
   it("reaps warm containers past warmIdleTimeoutMs", async () => {
     const { pool, runtime } = makePool({
       idleTimeoutMs: 10 * 60_000,
@@ -533,6 +594,18 @@ describe("SessionContainerPool.shutdown", () => {
     // Both the active (cnt_1) and warm (cnt_2) were stopped.
     expect(runtime.stopped.has("cnt_1")).toBe(true);
     expect(runtime.stopped.has("cnt_2")).toBe(true);
+  });
+
+  it("waits for inflight warm boots and stops them during shutdown", async () => {
+    const { pool, runtime } = makePool();
+    runtime.readyDelayMs = 25;
+
+    const warming = pool.warmForAgent("agt_x", baseSpawnOptions());
+    await new Promise((r) => setImmediate(r));
+    await pool.shutdown();
+    await warming;
+
+    expect(runtime.stopped.has("cnt_1")).toBe(true);
   });
 });
 
@@ -772,6 +845,52 @@ describe("SessionContainerPool — networking: limited", () => {
     // Warm container wasn't claimed — we spawned a fresh sidecar AND
     // agent (+2 spawns), not just an agent (+1).
     expect(spawnsAfter - spawnsBefore).toBe(2);
+    await pool.shutdown();
+  });
+
+  it("falls back to a cold spawn when a claimed warm container is no longer ready", async () => {
+    const { pool, runtime } = makePool();
+    await pool.warmForAgent("agt_x", baseSpawnOptions());
+    const baseWaitForReady = runtime.waitForReady.bind(runtime);
+    runtime.waitForReady = async (container, timeoutMs) => {
+      if (container.id === "cnt_1") {
+        throw new Error("warm container is dead");
+      }
+      return baseWaitForReady(container, timeoutMs);
+    };
+
+    const c = await pool.acquireForSession({
+      sessionId: "ses_claim",
+      spawnOptions: baseSpawnOptions(),
+      agentId: "agt_x",
+    });
+
+    expect(c.id).toBe("cnt_2");
+    expect(runtime.stopped.has("cnt_1")).toBe(true);
+    await pool.shutdown();
+  });
+
+  it("cold-respawns when the existing active container fails the reuse probe", async () => {
+    const { pool, runtime } = makePool();
+    const first = await pool.acquireForSession({
+      sessionId: "ses_live",
+      spawnOptions: baseSpawnOptions(),
+    });
+    const baseWaitForReady = runtime.waitForReady.bind(runtime);
+    runtime.waitForReady = async (container, timeoutMs) => {
+      if (container.id === first.id) {
+        throw new Error("active container is dead");
+      }
+      return baseWaitForReady(container, timeoutMs);
+    };
+
+    const second = await pool.acquireForSession({
+      sessionId: "ses_live",
+      spawnOptions: baseSpawnOptions(),
+    });
+
+    expect(second.id).toBe("cnt_2");
+    expect(runtime.stopped.has(first.id)).toBe(true);
     await pool.shutdown();
   });
 });

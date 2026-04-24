@@ -160,6 +160,10 @@ async function main(): Promise<void> {
   const gatewayPort = envInt("OPENCLAW_GATEWAY_PORT", 18789);
   const readyTimeoutMs = envInt("OPENCLAW_READY_TIMEOUT_MS", 60_000);
   const runTimeoutMs = envInt("OPENCLAW_RUN_TIMEOUT_MS", 10 * 60_000);
+  // Idle reap now applies only to sessions the caller explicitly marks
+  // as reapable (today: ephemeral one-shot sessions). Sticky product
+  // sessions keep their owned container alive between turns until
+  // explicit teardown or process restart/adoption.
   const idleTimeoutMs = envInt("OPENCLAW_IDLE_TIMEOUT_MS", 10 * 60_000);
   const sweepIntervalMs = envInt("OPENCLAW_SWEEP_INTERVAL_MS", 60_000);
   // Warm pool is bounded so a host with many agent templates does not
@@ -246,11 +250,13 @@ async function main(): Promise<void> {
 
   // Per-session container pool. isBusy closes over the session store so the
   // sweeper can skip containers whose session currently has a run in flight
-  // — the pool itself has no store dependency. cleanupOnReap closes over
-  // BOTH the store and the JSONL reader so it can tear down ephemeral
-  // sessions (auto-created by keyless POST /v1/chat/completions) along with
-  // their container. Called only on the idle-reap path; manual evictSession
-  // and shutdown paths preserve session data.
+  // — the pool itself has no store dependency. shouldReapSession marks only
+  // ephemeral sessions as eligible for idle reap; sticky sessions keep their
+  // container until explicit teardown. cleanupOnReap closes over BOTH the
+  // store and the JSONL reader so it can tear down those ephemeral sessions
+  // (auto-created by keyless POST /v1/chat/completions) along with their
+  // container. Called only on the idle-reap path; manual evictSession and
+  // shutdown paths preserve session data.
   const pool = new SessionContainerPool(runtime, {
     idleTimeoutMs,
     readyTimeoutMs,
@@ -258,6 +264,7 @@ async function main(): Promise<void> {
     maxWarmContainers,
     warmIdleTimeoutMs,
     isBusy: (sessionId) => store.sessions.get(sessionId)?.status === "running",
+    shouldReapSession: (sessionId) => store.sessions.get(sessionId)?.ephemeral === true,
     cleanupOnReap: async (sessionId) => {
       const session = store.sessions.get(sessionId);
       if (!session?.ephemeral) return;
