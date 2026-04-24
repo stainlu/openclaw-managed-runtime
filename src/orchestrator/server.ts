@@ -337,6 +337,16 @@ function eventResponse(event: Event) {
 }
 
 function handleRouterError(err: unknown, c: Context): Response {
+  const reply = routerErrorReply(err);
+  return c.json(reply.body, reply.status);
+}
+
+type JsonReply = {
+  status: 200 | 201 | 202 | 400 | 401 | 404 | 409 | 429 | 500 | 503;
+  body: Record<string, unknown>;
+};
+
+function routerErrorReply(err: unknown): JsonReply {
   if (err instanceof RouterError) {
     if (
       err.code === "agent_not_found" ||
@@ -344,34 +354,46 @@ function handleRouterError(err: unknown, c: Context): Response {
       err.code === "file_not_found" ||
       err.code === "vault_not_found"
     ) {
-      return c.json({ error: err.code, message: err.message }, 404);
+      return { status: 404, body: { error: err.code, message: err.message } };
     }
     if (err.code === "agent_archived") {
-      return c.json({ error: err.code, message: err.message }, 409);
+      return { status: 409, body: { error: err.code, message: err.message } };
     }
     if (err.code === "session_busy" || err.code === "session_not_running") {
-      return c.json({ error: err.code, message: err.message }, 409);
+      return { status: 409, body: { error: err.code, message: err.message } };
     }
     if (err.code === "capacity_exceeded") {
-      return c.json({ error: err.code, message: err.message }, 503);
+      return { status: 503, body: { error: err.code, message: err.message } };
     }
     if (err.code === "invalid_path") {
-      return c.json({ error: err.code, message: err.message }, 400);
+      return { status: 400, body: { error: err.code, message: err.message } };
     }
     if (err.code === "quota_exceeded") {
-      return c.json({ error: err.code, message: err.message }, 429);
+      return { status: 429, body: { error: err.code, message: err.message } };
     }
     if (err.code === "credential_expired") {
-      return c.json({ error: err.code, message: err.message }, 401);
+      return { status: 401, body: { error: err.code, message: err.message } };
     }
-    return c.json({ error: err.code, message: err.message }, 500);
+    return { status: 500, body: { error: err.code, message: err.message } };
   }
   const msg = err instanceof Error ? err.message : String(err);
-  return c.json({ error: "internal", message: msg }, 500);
+  return { status: 500, body: { error: "internal", message: msg } };
 }
 
 export function buildApp(deps: ServerDeps): Hono {
   const app = new Hono();
+  const EVENT_IDEMPOTENCY_TTL_MS = 5 * 60_000;
+  const eventReplyCache = new Map<
+    string,
+    JsonReply & { expiresAt: number }
+  >();
+  const eventInflight = new Map<string, Promise<JsonReply>>();
+
+  function reapExpiredEventReplies(now = Date.now()): void {
+    for (const [key, value] of eventReplyCache.entries()) {
+      if (value.expiresAt <= now) eventReplyCache.delete(key);
+    }
+  }
 
   // Register the observability middleware first so every downstream
   // handler (including SSE streams) runs inside the request-id scope
@@ -1139,43 +1161,85 @@ export function buildApp(deps: ServerDeps): Hono {
       return c.json({ error: "invalid_request", details: parsed.error.format() }, 400);
     }
     const event = parsed.data;
+    const idempotencyKey = c.req.header("Idempotency-Key")?.trim();
+    const requestKey = idempotencyKey ? `${sessionId}:${idempotencyKey}` : null;
+    if (requestKey) {
+      reapExpiredEventReplies();
+      const cached = eventReplyCache.get(requestKey);
+      if (cached) {
+        return c.json(cached.body, cached.status);
+      }
+      const inflight = eventInflight.get(requestKey);
+      if (inflight) {
+        const reply = await inflight;
+        return c.json(reply.body, reply.status);
+      }
+    }
     addContext({ sessionId });
     sessionEventsTotal.inc({ type: event.type });
 
-    // Tool confirmation flow — resolves a pending approval gate inside
-    // the container when the agent template has always_ask policy.
-    if (event.type === "user.tool_confirmation") {
-      try {
-        await deps.router.confirmTool(
-          sessionId,
-          event.toolUseId,
-          event.result,
-        );
-        return c.json({ session_id: sessionId, confirmed: true });
-      } catch (err) {
-        return handleRouterError(err, c);
+    const execute = async (): Promise<JsonReply> => {
+      // Tool confirmation flow — resolves a pending approval gate inside
+      // the container when the agent template has always_ask policy.
+      if (event.type === "user.tool_confirmation") {
+        try {
+          await deps.router.confirmTool(
+            sessionId,
+            event.toolUseId,
+            event.result,
+          );
+          return {
+            status: 200,
+            body: { session_id: sessionId, confirmed: true },
+          };
+        } catch (err) {
+          return routerErrorReply(err);
+        }
       }
+
+      // User message flow — triggers the agent loop.
+      try {
+        const result = await deps.router.runEvent({
+          sessionId,
+          content: event.content,
+          model: event.model,
+          thinkingLevel: event.thinkingLevel,
+        });
+        // The event id is Pi's — we don't know it until the JSONL is written.
+        // Clients that need to correlate this response with the persisted
+        // event should poll GET /v1/sessions/:sessionId/events once the
+        // session flips back to idle.
+        return {
+          status: 200,
+          body: {
+            session_id: result.session.sessionId,
+            session_status: result.session.status,
+            queued: result.queued,
+          },
+        };
+      } catch (err) {
+        return routerErrorReply(err);
+      }
+    };
+
+    if (!requestKey) {
+      const reply = await execute();
+      return c.json(reply.body, reply.status);
     }
 
-    // User message flow — triggers the agent loop.
+    const replyPromise = execute();
+    eventInflight.set(requestKey, replyPromise);
     try {
-      const result = await deps.router.runEvent({
-        sessionId,
-        content: event.content,
-        model: event.model,
-        thinkingLevel: event.thinkingLevel,
-      });
-      // The event id is Pi's — we don't know it until the JSONL is written.
-      // Clients that need to correlate this response with the persisted
-      // event should poll GET /v1/sessions/:sessionId/events once the
-      // session flips back to idle.
-      return c.json({
-        session_id: result.session.sessionId,
-        session_status: result.session.status,
-        queued: result.queued,
-      });
-    } catch (err) {
-      return handleRouterError(err, c);
+      const reply = await replyPromise;
+      if (reply.status < 500) {
+        eventReplyCache.set(requestKey, {
+          ...reply,
+          expiresAt: Date.now() + EVENT_IDEMPOTENCY_TTL_MS,
+        });
+      }
+      return c.json(reply.body, reply.status);
+    } finally {
+      eventInflight.delete(requestKey);
     }
   });
 

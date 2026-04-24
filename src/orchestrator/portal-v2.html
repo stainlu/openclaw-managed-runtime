@@ -3881,6 +3881,7 @@ function AppProvider({ children }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [createEnvOpen, setCreateEnvOpen] = useState(false);
   const [createVaultOpen, setCreateVaultOpen] = useState(false);
+  const pendingEventPostsRef = React.useRef(new Map());
   // agents is a LIVE view — just re-read the global AGENTS each
   // render. pushToast triggers re-renders; the pump's LIVE_BUS
   // subscription inside App() triggers the rest.
@@ -3899,18 +3900,29 @@ function AppProvider({ children }) {
   //     measured latency — same format the design spec called for.
 
   async function sendMessage(sid, text) {
-    if (!text.trim()) return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const pendingKey = `${sid}:${trimmed}`;
+    const pending = pendingEventPostsRef.current.get(pendingKey);
+    if (pending) {
+      return pending;
+    }
+    const idempotencyKey = 'evt_' + Math.random().toString(36).slice(2, 12);
     const id = 'ev_' + Math.random().toString(36).slice(2, 10);
     const startedAt = Date.now();
-    setSentMessages(m => [...m, { id, sid, text: text.trim(), at: new Date(), postedAt: startedAt, status: 'sending' }]);
+    setSentMessages(m => [...m, { id, sid, text: trimmed, at: new Date(), postedAt: startedAt, status: 'sending' }]);
     const tid = pushToast({
       method: 'POST', path: `/v1/sessions/${sid}/events`,
       label: 'user.message', status: null, ms: null, pending: true,
     });
-    try {
+    const req = (async () => {
       const res = await fetch(`/v1/sessions/${encodeURIComponent(sid)}/events`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'user.message', content: text.trim() }),
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+        },
+        body: JSON.stringify({ type: 'user.message', content: trimmed }),
       });
       const ms = Date.now() - startedAt;
       const ok = res.ok;
@@ -3947,11 +3959,19 @@ function AppProvider({ children }) {
           setSentMessages(m => m.filter(x => x.id !== id));
         }, 30_000);
       }
-    } catch (err) {
+      return res;
+    })().catch((err) => {
       const ms = Date.now() - startedAt;
       const msg = err?.message || 'network error';
       setSentMessages(m => m.map(x => x.id === id ? { ...x, status: 'failed', ms, error: msg } : x));
       setToasts(ts2 => ts2.map(x => x.id === tid ? { ...x, status: 0, ms, pending: false, label: msg } : x));
+      throw err;
+    });
+    pendingEventPostsRef.current.set(pendingKey, req);
+    try {
+      return await req;
+    } finally {
+      pendingEventPostsRef.current.delete(pendingKey);
     }
   }
 

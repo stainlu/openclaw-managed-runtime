@@ -254,6 +254,75 @@ async function req(
 }
 
 describe("session ownership in the HTTP API", () => {
+  it("deduplicates POST /events when Idempotency-Key repeats", async () => {
+    let calls = 0;
+    let releaseFirst: (() => void) | undefined;
+    const firstStarted = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const { app, store } = makeApp({
+      routerOverrides: {
+        async runEvent(args: { sessionId: string }) {
+          calls += 1;
+          if (calls === 1) {
+            await firstStarted;
+          }
+          const session = store.sessions.get(args.sessionId);
+          if (!session) {
+            throw new RouterError("session_not_found", `session ${args.sessionId} does not exist`);
+          }
+          return { session, queued: false };
+        },
+      } as Partial<ServerDeps["router"]>,
+    });
+    const agent = createAgent(store);
+    const session = store.sessions.create({
+      agentId: agent.agentId,
+      userId: null,
+    });
+
+    const headers = { "Idempotency-Key": "evt_same_turn" };
+    const p1 = req(app, `/v1/sessions/${session.sessionId}/events`, {
+      method: "POST",
+      token: "admin-secret",
+      headers,
+      body: { type: "user.message", content: "hi" },
+    });
+    const p2 = req(app, `/v1/sessions/${session.sessionId}/events`, {
+      method: "POST",
+      token: "admin-secret",
+      headers,
+      body: { type: "user.message", content: "hi" },
+    });
+
+    releaseFirst?.();
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    expect(r1.body).toEqual(r2.body);
+    expect(calls).toBe(1);
+
+    const r3 = await req(app, `/v1/sessions/${session.sessionId}/events`, {
+      method: "POST",
+      token: "admin-secret",
+      headers,
+      body: { type: "user.message", content: "hi" },
+    });
+    expect(r3.status).toBe(200);
+    expect(r3.body).toEqual(r1.body);
+    expect(calls).toBe(1);
+
+    const r4 = await req(app, `/v1/sessions/${session.sessionId}/events`, {
+      method: "POST",
+      token: "admin-secret",
+      headers: { "Idempotency-Key": "evt_distinct_turn" },
+      body: { type: "user.message", content: "hi" },
+    });
+    expect(r4.status).toBe(200);
+    expect(calls).toBe(2);
+  });
+
   it("hides per-session reads and writes from other user tokens", async () => {
     const { app, store } = makeApp();
     const agent = createAgent(store);
