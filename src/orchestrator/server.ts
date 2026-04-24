@@ -647,6 +647,16 @@ export function buildApp(deps: ServerDeps): Hono {
       outcome: "ok",
       metadata: { new_version: updated.version },
     });
+    // Agent updates change the boot config baked into warm containers
+    // (model, tools, instructions, MCP wiring, permission policy, etc.).
+    // Replace the speculative warm immediately so the next new session
+    // does not claim stale runtime config.
+    void deps.router.dropWarmForAgent(agentId).catch((err) => {
+      log.warn({ err, agent_id: agentId }, "drop-warm-for-agent after update failed (non-fatal)");
+    });
+    void deps.router.warmForAgent(agentId).catch((err) => {
+      log.warn({ err, agent_id: agentId }, "warm-for-agent after update failed (non-fatal)");
+    });
     return c.json(agentResponse(updated));
   });
 

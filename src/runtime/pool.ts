@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { getLogger } from "../log.js";
 import {
   poolAcquireTotal,
@@ -154,6 +155,8 @@ type ActiveContainer = {
   container: Container;
   /** Operator-role WS client for control-plane calls (abort/steer/patch). */
   wsClient: GatewayWebSocketClient;
+  /** Fingerprint of the boot-time config baked into this container. */
+  configSignature: string;
   spawnedAt: number;
   lastUsedAt: number;
   /**
@@ -175,8 +178,69 @@ type WarmContainer = {
   container: Container;
   wsClient: GatewayWebSocketClient;
   spawnOptions: SpawnOptions;
+  configSignature: string;
   spawnedAt: number;
 };
+
+function stableSortRecord(
+  input: Record<string, string>,
+  opts?: { exclude?: string[] },
+): Record<string, string> {
+  const exclude = new Set(opts?.exclude ?? []);
+  return Object.fromEntries(
+    Object.entries(input)
+      .filter(([key]) => !exclude.has(key))
+      .sort(([a], [b]) => a.localeCompare(b)),
+  );
+}
+
+function normalizeNetworkingSpec(
+  spec: NetworkingSpec | undefined,
+): Record<string, unknown> | null {
+  if (!spec) return null;
+  if (spec.type === "unrestricted") {
+    return { type: "unrestricted" };
+  }
+  return {
+    type: "limited",
+    allowedHosts: [...spec.allowedHosts].sort(),
+    allowMcpServers: Boolean(spec.allowMcpServers),
+    allowPackageManagers: Boolean(spec.allowPackageManagers),
+  };
+}
+
+export function buildContainerConfigSignature(args: {
+  spawnOptions: SpawnOptions;
+  networking?: NetworkingSpec;
+}): string {
+  const normalized = {
+    image: args.spawnOptions.image,
+    env: stableSortRecord(args.spawnOptions.env, {
+      exclude: [
+        "OPENCLAW_GATEWAY_TOKEN",
+        "OPENCLAW_ORCHESTRATOR_TOKEN",
+      ],
+    }),
+    mounts: args.spawnOptions.mounts.map((mount) => ({
+      containerPath: mount.containerPath,
+      readOnly: Boolean(mount.readOnly),
+    })),
+    containerPort: args.spawnOptions.containerPort,
+    network: args.spawnOptions.network ?? null,
+    additionalNetworks: [...(args.spawnOptions.additionalNetworks ?? [])].sort(),
+    dns: [...(args.spawnOptions.dns ?? [])].sort(),
+    labels: stableSortRecord(args.spawnOptions.labels ?? {}, {
+      exclude: [
+        "orchestrator-session-id",
+      ],
+    }),
+    networking: normalizeNetworkingSpec(args.networking),
+  };
+  return createHash("sha256")
+    .update(JSON.stringify(normalized))
+    .digest("hex")
+    .slice(0, 16);
+}
 
 export class SessionContainerPool {
   private readonly active = new Map<string, ActiveContainer>();
@@ -189,7 +253,11 @@ export class SessionContainerPool {
    * other. Real session acquires must not wait on this map — warming is
    * best-effort and outside the user's critical path.
    */
-  private readonly pendingByAgent = new Map<string, Promise<void>>();
+  private readonly pendingByAgent = new Map<
+    string,
+    { configSignature: string; promise: Promise<void> }
+  >();
+  private readonly desiredWarmSignature = new Map<string, string>();
   private sweeperHandle: NodeJS.Timeout | undefined;
 
   constructor(
@@ -225,19 +293,39 @@ export class SessionContainerPool {
     // first event just pays cold-spawn latency. Default for local
     // dev; production deploys override via OPENCLAW_MAX_WARM_CONTAINERS.
     if (this.cfg.maxWarmContainers <= 0) return;
-    if (this.warm.has(agentId)) return;
+    const configSignature = buildContainerConfigSignature({ spawnOptions });
+    const existingWarm = this.warm.get(agentId);
+    if (existingWarm?.configSignature === configSignature) return;
+    this.desiredWarmSignature.set(agentId, configSignature);
+    if (existingWarm && existingWarm.configSignature !== configSignature) {
+      this.warm.delete(agentId);
+      poolWarmContainers.set(this.warm.size);
+      await existingWarm.wsClient.close().catch(() => {
+        /* best-effort */
+      });
+      await this.runtime.stop(existingWarm.container.id).catch((err) => {
+        log.warn({ err, container_id: existingWarm.container.id, agent_id: agentId }, "stale warm stop failed");
+      });
+    }
     const inflight = this.pendingByAgent.get(agentId);
-    if (inflight) return inflight;
-    const promise = this.doWarmForAgent(agentId, spawnOptions);
-    this.pendingByAgent.set(agentId, promise);
+    if (inflight?.configSignature === configSignature) return inflight.promise;
+    const promise = this.doWarmForAgent(agentId, spawnOptions, configSignature);
+    this.pendingByAgent.set(agentId, { configSignature, promise });
     try {
       await promise;
     } finally {
-      this.pendingByAgent.delete(agentId);
+      const current = this.pendingByAgent.get(agentId);
+      if (current?.configSignature === configSignature) {
+        this.pendingByAgent.delete(agentId);
+      }
     }
   }
 
-  private async doWarmForAgent(agentId: string, spawnOptions: SpawnOptions): Promise<void> {
+  private async doWarmForAgent(
+    agentId: string,
+    spawnOptions: SpawnOptions,
+    configSignature: string,
+  ): Promise<void> {
     const t0 = Date.now();
     await this.evictOldestWarmIfAtCap();
     const container = await this.runtime.spawn(spawnOptions);
@@ -262,11 +350,17 @@ export class SessionContainerPool {
       throw err;
     }
     const tConnected = Date.now();
+    if (this.desiredWarmSignature.get(agentId) !== configSignature) {
+      await wsClient.close().catch(() => { /* best-effort */ });
+      await this.runtime.stop(container.id).catch(() => { /* best-effort */ });
+      return;
+    }
     this.warm.set(agentId, {
       agentId,
       container,
       wsClient,
       spawnOptions,
+      configSignature,
       spawnedAt: Date.now(),
     });
     poolWarmContainers.set(this.warm.size);
@@ -310,11 +404,29 @@ export class SessionContainerPool {
      */
     bypassWarmPool?: boolean;
   }): Promise<Container> {
+    const configSignature = buildContainerConfigSignature({
+      spawnOptions: args.spawnOptions,
+      networking: args.networking,
+    });
     const existing = this.active.get(args.sessionId);
     if (existing) {
-      existing.lastUsedAt = Date.now();
+      if (
+        existing.configSignature !== "adopted"
+        && existing.configSignature !== configSignature
+      ) {
+        await this.evictSession(args.sessionId);
+      } else {
+        existing.lastUsedAt = Date.now();
+        poolAcquireTotal.labels({ source: "active" }).inc();
+        return existing.container;
+      }
+    }
+
+    const freshExisting = this.active.get(args.sessionId);
+    if (freshExisting) {
+      freshExisting.lastUsedAt = Date.now();
       poolAcquireTotal.labels({ source: "active" }).inc();
-      return existing.container;
+      return freshExisting.container;
     }
 
     // Limited networking forks off to its own spawn path — warm pool
@@ -355,42 +467,57 @@ export class SessionContainerPool {
     if (args.agentId && !args.bypassWarmPool) {
       const warmEntry = this.warm.get(args.agentId);
       if (warmEntry) {
-        this.warm.delete(args.agentId);
-        poolWarmContainers.set(this.warm.size);
-        const warmHostPath = warmEntry.spawnOptions.mounts[0]?.hostPath;
-        if (warmHostPath && this.cfg.renameWorkspaceOnClaim) {
-          this.cfg.renameWorkspaceOnClaim(warmHostPath, args.sessionId);
+        if (warmEntry.configSignature !== configSignature) {
+          this.warm.delete(args.agentId);
+          poolWarmContainers.set(this.warm.size);
+          await warmEntry.wsClient.close().catch(() => {
+            /* best-effort */
+          });
+          await this.runtime.stop(warmEntry.container.id).catch((err) => {
+            log.warn(
+              { err, container_id: warmEntry.container.id, agent_id: args.agentId },
+              "stale warm stop failed during claim",
+            );
+          });
+        } else {
+          this.warm.delete(args.agentId);
+          poolWarmContainers.set(this.warm.size);
+          const warmHostPath = warmEntry.spawnOptions.mounts[0]?.hostPath;
+          if (warmHostPath && this.cfg.renameWorkspaceOnClaim) {
+            this.cfg.renameWorkspaceOnClaim(warmHostPath, args.sessionId);
+          }
+          const now = Date.now();
+          this.active.set(args.sessionId, {
+            sessionId: args.sessionId,
+            container: warmEntry.container,
+            wsClient: warmEntry.wsClient,
+            configSignature,
+            spawnedAt: warmEntry.spawnedAt,
+            lastUsedAt: now,
+          });
+          poolActiveContainers.set(this.active.size);
+          poolAcquireTotal.labels({ source: "warm" }).inc();
+          this.cfg.onContainerClaimed?.({
+            sessionId: args.sessionId,
+            agentId: args.agentId,
+            container: warmEntry.container,
+            source: "warm",
+            // Warm-reuse is instant from the session's perspective. The
+            // container was fully booted before this session existed;
+            // reporting its original spawn duration would mis-represent
+            // the perceived latency of this session's first event.
+            bootMs: 0,
+          });
+          log.info(
+            { session_id: args.sessionId, agent_id: args.agentId },
+            "claimed pre-warmed container",
+          );
+          // Replenish the warm pool in the background.
+          void this.warmForAgent(args.agentId, warmEntry.spawnOptions).catch((err) => {
+            log.warn({ err, agent_id: args.agentId }, "warm-pool replenish failed");
+          });
+          return warmEntry.container;
         }
-        const now = Date.now();
-        this.active.set(args.sessionId, {
-          sessionId: args.sessionId,
-          container: warmEntry.container,
-          wsClient: warmEntry.wsClient,
-          spawnedAt: warmEntry.spawnedAt,
-          lastUsedAt: now,
-        });
-        poolActiveContainers.set(this.active.size);
-        poolAcquireTotal.labels({ source: "warm" }).inc();
-        this.cfg.onContainerClaimed?.({
-          sessionId: args.sessionId,
-          agentId: args.agentId,
-          container: warmEntry.container,
-          source: "warm",
-          // Warm-reuse is instant from the session's perspective. The
-          // container was fully booted before this session existed;
-          // reporting its original spawn duration would mis-represent
-          // the perceived latency of this session's first event.
-          bootMs: 0,
-        });
-        log.info(
-          { session_id: args.sessionId, agent_id: args.agentId },
-          "claimed pre-warmed container",
-        );
-        // Replenish the warm pool in the background.
-        void this.warmForAgent(args.agentId, warmEntry.spawnOptions).catch((err) => {
-          log.warn({ err, agent_id: args.agentId }, "warm-pool replenish failed");
-        });
-        return warmEntry.container;
       }
     }
 
@@ -400,7 +527,7 @@ export class SessionContainerPool {
     const inflight = this.pending.get(args.sessionId);
     if (inflight) return inflight;
 
-    const spawnPromise = this.doSpawn(args);
+    const spawnPromise = this.doSpawn(args, configSignature);
     this.pending.set(args.sessionId, spawnPromise);
     try {
       return await spawnPromise;
@@ -412,7 +539,7 @@ export class SessionContainerPool {
   private async doSpawn(args: {
     sessionId: string;
     spawnOptions: SpawnOptions;
-  }): Promise<Container> {
+  }, configSignature: string): Promise<Container> {
     const spawnEnd = poolSpawnDurationSeconds.startTimer();
     const t0 = Date.now();
     const container = await this.runtime.spawn(args.spawnOptions);
@@ -452,6 +579,7 @@ export class SessionContainerPool {
       sessionId: args.sessionId,
       container,
       wsClient,
+      configSignature,
       spawnedAt: now,
       lastUsedAt: now,
     });
@@ -523,6 +651,15 @@ export class SessionContainerPool {
     const netCfg = this.cfg.limitedNetworking;
     const spawnEnd = poolSpawnDurationSeconds.startTimer();
     const limitedT0 = Date.now();
+    const configSignature = buildContainerConfigSignature({
+      spawnOptions: args.spawnOptions,
+      networking: {
+        type: "limited",
+        allowedHosts: args.allowedHosts,
+        allowMcpServers: args.allowMcpServers,
+        allowPackageManagers: args.allowPackageManagers,
+      },
+    });
 
     // Full session id, sanitized to Docker's name rules ([a-z0-9-_]).
     // Do NOT truncate: nanoid session ids are 12 chars and prefix
@@ -694,6 +831,7 @@ export class SessionContainerPool {
         sessionId: args.sessionId,
         container: agent,
         wsClient,
+        configSignature,
         spawnedAt: now,
         lastUsedAt: now,
         ownedResources: {
@@ -829,6 +967,7 @@ export class SessionContainerPool {
       sessionId: args.sessionId,
       container: args.container,
       wsClient,
+      configSignature: "adopted",
       spawnedAt: now,
       lastUsedAt: now,
     });

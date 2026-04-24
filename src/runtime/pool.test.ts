@@ -124,10 +124,13 @@ class FakeRuntime implements ContainerRuntime {
   }
 }
 
-function baseSpawnOptions(nameOverride?: string): SpawnOptions {
+function baseSpawnOptions(
+  nameOverride?: string,
+  opts?: { env?: Record<string, string> },
+): SpawnOptions {
   return {
     image: "test-image",
-    env: {},
+    env: opts?.env ?? {},
     mounts: [],
     containerPort: 18789,
     name: nameOverride,
@@ -312,6 +315,50 @@ describe("SessionContainerPool.acquireForSession", () => {
     await warming;
     await pool.shutdown();
   });
+
+  it("does not claim a stale warm container when the boot config changed", async () => {
+    const { pool, runtime } = makePool();
+    await pool.warmForAgent(
+      "agt_x",
+      baseSpawnOptions(undefined, {
+        env: { OPENCLAW_MODEL: "moonshot/kimi-k2.5" },
+      }),
+    );
+
+    const c = await pool.acquireForSession({
+      sessionId: "ses_1",
+      spawnOptions: baseSpawnOptions(undefined, {
+        env: { OPENCLAW_MODEL: "openai/gpt-5.4" },
+      }),
+      agentId: "agt_x",
+    });
+
+    expect(c.id).toBe("cnt_2");
+    expect(runtime.stopped.has("cnt_1")).toBe(true);
+    await pool.shutdown();
+  });
+
+  it("evicts an active container when the boot config changed for the session", async () => {
+    const { pool, runtime } = makePool();
+    const first = await pool.acquireForSession({
+      sessionId: "ses_1",
+      spawnOptions: baseSpawnOptions(undefined, {
+        env: { OPENCLAW_MODEL: "moonshot/kimi-k2.5" },
+      }),
+    });
+
+    const second = await pool.acquireForSession({
+      sessionId: "ses_1",
+      spawnOptions: baseSpawnOptions(undefined, {
+        env: { OPENCLAW_MODEL: "openai/gpt-5.4" },
+      }),
+    });
+
+    expect(second.id).toBe("cnt_2");
+    expect(second.id).not.toBe(first.id);
+    expect(runtime.stopped.has("cnt_1")).toBe(true);
+    await pool.shutdown();
+  });
 });
 
 describe("SessionContainerPool.warmForAgent", () => {
@@ -344,6 +391,25 @@ describe("SessionContainerPool.warmForAgent", () => {
       /readyz/,
     );
     // The spawned container should have been stopped on the failure path.
+    expect(runtime.stopped.has("cnt_1")).toBe(true);
+    await pool.shutdown();
+  });
+
+  it("replaces a stale warm container when the agent boot config changed", async () => {
+    const { pool, runtime } = makePool();
+    await pool.warmForAgent(
+      "agt_x",
+      baseSpawnOptions(undefined, {
+        env: { OPENCLAW_MODEL: "moonshot/kimi-k2.5" },
+      }),
+    );
+    await pool.warmForAgent(
+      "agt_x",
+      baseSpawnOptions(undefined, {
+        env: { OPENCLAW_MODEL: "openai/gpt-5.4" },
+      }),
+    );
+    expect(runtime.calls.filter((c) => c.kind === "spawn")).toHaveLength(2);
     expect(runtime.stopped.has("cnt_1")).toBe(true);
     await pool.shutdown();
   });

@@ -9,6 +9,10 @@ import type { Event, Session } from "./types.js";
 function makeApp() {
   const store = new InMemoryStore();
   const latestBySession = new Map<string, Event>();
+  const routerCalls = {
+    warmForAgent: [] as string[],
+    dropWarmForAgent: [] as string[],
+  };
 
   const events = {
     latestAgentMessage(_agentId: string, sessionId: string) {
@@ -55,10 +59,12 @@ function makeApp() {
     async warmSession() {
       return;
     },
-    async warmForAgent() {
+    async warmForAgent(agentId: string) {
+      routerCalls.warmForAgent.push(agentId);
       return;
     },
-    async dropWarmForAgent() {
+    async dropWarmForAgent(agentId: string) {
+      routerCalls.dropWarmForAgent.push(agentId);
       return;
     },
     async runEvent(args: { sessionId: string; content: string }) {
@@ -148,6 +154,7 @@ function makeApp() {
   return {
     app: buildApp(deps),
     store,
+    routerCalls,
   };
 }
 
@@ -311,5 +318,24 @@ describe("session ownership in the HTTP API", () => {
     expect(text).toContain('"container_name":"openclaw-agt-live123"');
     expect(text).toContain('"pool_source":"cold"');
     expect(text).toContain('"boot_ms":4321');
+  });
+
+  it("rebuilds the warm template container after an agent update", async () => {
+    const { app, store, routerCalls } = makeApp();
+    const agent = createAgent(store);
+
+    const res = await req(app, `/v1/agents/${agent.agentId}`, {
+      method: "PATCH",
+      token: "admin-secret",
+      body: {
+        version: agent.version,
+        model: "openai/gpt-5.4",
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(routerCalls.dropWarmForAgent).toEqual([agent.agentId]);
+    expect(routerCalls.warmForAgent).toContain(agent.agentId);
+    expect(store.agents.get(agent.agentId)?.model).toBe("openai/gpt-5.4");
   });
 });
