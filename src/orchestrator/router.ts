@@ -25,7 +25,7 @@ import type {
   VaultStore,
 } from "../store/types.js";
 import type { VaultCredentialMcpOAuth } from "../store/types.js";
-import type { AgentConfig, Session } from "./types.js";
+import type { AgentConfig, Event, Session } from "./types.js";
 
 const log = getLogger("router");
 
@@ -131,6 +131,11 @@ export type PendingApproval = {
   toolCallId?: string;
   description: string;
   arrivedAt: number;
+};
+
+type TurnProgressSnapshot = {
+  userTurns: number;
+  latestAgentMessageId?: string;
 };
 
 export class AgentRouter {
@@ -651,6 +656,8 @@ export class AgentRouter {
         }
       }
 
+      const beforeTurn = this.snapshotTurnProgress(agent.agentId, args.sessionId);
+
       const canonicalSessionKey = `agent:main:${args.sessionId}`;
       const runEnd = sessionRunDurationSeconds.startTimer();
       const res = await fetch(`${container.baseUrl}/v1/chat/completions`, {
@@ -736,7 +743,11 @@ export class AgentRouter {
         const current = router.sessions.get(args.sessionId);
         if (current?.status !== "running") return;
         if (outcome.ok) {
-          const latest = router.events.latestAgentMessage(agent.agentId, args.sessionId);
+          const latest = router.assertTurnAdvanced(
+            agent.agentId,
+            args.sessionId,
+            beforeTurn,
+          );
           const tokensIn = latest?.tokensIn ?? 0;
           const tokensOut = latest?.tokensOut ?? 0;
           const costUsd = latest?.costUsd ?? 0;
@@ -1445,6 +1456,7 @@ export class AgentRouter {
       { session_id: sessionId, total_pre_llm_ms: cursor - t0, ...timings },
       "turn pre-LLM timings (receipt → chat.completions dispatch)",
     );
+    const beforeTurn = this.snapshotTurnProgress(agent.agentId, sessionId);
 
     // Phase 2: Invoke chat completions. NOT retryable — Pi writes
     // user.message to JSONL immediately on HTTP receipt. Even connect-
@@ -1476,7 +1488,11 @@ export class AgentRouter {
     // just the truth per the active catalog. Updating the runtime
     // provider catalog or our price-override injection layer will
     // propagate through this path with zero code changes.
-    const latestAgent = this.events.latestAgentMessage(agent.agentId, sessionId);
+    const latestAgent = this.assertTurnAdvanced(
+      agent.agentId,
+      sessionId,
+      beforeTurn,
+    );
     const costUsd = latestAgent?.costUsd ?? 0;
 
     const usage: RunUsage = {
@@ -1641,6 +1657,39 @@ export class AgentRouter {
       /* best-effort */
     });
     this.sessions.endRunFailure(sessionId, outcome.error);
+  }
+
+  private snapshotTurnProgress(
+    agentId: string,
+    sessionId: string,
+  ): TurnProgressSnapshot {
+    return {
+      userTurns: this.events.countUserTurns(agentId, sessionId),
+      latestAgentMessageId:
+        this.events.latestAgentMessage(agentId, sessionId)?.eventId,
+    };
+  }
+
+  private assertTurnAdvanced(
+    agentId: string,
+    sessionId: string,
+    before: TurnProgressSnapshot,
+  ): Event {
+    const afterUserTurns = this.events.countUserTurns(agentId, sessionId);
+    if (afterUserTurns <= before.userTurns) {
+      throw new RouterError(
+        "chat_completions_failed",
+        "turn returned but no new user.message was written to JSONL",
+      );
+    }
+    const latestAgent = this.events.latestAgentMessage(agentId, sessionId);
+    if (!latestAgent || latestAgent.eventId === before.latestAgentMessageId) {
+      throw new RouterError(
+        "chat_completions_failed",
+        "turn returned but no new agent.message was written to JSONL",
+      );
+    }
+    return latestAgent;
   }
 
   /**

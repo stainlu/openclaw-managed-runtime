@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { GatewayWebSocketClient } from "../runtime/gateway-ws.js";
 import { ParentTokenMinter } from "../runtime/parent-token.js";
@@ -20,6 +20,7 @@ import {
 
 function makeRouter(opts: {
   poolStub?: Partial<SessionContainerPool>;
+  eventReaderStub?: Partial<PiJsonlEventReader>;
 } = {}): {
   router: AgentRouter;
   store: InMemoryStore;
@@ -33,7 +34,8 @@ function makeRouter(opts: {
   // loudly. Tests that DO want to exercise a pool interaction provide
   // their own shaped stub.
   const pool = (opts.poolStub ?? {}) as SessionContainerPool;
-  const eventReader = new PiJsonlEventReader("/tmp/does-not-exist");
+  const eventReader = (opts.eventReaderStub ??
+    new PiJsonlEventReader("/tmp/does-not-exist")) as PiJsonlEventReader;
   const cfg: RouterConfig = {
     runtimeImage: "test-image",
     hostStateRoot: "/tmp/test-state",
@@ -55,6 +57,23 @@ function makeRouter(opts: {
     cfg,
   );
   return { router, store, queue, pool };
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+async function waitForSessionToStopRunning(
+  store: InMemoryStore,
+  sessionId: string,
+): Promise<void> {
+  const deadline = Date.now() + 500;
+  while (Date.now() < deadline) {
+    if (store.sessions.get(sessionId)?.status !== "running") return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`session ${sessionId} stayed running`);
 }
 
 describe("AgentRouter.createSession", () => {
@@ -453,6 +472,117 @@ describe("AgentRouter.runEvent — decision tree", () => {
     });
     const next = queue.shift(session.sessionId);
     expect(next?.model).toBe("anthropic/claude-sonnet-4-6");
+  });
+});
+
+describe("AgentRouter.runEvent — JSONL advancement guarantees", () => {
+  function seedAgent(store: InMemoryStore) {
+    return store.agents.create({
+      model: "m",
+      tools: [],
+      instructions: "",
+      permissionPolicy: { type: "always_allow" },
+      callableAgents: [],
+      maxSubagentDepth: 0,
+    });
+  }
+
+  it("fails the turn when chat.completions returns 200 but no new JSONL events were written", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "all good" } }],
+            usage: { prompt_tokens: 11, completion_tokens: 7 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const fakeEvents = {
+      stateRoot: "/tmp/test-state",
+      countUserTurns: vi
+        .fn()
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0),
+      latestAgentMessage: vi
+        .fn()
+        .mockReturnValueOnce(undefined)
+        .mockReturnValueOnce(undefined),
+    };
+    const { router, store } = makeRouter({
+      poolStub: {
+        acquireForSession: async () =>
+          ({ baseUrl: "http://container.test", token: "tok" }) as any,
+        evictSession: async () => {},
+      },
+      eventReaderStub: fakeEvents as unknown as PiJsonlEventReader,
+    });
+    const agent = seedAgent(store);
+    const session = router.createSession(agent.agentId);
+
+    await router.runEvent({ sessionId: session.sessionId, content: "hi" });
+    await waitForSessionToStopRunning(store, session.sessionId);
+
+    const failed = store.sessions.get(session.sessionId);
+    expect(failed?.status).toBe("failed");
+    expect(failed?.error).toContain("no new user.message was written to JSONL");
+  });
+
+  it("keeps the turn successful when both user.message and agent.message advance", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "done" } }],
+            usage: { prompt_tokens: 11, completion_tokens: 7 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const fakeEvents = {
+      stateRoot: "/tmp/test-state",
+      countUserTurns: vi
+        .fn()
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(1),
+      latestAgentMessage: vi
+        .fn()
+        .mockReturnValueOnce(undefined)
+        .mockReturnValueOnce({
+          eventId: "evt_new",
+          sessionId: "ses_unused",
+          type: "agent.message",
+          content: "done",
+          createdAt: Date.now(),
+          tokensIn: 11,
+          tokensOut: 7,
+          costUsd: 0.12,
+        }),
+    };
+    const { router, store } = makeRouter({
+      poolStub: {
+        acquireForSession: async () =>
+          ({ baseUrl: "http://container.test", token: "tok" }) as any,
+        evictSession: async () => {},
+      },
+      eventReaderStub: fakeEvents as unknown as PiJsonlEventReader,
+    });
+    const agent = seedAgent(store);
+    const session = router.createSession(agent.agentId);
+
+    await router.runEvent({ sessionId: session.sessionId, content: "hi" });
+    await waitForSessionToStopRunning(store, session.sessionId);
+
+    const finished = store.sessions.get(session.sessionId);
+    expect(finished?.status).toBe("idle");
+    expect(finished?.error).toBeNull();
+    expect(finished?.tokensIn).toBe(11);
+    expect(finished?.tokensOut).toBe(7);
+    expect(finished?.costUsd).toBe(0.12);
   });
 });
 
