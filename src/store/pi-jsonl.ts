@@ -121,6 +121,18 @@ export class PiJsonlEventReader {
     return undefined;
   }
 
+  latestAgentOutcome(agentId: string, sessionId: string): Event | undefined {
+    const events = this.listBySession(agentId, sessionId);
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (!e) continue;
+      if (e.type === "agent.message" || e.type === "agent.tool_result") {
+        return e;
+      }
+    }
+    return undefined;
+  }
+
   /**
    * Count "turns" = user.message events for this session. Used by the
    * orchestrator's session-list endpoint to expose a turns field on the

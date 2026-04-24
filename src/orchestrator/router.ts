@@ -148,7 +148,7 @@ export type PendingApproval = {
 
 type TurnProgressSnapshot = {
   userTurns: number;
-  latestAgentMessageId?: string;
+  latestAgentOutcomeId?: string;
 };
 
 export class AgentRouter {
@@ -1638,10 +1638,11 @@ export class AgentRouter {
     }
 
     // Fast path: turn may have completed while the orchestrator was down.
-    // Compare the latest agent.message's createdAt to the session's
-    // lastEventAt (which was set by beginRun before the crash). A newer
-    // agent.message means Pi finished the turn without us watching.
-    const latest = this.events.latestAgentMessage(agent.agentId, sessionId);
+    // Compare the latest assistant-side outcome event's createdAt to the
+    // session's lastEventAt (which was set by beginRun before the crash).
+    // A newer agent.message OR agent.tool_result means Pi finished the
+    // turn without us watching.
+    const latest = this.events.latestAgentOutcome(agent.agentId, sessionId);
     const startedAt = session.lastEventAt ?? session.createdAt;
     if (latest && latest.createdAt > startedAt) {
       log.info(
@@ -1721,8 +1722,8 @@ export class AgentRouter {
   ): TurnProgressSnapshot {
     return {
       userTurns: this.events.countUserTurns(agentId, sessionId),
-      latestAgentMessageId:
-        this.events.latestAgentMessage(agentId, sessionId)?.eventId,
+      latestAgentOutcomeId:
+        this.events.latestAgentOutcome(agentId, sessionId)?.eventId,
     };
   }
 
@@ -1757,7 +1758,7 @@ export class AgentRouter {
     agentId: string,
     sessionId: string,
     before: TurnProgressSnapshot,
-  ): Event {
+  ): Event | undefined {
     const afterUserTurns = this.events.countUserTurns(agentId, sessionId);
     if (afterUserTurns <= before.userTurns) {
       throw new RouterError(
@@ -1765,14 +1766,14 @@ export class AgentRouter {
         "turn returned but no new user.message was written to JSONL",
       );
     }
-    const latestAgent = this.events.latestAgentMessage(agentId, sessionId);
-    if (!latestAgent || latestAgent.eventId === before.latestAgentMessageId) {
+    const latestAgentOutcome = this.events.latestAgentOutcome(agentId, sessionId);
+    if (!latestAgentOutcome || latestAgentOutcome.eventId === before.latestAgentOutcomeId) {
       throw new RouterError(
         "chat_completions_failed",
-        "turn returned but no new agent.message was written to JSONL",
+        "turn returned but no new agent.message or agent.tool_result was written to JSONL",
       );
     }
-    return latestAgent;
+    return this.events.latestAgentMessage(agentId, sessionId);
   }
 
   /**

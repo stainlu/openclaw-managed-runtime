@@ -55,6 +55,7 @@ describe("PiJsonlEventReader", () => {
     const reader = new PiJsonlEventReader(root);
     expect(reader.listBySession("no-agent", "no-session")).toEqual([]);
     expect(reader.latestAgentMessage("no-agent", "no-session")).toBeUndefined();
+    expect(reader.latestAgentOutcome("no-agent", "no-session")).toBeUndefined();
   });
 
   it("returns [] when the JSONL file is missing but sessions.json maps the key", () => {
@@ -260,6 +261,46 @@ describe("PiJsonlEventReader", () => {
     const reader = new PiJsonlEventReader(f.root);
     const latest = reader.latestAgentMessage(f.agentId, f.sessionId);
     expect(latest?.content).toBe("second");
+    expect(latest?.eventId).toBe("evt-c");
+  });
+
+  it("latestAgentOutcome returns the newest agent.message or agent.tool_result", () => {
+    const f = makeFixture([
+      {
+        type: "message",
+        id: "evt-a",
+        message: { role: "user", content: [{ type: "text", text: "what time is it?" }] },
+      },
+      {
+        type: "message",
+        id: "evt-b",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call-date",
+              name: "exec",
+              arguments: { command: "date" },
+            },
+          ],
+        },
+      },
+      {
+        type: "message",
+        id: "evt-c",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-date",
+          toolName: "exec",
+          content: [{ type: "text", text: "Fri Apr 24 17:58:01 UTC 2026" }],
+        },
+      },
+    ]);
+    fixtures.push(f);
+    const reader = new PiJsonlEventReader(f.root);
+    const latest = reader.latestAgentOutcome(f.agentId, f.sessionId);
+    expect(latest?.type).toBe("agent.tool_result");
     expect(latest?.eventId).toBe("evt-c");
   });
 
