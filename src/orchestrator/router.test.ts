@@ -585,6 +585,111 @@ describe("AgentRouter.runEvent — JSONL advancement guarantees", () => {
     expect(finished?.tokensOut).toBe(7);
     expect(finished?.costUsd).toBe(0.12);
   });
+
+  it("falls back to transcript usage when the completion response omits usage", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "done" } }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const fakeEvents = {
+      stateRoot: "/tmp/test-state",
+      countUserTurns: vi
+        .fn()
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(1),
+      latestAgentMessage: vi
+        .fn()
+        .mockReturnValueOnce(undefined)
+        .mockReturnValueOnce({
+          eventId: "evt_new",
+          sessionId: "ses_unused",
+          type: "agent.message",
+          content: "done",
+          createdAt: Date.now(),
+          tokensIn: 321,
+          tokensOut: 45,
+          costUsd: 0.42,
+        }),
+    };
+    const { router, store } = makeRouter({
+      poolStub: {
+        acquireForSession: async () =>
+          ({ baseUrl: "http://container.test", token: "tok" }) as any,
+        evictSession: async () => {},
+      },
+      eventReaderStub: fakeEvents as unknown as PiJsonlEventReader,
+    });
+    const agent = seedAgent(store);
+    const session = router.createSession(agent.agentId);
+
+    await router.runEvent({ sessionId: session.sessionId, content: "hi" });
+    await waitForSessionToStopRunning(store, session.sessionId);
+
+    const finished = store.sessions.get(session.sessionId);
+    expect(finished?.status).toBe("idle");
+    expect(finished?.tokensIn).toBe(321);
+    expect(finished?.tokensOut).toBe(45);
+    expect(finished?.costUsd).toBe(0.42);
+  });
+
+  it("normalizes input_tokens/output_tokens usage aliases from chat completion responses", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "done" } }],
+            usage: { input_tokens: 18, output_tokens: 6 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const fakeEvents = {
+      stateRoot: "/tmp/test-state",
+      countUserTurns: vi
+        .fn()
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(1),
+      latestAgentMessage: vi
+        .fn()
+        .mockReturnValueOnce(undefined)
+        .mockReturnValueOnce({
+          eventId: "evt_new",
+          sessionId: "ses_unused",
+          type: "agent.message",
+          content: "done",
+          createdAt: Date.now(),
+          costUsd: 0.05,
+        }),
+    };
+    const { router, store } = makeRouter({
+      poolStub: {
+        acquireForSession: async () =>
+          ({ baseUrl: "http://container.test", token: "tok" }) as any,
+        evictSession: async () => {},
+      },
+      eventReaderStub: fakeEvents as unknown as PiJsonlEventReader,
+    });
+    const agent = seedAgent(store);
+    const session = router.createSession(agent.agentId);
+
+    await router.runEvent({ sessionId: session.sessionId, content: "hi" });
+    await waitForSessionToStopRunning(store, session.sessionId);
+
+    const finished = store.sessions.get(session.sessionId);
+    expect(finished?.status).toBe("idle");
+    expect(finished?.tokensIn).toBe(18);
+    expect(finished?.tokensOut).toBe(6);
+    expect(finished?.costUsd).toBe(0.05);
+  });
 });
 
 describe("AgentRouter.cancel — pre-abort checks", () => {

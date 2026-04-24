@@ -162,6 +162,7 @@ function makeApp() {
     app: buildApp(deps),
     store,
     routerCalls,
+    latestBySession,
   };
 }
 
@@ -254,6 +255,39 @@ describe("session ownership in the HTTP API", () => {
     expect(res.status).toBe(200);
     const sessionId = (res.body as { session_id: string }).session_id;
     expect(store.sessions.get(sessionId)?.userId).toBe(alice.userId);
+  });
+
+  it("falls back to transcript usage for session reads when stored totals are sparse", async () => {
+    const { app, store, latestBySession } = makeApp();
+    const agent = createAgent(store);
+    const session = store.sessions.create({
+      agentId: agent.agentId,
+      userId: null,
+    });
+    const now = Date.now();
+    latestBySession.set(session.sessionId, {
+      eventId: `evt_${session.sessionId}_${now}`,
+      sessionId: session.sessionId,
+      type: "agent.message",
+      content: "reply:hi",
+      createdAt: now,
+      tokensIn: 321,
+      tokensOut: 45,
+      costUsd: 0.42,
+      model: "zenmux/openai/gpt-5.4",
+    });
+
+    const res = await req(app, `/v1/sessions/${session.sessionId}`, {
+      token: "admin-secret",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      session_id: session.sessionId,
+      tokens: { input: 321, output: 45 },
+      cost_usd: 0.42,
+      output: "reply:hi",
+    });
   });
 
   it("does not let another user reuse a named chat-completions session key", async () => {

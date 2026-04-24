@@ -1500,10 +1500,12 @@ export class AgentRouter {
       beforeTurn,
     );
     const costUsd = latestAgent?.costUsd ?? 0;
+    const tokensIn = latestAgent?.tokensIn ?? completion.tokensIn;
+    const tokensOut = latestAgent?.tokensOut ?? completion.tokensOut;
 
     const usage: RunUsage = {
-      tokensIn: completion.tokensIn,
-      tokensOut: completion.tokensOut,
+      tokensIn,
+      tokensOut,
       costUsd,
     };
 
@@ -1909,7 +1911,7 @@ export class AgentRouter {
 
     const data = (await res.json()) as ChatCompletionResponse;
     const output = data.choices?.[0]?.message?.content ?? "";
-    const usage = data.usage ?? { prompt_tokens: 0, completion_tokens: 0 };
+    const usage = normalizeChatCompletionUsage(data.usage);
 
     // OpenClaw's OpenAI-compat endpoint returns HTTP 200 even when the
     // upstream provider errored — the failure surfaces as one of these
@@ -1930,8 +1932,8 @@ export class AgentRouter {
 
     return {
       output,
-      tokensIn: usage.prompt_tokens ?? 0,
-      tokensOut: usage.completion_tokens ?? 0,
+      tokensIn: usage.tokensIn,
+      tokensOut: usage.tokensOut,
     };
   }
 }
@@ -1945,8 +1947,37 @@ function isOpenClawFailureContent(content: string): boolean {
 
 type ChatCompletionResponse = {
   choices?: Array<{ message?: { content?: string } }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+    promptTokens?: number;
+    completionTokens?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+  };
 };
+
+function normalizeChatCompletionUsage(
+  usage: ChatCompletionResponse["usage"] | undefined,
+): { tokensIn: number; tokensOut: number } {
+  if (!usage) return { tokensIn: 0, tokensOut: 0 };
+  return {
+    tokensIn:
+      asFiniteNumber(usage.prompt_tokens) ??
+      asFiniteNumber(usage.input_tokens) ??
+      asFiniteNumber(usage.promptTokens) ??
+      asFiniteNumber(usage.inputTokens) ??
+      0,
+    tokensOut:
+      asFiniteNumber(usage.completion_tokens) ??
+      asFiniteNumber(usage.output_tokens) ??
+      asFiniteNumber(usage.completionTokens) ??
+      asFiniteNumber(usage.outputTokens) ??
+      0,
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

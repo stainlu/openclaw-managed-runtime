@@ -251,6 +251,9 @@ function sessionResponse(
 ) {
   const latestAgent = events.latestAgentMessage(session.agentId, session.sessionId);
   const containerRow = containers?.get(session.sessionId);
+  const tokensIn = Math.max(session.tokensIn, latestAgent?.tokensIn ?? 0);
+  const tokensOut = Math.max(session.tokensOut, latestAgent?.tokensOut ?? 0);
+  const costUsd = Math.max(session.costUsd, latestAgent?.costUsd ?? 0);
   return {
     session_id: session.sessionId,
     agent_id: session.agentId,
@@ -258,10 +261,10 @@ function sessionResponse(
     status: session.status,
     output: latestAgent?.content ?? null,
     tokens: {
-      input: session.tokensIn,
-      output: session.tokensOut,
+      input: tokensIn,
+      output: tokensOut,
     },
-    cost_usd: session.costUsd,
+    cost_usd: costUsd,
     error: session.error,
     created_at: session.createdAt,
     last_event_at: session.lastEventAt,

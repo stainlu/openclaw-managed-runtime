@@ -38,9 +38,13 @@ type PiMessage = {
   usage?: {
     input?: number;
     output?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
     cost?: {
       total?: number;
-    };
+    } | number;
   };
   model?: string;
   provider?: string;
@@ -444,15 +448,16 @@ function mapLineToEvents(line: PiLine, sessionId: string): Event[] {
     // if there are also no tool calls. A message with ONLY tool calls and
     // no text is valid (stopReason=toolUse).
     if (text) {
+      const usage = normalizeUsage(msg.usage);
       events.push({
         eventId,
         sessionId,
         type: "agent.message",
         content: text,
         createdAt,
-        tokensIn: msg.usage?.input,
-        tokensOut: msg.usage?.output,
-        costUsd: msg.usage?.cost?.total,
+        tokensIn: usage.tokensIn,
+        tokensOut: usage.tokensOut,
+        costUsd: usage.costUsd,
         model: combineModel(msg.provider, msg.model),
       });
     }
@@ -508,6 +513,33 @@ function isRuntimeNotice(text: string): boolean {
     return true;
   }
   return false;
+}
+
+function normalizeUsage(usage: PiMessage["usage"] | undefined): {
+  tokensIn: number | undefined;
+  tokensOut: number | undefined;
+  costUsd: number | undefined;
+} {
+  if (!usage) {
+    return { tokensIn: undefined, tokensOut: undefined, costUsd: undefined };
+  }
+  const tokensIn =
+    finiteNumber(usage.input) ??
+    finiteNumber(usage.input_tokens) ??
+    finiteNumber(usage.prompt_tokens);
+  const tokensOut =
+    finiteNumber(usage.output) ??
+    finiteNumber(usage.output_tokens) ??
+    finiteNumber(usage.completion_tokens);
+  const costUsd =
+    typeof usage.cost === "number"
+      ? finiteNumber(usage.cost)
+      : finiteNumber(usage.cost?.total);
+  return { tokensIn, tokensOut, costUsd };
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function combineModel(

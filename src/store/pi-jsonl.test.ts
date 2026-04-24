@@ -105,6 +105,38 @@ describe("PiJsonlEventReader", () => {
     });
   });
 
+  it("normalizes OpenAI-family usage aliases from transcript entries", () => {
+    const f = makeFixture([
+      {
+        type: "message",
+        id: "evt-1",
+        timestamp: "2026-04-24T12:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          provider: "zenmux",
+          model: "openai/gpt-5.4",
+          usage: {
+            prompt_tokens: 321,
+            completion_tokens: 45,
+            cost: 0.0042,
+          },
+        },
+      },
+    ]);
+    fixtures.push(f);
+    const reader = new PiJsonlEventReader(f.root);
+    const events = reader.listBySession(f.agentId, f.sessionId);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "agent.message",
+      tokensIn: 321,
+      tokensOut: 45,
+      costUsd: 0.0042,
+      model: "zenmux/openai/gpt-5.4",
+    });
+  });
+
   describe("follow() resume cursor", () => {
     function threeEventFixture(): Fixture {
       return makeFixture([
