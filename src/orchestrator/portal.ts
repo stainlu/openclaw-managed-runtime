@@ -632,7 +632,7 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
         <div class="field">
           <label>Model <span class="muted">— provider/model slug from openclaw</span></label>
           <input id="fld-model" value="moonshot/kimi-k2.5" />
-          <div class="hint">Examples: <code>anthropic/claude-sonnet-4-6</code>, <code>openai/gpt-5.4</code>, <code>google/gemini-2.5-pro</code>, <code>moonshot/kimi-k2.5</code>. The orchestrator forwards only the matching provider API key from its host env.</div>
+          <div class="hint">Examples: <code>anthropic/claude-sonnet-4-6</code>, <code>openai/gpt-5.4</code>, <code>deepseek/deepseek-v4-pro</code>, <code>google/gemini-2.5-pro</code>, <code>moonshot/kimi-k2.5</code>. If <code>ZENMUX_API_KEY</code> is set, the runtime routes all models through ZenMux; otherwise it forwards the matching provider API key from the host env.</div>
         </div>
         <div class="field">
           <label>Instructions <span class="muted">— system prompt</span></label>
@@ -1043,7 +1043,7 @@ function renderDetail(session, events) {
         <span class="label">Status</span><span class="value \${statusCls}">\${isRunning ? '<span class="spinner"></span>' : ""}\${session.status}</span>
         <span class="label">Duration</span><span class="value">\${totalDuration ? fmtDuration(totalDuration) : "—"}</span>
         <span class="label">Tokens</span><span class="value">\${session.tokens?.input || 0} in / \${session.tokens?.output || 0} out</span>
-        <span class="label">Cost</span><span class="value" title="Cost comes from the provider plugin's price catalog in the container. Moonshot models currently ship \\$0 in openclaw's bundled catalog (tracked upstream); Anthropic / OpenAI / Google / xAI / Mistral / Bedrock report real cost automatically.">\${fmtCost(session.cost_usd || 0)}\${(session.cost_usd || 0) === 0 && (session.tokens?.input || 0) > 0 ? ' <span class="muted" style="font-size: 10px;">(catalog $0)</span>' : ""}</span>
+        <span class="label">Cost</span><span class="value" title="Cost comes from the provider plugin's price catalog in the container. Moonshot and DeepSeek direct-provider v4 models currently rely on docker/provider-prices.json patches layered onto the bundled catalog; Anthropic / OpenAI / Google / xAI / Mistral / Bedrock report real cost automatically, and ZenMux-routed models use ZenMux's live catalog.">\${fmtCost(session.cost_usd || 0)}\${(session.cost_usd || 0) === 0 && (session.tokens?.input || 0) > 0 ? ' <span class="muted" style="font-size: 10px;">(catalog $0)</span>' : ""}</span>
         <span class="label">Tool calls</span><span class="value">\${toolCount}</span>
         <span class="label">Last event</span><span class="value">\${fmtMs(session.last_event_at)}</span>
       </div>

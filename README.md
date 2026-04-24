@@ -292,7 +292,7 @@ The SSE stream emits an initial status event on connect, checks for status trans
 
 **Cancel + queue.** Cancel aborts the in-flight run via the WebSocket control plane. Events posted to a busy session queue automatically and drain in order.
 
-**Per-turn cost.** Each session tracks rolling `tokens_in`, `tokens_out`, and `cost_usd` from the provider's own billing data — cache-aware, not a static price sheet. Anthropic, OpenAI, Google, xAI, Mistral, OpenRouter, and Bedrock auto-report non-zero cost with no config. Moonshot currently gets real non-zero cost via the runtime's `provider-prices.json` overrides layered onto the bundled catalog; when upstream ships the same prices, deleting the local override block cleanly defers back to upstream.
+**Per-turn cost.** Each session tracks rolling `tokens_in`, `tokens_out`, and `cost_usd` from the provider's own billing data — cache-aware, not a static price sheet. Anthropic, OpenAI, Google, xAI, Mistral, OpenRouter, and Bedrock auto-report non-zero cost with no config. Moonshot and DeepSeek direct-provider v4 models currently get real non-zero cost via the runtime's `provider-prices.json` patches layered onto the bundled catalog; when upstream ships the same prices and model ids, deleting the local provider block cleanly defers back to upstream.
 
 **OpenAI SDK drop-in.** Point any OpenAI SDK at `http://<host>:8080/v1` with an `x-openclaw-agent-id` header. Sticky sessions via the `user` field. Real per-token streaming (not emulated) when `stream: true`.
 

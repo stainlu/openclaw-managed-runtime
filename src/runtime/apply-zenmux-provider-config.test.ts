@@ -69,4 +69,53 @@ describe("apply-zenmux-provider-config", () => {
       ],
     });
   });
+
+  it("preserves provider/model ids for DeepSeek v4 models routed through ZenMux", () => {
+    const provider = buildZenMuxProviderConfig({
+      baseUrl: "https://zenmux.ai/api/v1",
+      apiKey: "sk-test",
+      modelId: "deepseek/deepseek-v4-pro",
+      catalog: {
+        data: [
+          {
+            id: "deepseek/deepseek-v4-pro",
+            display_name: "DeepSeek: V4 Pro",
+            input_modalities: ["text"],
+            capabilities: { reasoning: true },
+            context_length: 1048576,
+            pricings: {
+              prompt: [
+                { value: 1.74, unit: "perMTokens", currency: "USD" },
+              ],
+              completion: [
+                { value: 3.48, unit: "perMTokens", currency: "USD" },
+              ],
+              input_cache_read: [
+                { value: 0.145, unit: "perMTokens", currency: "USD" },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    expect(provider).toMatchObject({
+      models: [
+        {
+          id: "deepseek/deepseek-v4-pro",
+          name: "DeepSeek: V4 Pro",
+          reasoning: true,
+          input: ["text"],
+          contextWindow: 1048576,
+          maxTokens: 1048576,
+          cost: {
+            input: 1.74,
+            output: 3.48,
+            cacheRead: 0.145,
+            cacheWrite: 0,
+          },
+        },
+      ],
+    });
+  });
 });

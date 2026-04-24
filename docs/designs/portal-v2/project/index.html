@@ -2150,7 +2150,7 @@ function CreateAgentModal() {
           <div>
             <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Model</label>
             <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
-              {['moonshot/kimi-k2.5', 'anthropic/claude-4.5', 'openai/gpt-5', 'deepseek/v3'].map(m => (
+              {['moonshot/kimi-k2.5', 'anthropic/claude-4.5', 'openai/gpt-5', 'deepseek/deepseek-v4-pro'].map(m => (
                 <button key={m} onClick={() => setModel(m)} style={{
                   all: 'unset', cursor: 'pointer',
                   padding: '6px 11px', fontSize: 12, fontFamily: 'var(--font-mono)',

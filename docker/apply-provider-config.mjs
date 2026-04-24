@@ -14,6 +14,7 @@
 //
 // Supported provider ids:
 //   - moonshot — via buildMoonshotProvider() from the bundled extension
+//   - deepseek — via buildDeepSeekProvider() from the bundled extension
 //
 // Unknown or Category A provider ids are a no-op. Category A plugins
 // (anthropic, openai, google, xai, mistral, openrouter, amazon-bedrock)
@@ -46,6 +47,10 @@ const PROVIDER_CATALOGS = {
   moonshot: {
     module: "extensions/moonshot/provider-catalog.js",
     factory: "buildMoonshotProvider",
+  },
+  deepseek: {
+    module: "extensions/deepseek/provider-catalog.js",
+    factory: "buildDeepSeekProvider",
   },
 };
 
@@ -123,13 +128,14 @@ export function applyPriceOverrides(providerId, providerConfig, overrides, logge
 
 // Price-override pass. openclaw's bundled plugin catalogs ship with
 // real prices for most Category A providers (Anthropic, OpenAI, Google,
-// xAI, Mistral, Bedrock) but $0 for Moonshot (tracked in
-// openclaw/openclaw#67928). We carry a small JSON table of real-world
-// $/1M-token prices in provider-prices.json; if the provider built
-// above has an entry, patch the cost block on each matching model so
-// cost.total comes out non-zero. When openclaw ships real prices
-// upstream, delete the matching provider block from the JSON to defer
-// to upstream without any other change.
+// xAI, Mistral, Bedrock). We carry a small JSON table of provider-side
+// catalog patches in provider-prices.json for any bundled provider catalog
+// that still lags upstream docs (today: Moonshot + DeepSeek direct-provider
+// v4 ids). If the provider built above has an entry, patch the cost block on
+// each matching model and inject any missing models so cost.total stays real
+// and newly-documented ids resolve immediately. When openclaw ships the same
+// prices/catalog upstream, delete the matching provider block from the JSON
+// to defer to upstream without any other change.
 const PRICES_PATH = process.env.OPENCLAW_PROVIDER_PRICES_PATH || "/opt/openclaw-plugins/provider-prices.json";
 
 export async function main(argv = process.argv) {

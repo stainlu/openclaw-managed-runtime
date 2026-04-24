@@ -92,7 +92,7 @@ Three policies on agent templates:
 
 ### Cost accounting
 
-Per-session rolling `tokens_in`, `tokens_out`, `cost_usd` sourced from the provider's billing data (cache-aware, not a static price sheet). Anthropic / OpenAI / Google / xAI / Mistral / OpenRouter / Bedrock report non-zero cost automatically. Moonshot currently gets real cost via the runtime's `docker/provider-prices.json` overrides layered onto the bundled catalog; when upstream ships the same prices, deleting the override block cleanly defers back to upstream.
+Per-session rolling `tokens_in`, `tokens_out`, `cost_usd` sourced from the provider's billing data (cache-aware, not a static price sheet). Anthropic / OpenAI / Google / xAI / Mistral / OpenRouter / Bedrock report non-zero cost automatically. Moonshot and DeepSeek direct-provider v4 models currently get real cost via the runtime's `docker/provider-prices.json` patches layered onto the bundled catalog; when upstream ships the same prices and model ids, deleting the local provider block cleanly defers back to upstream.
 
 ### Observability
 

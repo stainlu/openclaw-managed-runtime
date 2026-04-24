@@ -1,15 +1,16 @@
 {
   "_meta": {
-    "updated": "2026-04-19",
+    "updated": "2026-04-24",
     "format": "USD per 1M tokens",
     "notes": [
       "openclaw's cost formula is: tokens * cost.input / 1e6 (see dist/usage-format-*.js:estimateUsageCost). Values here are $ per 1M tokens — the industry-standard pricing quote.",
-      "Direct providers (Anthropic, OpenAI, Google, xAI, Mistral, Bedrock) ship real prices in openclaw's upstream catalog. This file ONLY overrides the ones that ship $0 (currently Moonshot — tracked upstream in openclaw/openclaw#67928).",
+      "Direct providers (Anthropic, OpenAI, Google, xAI, Mistral, Bedrock) generally ship real prices in openclaw's upstream catalog. This file only patches providers whose bundled catalog still lags the provider's live docs/catalog (currently Moonshot and DeepSeek direct-provider v4 models).",
       "For OpenRouter-routed models, use OpenRouter's live API (https://openrouter.ai/api/v1/models) instead of this file — it returns current per-token rates.",
       "China-region Moonshot (platform.kimi.com) is cheaper in CNY; the values below are the international USD tier from platform.kimi.ai."
     ],
     "sources": {
-      "moonshot": "https://platform.kimi.ai/docs/pricing/chat-k25 and .../chat-k2 (2026-04-19)"
+      "moonshot": "https://platform.kimi.ai/docs/pricing/chat-k25 and .../chat-k2 (2026-04-19)",
+      "deepseek": "https://api-docs.deepseek.com/quick_start/pricing/ (2026-04-24)"
     }
   },
 
@@ -29,5 +30,42 @@
     "kimi-k2-thinking":       { "input": 0.60, "output": 2.50, "cacheRead": 0.15, "cacheWrite": 0 },
     "kimi-k2-thinking-turbo": { "input": 1.15, "output": 8.00, "cacheRead": 0.15, "cacheWrite": 0 },
     "kimi-k2-turbo":          { "input": 1.15, "output": 8.00, "cacheRead": 0.15, "cacheWrite": 0 }
+  },
+
+  "deepseek": {
+    "deepseek-chat": {
+      "input": 0.14,
+      "output": 0.28,
+      "cacheRead": 0.028,
+      "cacheWrite": 0
+    },
+    "deepseek-reasoner": {
+      "input": 0.14,
+      "output": 0.28,
+      "cacheRead": 0.028,
+      "cacheWrite": 0
+    },
+    "deepseek-v4-flash": {
+      "name": "DeepSeek V4 Flash",
+      "reasoning": true,
+      "modalities": ["text"],
+      "contextWindow": 1048576,
+      "maxTokens": 393216,
+      "input": 0.14,
+      "output": 0.28,
+      "cacheRead": 0.028,
+      "cacheWrite": 0
+    },
+    "deepseek-v4-pro": {
+      "name": "DeepSeek V4 Pro",
+      "reasoning": true,
+      "modalities": ["text"],
+      "contextWindow": 1048576,
+      "maxTokens": 393216,
+      "input": 1.74,
+      "output": 3.48,
+      "cacheRead": 0.145,
+      "cacheWrite": 0
+    }
   }
 }

@@ -80,4 +80,112 @@ describe("apply-provider-config", () => {
     expect(lines.join("")).toContain("injected 1 missing moonshot model(s)");
     expect(lines.join("")).toContain("skipped 1 missing moonshot model(s)");
   });
+
+  it("patches DeepSeek legacy aliases and injects v4 catalog entries", () => {
+    const providerConfig = {
+      api: "openai-completions",
+      baseUrl: "https://api.deepseek.com",
+      models: [
+        {
+          id: "deepseek-chat",
+          name: "DeepSeek Chat",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0.28, output: 0.42, cacheRead: 0.028, cacheWrite: 0 },
+          contextWindow: 131072,
+          maxTokens: 8192,
+        },
+        {
+          id: "deepseek-reasoner",
+          name: "DeepSeek Reasoner",
+          reasoning: true,
+          input: ["text"],
+          cost: { input: 0.28, output: 0.42, cacheRead: 0.028, cacheWrite: 0 },
+          contextWindow: 131072,
+          maxTokens: 65536,
+        },
+      ],
+    };
+    const overrides = {
+      deepseek: {
+        "deepseek-chat": {
+          input: 0.14,
+          output: 0.28,
+          cacheRead: 0.028,
+          cacheWrite: 0,
+        },
+        "deepseek-reasoner": {
+          input: 0.14,
+          output: 0.28,
+          cacheRead: 0.028,
+          cacheWrite: 0,
+        },
+        "deepseek-v4-flash": {
+          name: "DeepSeek V4 Flash",
+          reasoning: true,
+          modalities: ["text"],
+          contextWindow: 1048576,
+          maxTokens: 393216,
+          input: 0.14,
+          output: 0.28,
+          cacheRead: 0.028,
+          cacheWrite: 0,
+        },
+        "deepseek-v4-pro": {
+          name: "DeepSeek V4 Pro",
+          reasoning: true,
+          modalities: ["text"],
+          contextWindow: 1048576,
+          maxTokens: 393216,
+          input: 1.74,
+          output: 3.48,
+          cacheRead: 0.145,
+          cacheWrite: 0,
+        },
+      },
+    };
+
+    applyPriceOverrides("deepseek", providerConfig, overrides);
+
+    expect(providerConfig.models.map((m) => m.id)).toEqual([
+      "deepseek-chat",
+      "deepseek-reasoner",
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+    ]);
+    expect(providerConfig.models[0].cost).toEqual({
+      input: 0.14,
+      output: 0.28,
+      cacheRead: 0.028,
+      cacheWrite: 0,
+    });
+    expect(providerConfig.models[2]).toMatchObject({
+      id: "deepseek-v4-flash",
+      name: "DeepSeek V4 Flash",
+      reasoning: true,
+      input: ["text"],
+      contextWindow: 1048576,
+      maxTokens: 393216,
+      cost: {
+        input: 0.14,
+        output: 0.28,
+        cacheRead: 0.028,
+        cacheWrite: 0,
+      },
+    });
+    expect(providerConfig.models[3]).toMatchObject({
+      id: "deepseek-v4-pro",
+      name: "DeepSeek V4 Pro",
+      reasoning: true,
+      input: ["text"],
+      contextWindow: 1048576,
+      maxTokens: 393216,
+      cost: {
+        input: 1.74,
+        output: 3.48,
+        cacheRead: 0.145,
+        cacheWrite: 0,
+      },
+    });
+  });
 });
