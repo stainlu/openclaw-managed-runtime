@@ -38,7 +38,13 @@ const log = getLogger("router");
 // Fix: before spawning the container, pre-create the session workspace
 // directory on the orchestrator's in-process mount view and chown it to
 // this UID. On macOS the chown is a harmless no-op.
-const AGENT_CONTAINER_UID = 999;
+//
+// NOTE: This value MUST stay in sync with the `useradd -r -u 999` in
+// Dockerfile.runtime. If they diverge, workspace directories will be
+// owned by the wrong UID and the container's openclaw user won't be able
+// to write its openclaw.json. Set OPENCLAW_AGENT_CONTAINER_UID env var
+// to override if your image uses a different UID.
+const AGENT_CONTAINER_UID = Number.parseInt(process.env.OPENCLAW_AGENT_CONTAINER_UID ?? "999", 10);
 
 export type RouterConfig = {
   /** Image reference for the OpenClaw agent container. */
