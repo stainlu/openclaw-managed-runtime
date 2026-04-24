@@ -40,6 +40,7 @@ import type {
 } from "./types.js";
 
 const nanoid = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 12);
+const SESSION_STATUS_VALUES_SQL = `'idle', 'starting', 'running', 'failed'`;
 
 // ---------- Row shapes ----------
 
@@ -158,6 +159,46 @@ function rowToSession(r: SessionRow): Session {
   };
 }
 
+function createSessionsTableSql(tableName: string): string {
+  return `
+CREATE TABLE ${tableName} (
+  session_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  environment_id TEXT,
+  status TEXT NOT NULL CHECK (status IN (${SESSION_STATUS_VALUES_SQL})),
+  ephemeral INTEGER NOT NULL DEFAULT 0,
+  remaining_subagent_depth INTEGER NOT NULL DEFAULT 0,
+  turns INTEGER NOT NULL DEFAULT 0,
+  tokens_in INTEGER NOT NULL DEFAULT 0,
+  tokens_out INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  last_event_at INTEGER,
+  vault_id TEXT,
+  parent_session_id TEXT,
+  user_id TEXT
+)`;
+}
+
+function createSessionContainersTableSql(
+  tableName: string,
+  sessionsTableName: string,
+): string {
+  return `
+CREATE TABLE ${tableName} (
+  session_id TEXT PRIMARY KEY REFERENCES ${sessionsTableName}(session_id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL,
+  container_id TEXT NOT NULL,
+  container_name TEXT NOT NULL,
+  container_port INTEGER NOT NULL,
+  gateway_token TEXT NOT NULL,
+  claimed_at INTEGER NOT NULL,
+  boot_ms INTEGER,
+  pool_source TEXT
+)`;
+}
+
 // ---------- Schema bootstrap ----------
 
 // Applied once per database. Idempotent — every CREATE uses IF NOT EXISTS.
@@ -226,7 +267,8 @@ CREATE TABLE IF NOT EXISTS environments (
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('idle', 'running', 'failed')),
+  environment_id TEXT,
+  status TEXT NOT NULL CHECK (status IN (${SESSION_STATUS_VALUES_SQL})),
   ephemeral INTEGER NOT NULL DEFAULT 0,
   remaining_subagent_depth INTEGER NOT NULL DEFAULT 0,
   turns INTEGER NOT NULL DEFAULT 0,
@@ -237,7 +279,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at INTEGER NOT NULL,
   last_event_at INTEGER,
   vault_id TEXT,
-  parent_session_id TEXT
+  parent_session_id TEXT,
+  user_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id);
@@ -1794,6 +1837,7 @@ export class SqliteStore implements Store {
     if (scCols.length > 0 && !scCols.some((c) => c.name === "pool_source")) {
       this.db.exec("ALTER TABLE session_containers ADD COLUMN pool_source TEXT");
     }
+    this.migrateSessionStatusConstraint();
 
     const envCols = this.db.pragma("table_info(environments)") as Array<{
       name: string;
@@ -1843,6 +1887,86 @@ export class SqliteStore implements Store {
     // plaintext before at-rest encryption was wired. Idempotent — a
     // second pass on an already-encrypted DB is a no-op.
     this.migratedVaultCredentials = vaultsStore.migratePlaintextCredentials();
+  }
+
+  private migrateSessionStatusConstraint(): void {
+    const row = this.db
+      .prepare(
+        `SELECT sql
+           FROM sqlite_master
+          WHERE type = 'table' AND name = 'sessions'`,
+      )
+      .get() as { sql: string | null } | undefined;
+    const sessionsSql = row?.sql ?? "";
+    if (sessionsSql.includes("'starting'")) return;
+
+    const fkWasEnabled =
+      (this.db.pragma("foreign_keys", { simple: true }) as number) === 1;
+    if (fkWasEnabled) {
+      this.db.pragma("foreign_keys = OFF");
+    }
+    try {
+      const migrate = this.db.transaction(() => {
+        this.db.exec(createSessionsTableSql("sessions_new"));
+        this.db.exec(`
+          INSERT INTO sessions_new (
+            session_id, agent_id, environment_id, status, ephemeral,
+            remaining_subagent_depth, turns, tokens_in, tokens_out, cost_usd,
+            error, created_at, last_event_at, vault_id, parent_session_id, user_id
+          )
+          SELECT
+            session_id, agent_id, environment_id, status, ephemeral,
+            remaining_subagent_depth, turns, tokens_in, tokens_out, cost_usd,
+            error, created_at, last_event_at, vault_id, parent_session_id, user_id
+          FROM sessions
+        `);
+        this.db.exec(
+          createSessionContainersTableSql(
+            "session_containers_new",
+            "sessions_new",
+          ),
+        );
+        this.db.exec(`
+          INSERT INTO session_containers_new (
+            session_id, agent_id, container_id, container_name, container_port,
+            gateway_token, claimed_at, boot_ms, pool_source
+          )
+          SELECT
+            session_id, agent_id, container_id, container_name, container_port,
+            gateway_token, claimed_at, boot_ms, pool_source
+          FROM session_containers
+        `);
+        this.db.exec("DROP TABLE session_containers");
+        this.db.exec("DROP TABLE sessions");
+        this.db.exec("ALTER TABLE sessions_new RENAME TO sessions");
+        this.db.exec(
+          "ALTER TABLE session_containers_new RENAME TO session_containers",
+        );
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id)",
+        );
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)",
+        );
+        this.db.exec(
+          "CREATE INDEX IF NOT EXISTS idx_session_containers_container ON session_containers(container_id)",
+        );
+      });
+      migrate();
+    } finally {
+      if (fkWasEnabled) {
+        this.db.pragma("foreign_keys = ON");
+      }
+    }
+
+    const fkViolations = this.db.pragma(
+      "foreign_key_check",
+    ) as Array<Record<string, unknown>>;
+    if (fkViolations.length > 0) {
+      throw new Error(
+        `session status migration left foreign key violations: ${JSON.stringify(fkViolations)}`,
+      );
+    }
   }
 
   close(): void {

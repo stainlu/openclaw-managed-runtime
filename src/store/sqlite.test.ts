@@ -41,10 +41,22 @@ function columns(db: Database.Database, table: string): Set<string> {
 
 describe("SqliteStore — fresh-DB schema", () => {
   it("creates every table and every current column on a brand new file", () => {
-    const store = new SqliteStore(newDbPath());
+    const path = newDbPath();
+    const store = new SqliteStore(path);
+    const agent = store.agents.create({
+      model: "m",
+      tools: [],
+      instructions: "",
+      permissionPolicy: { type: "always_allow" },
+      callableAgents: [],
+      maxSubagentDepth: 0,
+    });
+    const session = store.sessions.create({ agentId: agent.agentId });
+    store.sessions.beginRun(session.sessionId);
+    expect(store.sessions.get(session.sessionId)?.status).toBe("starting");
     // Read via a second handle so we can snapshot the schema without
     // going through the ORM-shaped methods.
-    const probe = new Database(newDbPath(), { readonly: true });
+    const probe = new Database(path, { readonly: true });
     const agents = columns(probe, "agents");
     const sessions = columns(probe, "sessions");
     const envs = columns(probe, "environments");
@@ -148,6 +160,94 @@ describe("SqliteStore — additive migrations on pre-existing DBs", () => {
     expect(row.ephemeral).toBe(0); // safe default (not ephemeral)
     expect(row.remaining_subagent_depth).toBe(0); // safe default (no subagents)
     expect(row.environment_id).toBeNull(); // nullable column
+  });
+
+  it("upgrades the sessions status constraint in place and preserves session_container foreign keys", () => {
+    const path = newDbPath();
+    const seed = new Database(path);
+    seed.pragma("foreign_keys = ON");
+    seed.exec(`
+      CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        environment_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('idle','running','failed')),
+        ephemeral INTEGER NOT NULL DEFAULT 0,
+        remaining_subagent_depth INTEGER NOT NULL DEFAULT 0,
+        turns INTEGER NOT NULL DEFAULT 0,
+        tokens_in INTEGER NOT NULL DEFAULT 0,
+        tokens_out INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL NOT NULL DEFAULT 0,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        last_event_at INTEGER,
+        vault_id TEXT,
+        parent_session_id TEXT,
+        user_id TEXT
+      );
+      CREATE TABLE session_containers (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL,
+        container_id TEXT NOT NULL,
+        container_name TEXT NOT NULL,
+        container_port INTEGER NOT NULL,
+        gateway_token TEXT NOT NULL,
+        claimed_at INTEGER NOT NULL,
+        boot_ms INTEGER,
+        pool_source TEXT
+      );
+      CREATE INDEX idx_session_containers_container ON session_containers(container_id);
+    `);
+    seed.prepare(
+      `INSERT INTO sessions (
+        session_id, agent_id, environment_id, status, ephemeral,
+        remaining_subagent_depth, turns, tokens_in, tokens_out, cost_usd,
+        error, created_at, last_event_at, vault_id, parent_session_id, user_id
+      ) VALUES (
+        ?, ?, NULL, 'idle', 0,
+        0, 0, 0, 0, 0,
+        NULL, ?, NULL, NULL, NULL, NULL
+      )`,
+    ).run("ses_old", "agt_old", 1000);
+    seed.prepare(
+      `INSERT INTO session_containers (
+        session_id, agent_id, container_id, container_name, container_port,
+        gateway_token, claimed_at, boot_ms, pool_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "ses_old",
+      "agt_old",
+      "cid_old",
+      "openclaw-agt-old",
+      18789,
+      "tok_old",
+      1001,
+      250,
+      "warm",
+    );
+    seed.close();
+
+    const store = new SqliteStore(path);
+    store.sessions.beginRun("ses_old");
+    expect(store.sessions.get("ses_old")?.status).toBe("starting");
+    expect(store.sessions.delete("ses_old")).toBe(true);
+    store.close();
+
+    const probe = new Database(path, { readonly: true });
+    const fk = probe.pragma("foreign_key_list(session_containers)") as Array<{
+      table: string;
+    }>;
+    const remainingContainers = probe
+      .prepare(`SELECT COUNT(*) as count FROM session_containers`)
+      .get() as { count: number };
+    const sessionsSql = probe
+      .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'`)
+      .get() as { sql: string };
+    probe.close();
+
+    expect(fk[0]?.table).toBe("sessions");
+    expect(remainingContainers.count).toBe(0);
+    expect(sessionsSql.sql).toContain("'starting'");
   });
 
   it("adds every agents migration column when opening a v1-era DB", () => {
