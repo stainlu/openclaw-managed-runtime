@@ -4,9 +4,10 @@ import { ParentTokenMinter } from "../runtime/parent-token.js";
 import { InMemoryStore } from "../store/memory.js";
 import { RouterError } from "./router.js";
 import { buildApp, type ServerDeps } from "./server.js";
+import { clearZenMuxCatalogCache } from "./zenmux-pricing.js";
 import type { Event, Session } from "./types.js";
 
-function makeApp() {
+function makeApp(opts: { passthroughEnv?: Record<string, string> } = {}) {
   const store = new InMemoryStore();
   const latestBySession = new Map<string, Event>();
   const routerCalls = {
@@ -156,6 +157,7 @@ function makeApp() {
     startTs: Date.now(),
     maxWarmContainers: 0,
     maxActiveContainers: 0,
+    passthroughEnv: opts.passthroughEnv,
   };
 
   return {
@@ -288,6 +290,74 @@ describe("session ownership in the HTTP API", () => {
       cost_usd: 0.42,
       output: "reply:hi",
     });
+  });
+
+  it("estimates ZenMux cost for session reads when transcript cost is missing", async () => {
+    clearZenMuxCatalogCache();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "https://zenmux.ai/api/v1/models") {
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "openai/gpt-5.4",
+                pricings: {
+                  prompt: [{ value: 2.5, unit: "perMTokens", currency: "USD" }],
+                  completion: [{ value: 10, unit: "perMTokens", currency: "USD" }],
+                  request: [{ value: 0.01, unit: "perCount", currency: "USD" }],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+    try {
+      const { app, store, latestBySession } = makeApp({
+        passthroughEnv: { ZENMUX_API_KEY: "sk-test" },
+      });
+      const agent = store.agents.create({
+        model: "openai/gpt-5.4",
+        tools: [],
+        instructions: "",
+        permissionPolicy: { type: "always_allow" },
+        callableAgents: [],
+        maxSubagentDepth: 0,
+      });
+      const session = store.sessions.create({
+        agentId: agent.agentId,
+        userId: null,
+      });
+      const now = Date.now();
+      latestBySession.set(session.sessionId, {
+        eventId: `evt_${session.sessionId}_${now}`,
+        sessionId: session.sessionId,
+        type: "agent.message",
+        content: "reply:hi",
+        createdAt: now,
+        tokensIn: 321,
+        tokensOut: 45,
+        model: "zenmux/openai/gpt-5.4",
+      });
+
+      const res = await req(app, `/v1/sessions/${session.sessionId}`, {
+        token: "admin-secret",
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        session_id: session.sessionId,
+        tokens: { input: 321, output: 45 },
+        cost_usd: 0.0112525,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearZenMuxCatalogCache();
+    }
   });
 
   it("does not let another user reuse a named chat-completions session key", async () => {

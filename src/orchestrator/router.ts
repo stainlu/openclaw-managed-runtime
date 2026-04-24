@@ -26,6 +26,7 @@ import type {
 } from "../store/types.js";
 import type { VaultCredentialMcpOAuth } from "../store/types.js";
 import type { AgentConfig, Event, Session } from "./types.js";
+import { estimateZenMuxTurnCostUsd } from "./zenmux-pricing.js";
 
 const log = getLogger("router");
 
@@ -755,7 +756,12 @@ export class AgentRouter {
           );
           const tokensIn = latest?.tokensIn ?? 0;
           const tokensOut = latest?.tokensOut ?? 0;
-          const costUsd = latest?.costUsd ?? 0;
+          const costUsd = await router.resolveRunCostUsd(
+            latest?.model ?? normalizeModelForRuntime(agent.model, router.cfg.passthroughEnv),
+            tokensIn,
+            tokensOut,
+            latest?.costUsd,
+          );
           router.pendingApprovals.delete(args.sessionId);
           router.sessions.endRunSuccess(args.sessionId, { tokensIn, tokensOut, costUsd });
           return;
@@ -1481,27 +1487,19 @@ export class AgentRouter {
       "chat.completions returned",
     );
 
-    // Item 9 — cost accounting. Pi's provider plugins compute the
-    // authoritative per-turn cost from their catalogs (cache-aware: a
-    // cacheRead-heavy turn pays the cache-read rate, not the normal
-    // input rate) and write it to message.usage.cost.total in the JSONL.
-    // PiJsonlEventReader already surfaces that as agent.message.costUsd,
-    // so the orchestrator reads the single source of truth rather than
-    // maintaining a separate static price sheet that would drift. If
-    // the provider plugin does not report cost (for example, when the
-    // pinned OpenClaw runtime is missing full catalog metadata for a
-    // downstream model id), the recorded cost is 0 — not a rollup bug,
-    // just the truth per the active catalog. Updating the runtime
-    // provider catalog or our price-override injection layer will
-    // propagate through this path with zero code changes.
     const latestAgent = this.assertTurnAdvanced(
       agent.agentId,
       sessionId,
       beforeTurn,
     );
-    const costUsd = latestAgent?.costUsd ?? 0;
     const tokensIn = latestAgent?.tokensIn ?? completion.tokensIn;
     const tokensOut = latestAgent?.tokensOut ?? completion.tokensOut;
+    const costUsd = await this.resolveRunCostUsd(
+      latestAgent?.model ?? normalizeModelForRuntime(agent.model, this.cfg.passthroughEnv),
+      tokensIn,
+      tokensOut,
+      latestAgent?.costUsd,
+    );
 
     const usage: RunUsage = {
       tokensIn,
@@ -1627,7 +1625,12 @@ export class AgentRouter {
       const latest = this.events.latestAgentMessage(agent.agentId, sessionId);
       const tokensIn = latest?.tokensIn ?? 0;
       const tokensOut = latest?.tokensOut ?? 0;
-      const costUsd = latest?.costUsd ?? 0;
+      const costUsd = await this.resolveRunCostUsd(
+        latest?.model ?? normalizeModelForRuntime(agent.model, this.cfg.passthroughEnv),
+        tokensIn,
+        tokensOut,
+        latest?.costUsd,
+      );
       this.pendingApprovals.delete(sessionId);
       this.sessions.endRunSuccess(sessionId, { tokensIn, tokensOut, costUsd });
       log.info(
@@ -1677,6 +1680,33 @@ export class AgentRouter {
       latestAgentMessageId:
         this.events.latestAgentMessage(agentId, sessionId)?.eventId,
     };
+  }
+
+  private async resolveRunCostUsd(
+    model: string | undefined,
+    tokensIn: number,
+    tokensOut: number,
+    transcriptCostUsd: number | undefined,
+  ): Promise<number> {
+    if (transcriptCostUsd !== undefined) {
+      return transcriptCostUsd;
+    }
+    try {
+      return (
+        (await estimateZenMuxTurnCostUsd({
+          model,
+          tokensIn,
+          tokensOut,
+          passthroughEnv: this.cfg.passthroughEnv,
+        })) ?? 0
+      );
+    } catch (err) {
+      log.warn(
+        { err, model, tokens_in: tokensIn, tokens_out: tokensOut },
+        "ZenMux cost fallback failed; recording zero cost",
+      );
+      return 0;
+    }
   }
 
   private assertTurnAdvanced(

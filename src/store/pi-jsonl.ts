@@ -42,6 +42,10 @@ type PiMessage = {
     output_tokens?: number;
     prompt_tokens?: number;
     completion_tokens?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    promptTokens?: number;
+    completionTokens?: number;
     cost?: {
       total?: number;
     } | number;
@@ -526,11 +530,15 @@ function normalizeUsage(usage: PiMessage["usage"] | undefined): {
   const tokensIn =
     finiteNumber(usage.input) ??
     finiteNumber(usage.input_tokens) ??
-    finiteNumber(usage.prompt_tokens);
+    finiteNumber(usage.prompt_tokens) ??
+    finiteNumber(usage.inputTokens) ??
+    finiteNumber(usage.promptTokens);
   const tokensOut =
     finiteNumber(usage.output) ??
     finiteNumber(usage.output_tokens) ??
-    finiteNumber(usage.completion_tokens);
+    finiteNumber(usage.completion_tokens) ??
+    finiteNumber(usage.outputTokens) ??
+    finiteNumber(usage.completionTokens);
   const costUsd =
     typeof usage.cost === "number"
       ? finiteNumber(usage.cost)

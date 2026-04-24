@@ -6,6 +6,7 @@ import type { SessionContainerPool } from "../runtime/pool.js";
 import { InMemoryStore } from "../store/memory.js";
 import { PiJsonlEventReader } from "../store/pi-jsonl.js";
 import type { QueueStore } from "../store/types.js";
+import { clearZenMuxCatalogCache } from "./zenmux-pricing.js";
 import {
   AgentRouter,
   RouterError,
@@ -21,6 +22,7 @@ import {
 function makeRouter(opts: {
   poolStub?: Partial<SessionContainerPool>;
   eventReaderStub?: Partial<PiJsonlEventReader>;
+  passthroughEnv?: Record<string, string>;
 } = {}): {
   router: AgentRouter;
   store: InMemoryStore;
@@ -41,7 +43,7 @@ function makeRouter(opts: {
     hostStateRoot: "/tmp/test-state",
     network: "test-net",
     gatewayPort: 18789,
-    passthroughEnv: {},
+    passthroughEnv: opts.passthroughEnv ?? {},
     runTimeoutMs: 60_000,
     orchestratorUrl: "http://orchestrator-test:8080",
     tokenMinter: new ParentTokenMinter(),
@@ -62,6 +64,7 @@ function makeRouter(opts: {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  clearZenMuxCatalogCache();
 });
 
 async function waitForSessionToStopRunning(
@@ -689,6 +692,89 @@ describe("AgentRouter.runEvent — JSONL advancement guarantees", () => {
     expect(finished?.tokensIn).toBe(18);
     expect(finished?.tokensOut).toBe(6);
     expect(finished?.costUsd).toBe(0.05);
+  });
+
+  it("estimates cost from the live ZenMux catalog when transcript cost is missing", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "http://container.test/v1/chat/completions") {
+          return new Response(
+            JSON.stringify({
+              choices: [{ message: { content: "done" } }],
+              usage: { prompt_tokens: 321, completion_tokens: 45 },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "https://zenmux.ai/api/v1/models") {
+          return new Response(
+            JSON.stringify({
+              data: [
+                {
+                  id: "openai/gpt-5.4",
+                  pricings: {
+                    prompt: [{ value: 2.5, unit: "perMTokens", currency: "USD" }],
+                    completion: [{ value: 10, unit: "perMTokens", currency: "USD" }],
+                    request: [{ value: 0.01, unit: "perCount", currency: "USD" }],
+                  },
+                },
+              ],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+    const fakeEvents = {
+      stateRoot: "/tmp/test-state",
+      countUserTurns: vi
+        .fn()
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(1),
+      latestAgentMessage: vi
+        .fn()
+        .mockReturnValueOnce(undefined)
+        .mockReturnValueOnce({
+          eventId: "evt_new",
+          sessionId: "ses_unused",
+          type: "agent.message",
+          content: "done",
+          createdAt: Date.now(),
+          tokensIn: 321,
+          tokensOut: 45,
+          model: "zenmux/openai/gpt-5.4",
+        }),
+    };
+    const { router, store } = makeRouter({
+      poolStub: {
+        acquireForSession: async () =>
+          ({ baseUrl: "http://container.test", token: "tok" }) as any,
+        evictSession: async () => {},
+      },
+      eventReaderStub: fakeEvents as unknown as PiJsonlEventReader,
+      passthroughEnv: { ZENMUX_API_KEY: "sk-test" },
+    });
+    const agent = store.agents.create({
+      model: "openai/gpt-5.4",
+      tools: [],
+      instructions: "",
+      permissionPolicy: { type: "always_allow" },
+      callableAgents: [],
+      maxSubagentDepth: 0,
+    });
+    const session = router.createSession(agent.agentId);
+
+    await router.runEvent({ sessionId: session.sessionId, content: "hi" });
+    await waitForSessionToStopRunning(store, session.sessionId);
+
+    const finished = store.sessions.get(session.sessionId);
+    expect(finished?.status).toBe("idle");
+    expect(finished?.tokensIn).toBe(321);
+    expect(finished?.tokensOut).toBe(45);
+    expect(finished?.costUsd).toBeCloseTo(0.0112525, 8);
   });
 });
 

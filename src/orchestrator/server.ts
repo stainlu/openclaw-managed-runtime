@@ -29,6 +29,11 @@ import { portalHtml } from "./portal.js";
 import { portalV2Html } from "./portal-v2.js";
 import { AgentRouter, RouterError } from "./router.js";
 import {
+  estimateZenMuxTurnCostFromCatalog,
+  fetchZenMuxCatalogCached,
+  resolveZenMuxCatalogModelId,
+} from "./zenmux-pricing.js";
+import {
   AddCredentialRequestSchema,
   CreateAgentRequestSchema,
   CreateEnvironmentRequestSchema,
@@ -162,6 +167,7 @@ export type ServerDeps = {
    * visibility when diagnosing cold-spawn pressure.
    */
   maxActiveContainers: number;
+  passthroughEnv?: Record<string, string>;
 };
 
 function agentResponse(agent: AgentConfig) {
@@ -244,16 +250,47 @@ function environmentResponse(env: EnvironmentConfig) {
 // ephemeral and only exists while the pool holds it. When the pool
 // reaps a session's container, the session_containers row is deleted
 // and these fields go null on subsequent responses.
-function sessionResponse(
+async function sessionResponse(
   session: Session,
   events: PiJsonlEventReader,
+  passthroughEnv: Record<string, string> | undefined,
   containers?: SessionContainerStore,
 ) {
   const latestAgent = events.latestAgentMessage(session.agentId, session.sessionId);
   const containerRow = containers?.get(session.sessionId);
   const tokensIn = Math.max(session.tokensIn, latestAgent?.tokensIn ?? 0);
   const tokensOut = Math.max(session.tokensOut, latestAgent?.tokensOut ?? 0);
-  const costUsd = Math.max(session.costUsd, latestAgent?.costUsd ?? 0);
+  let costUsd = Math.max(session.costUsd, latestAgent?.costUsd ?? 0);
+  if (
+    costUsd === 0 &&
+    passthroughEnv?.ZENMUX_API_KEY &&
+    latestAgent?.model &&
+    (tokensIn > 0 || tokensOut > 0)
+  ) {
+    const modelId = resolveZenMuxCatalogModelId(latestAgent.model, passthroughEnv);
+    if (modelId) {
+      try {
+        const catalog = await fetchZenMuxCatalogCached({
+          apiKey: passthroughEnv.ZENMUX_API_KEY,
+          baseUrl: passthroughEnv.ZENMUX_BASE_URL,
+        });
+        costUsd = Math.max(
+          costUsd,
+          estimateZenMuxTurnCostFromCatalog({
+            catalog,
+            modelId,
+            tokensIn,
+            tokensOut,
+          }) ?? 0,
+        );
+      } catch (err) {
+        log.warn(
+          { err, model: latestAgent.model, session_id: session.sessionId },
+          "ZenMux session cost fallback failed for session response",
+        );
+      }
+    }
+  }
   return {
     session_id: session.sessionId,
     agent_id: session.agentId,
@@ -1023,7 +1060,7 @@ export function buildApp(deps: ServerDeps): Hono {
       void deps.router.warmSession(session.sessionId).catch((err) => {
         log.warn({ err, session_id: session.sessionId }, "background warm-up failed (non-fatal)");
       });
-      return c.json(sessionResponse(session, deps.events, deps.sessionContainers));
+      return c.json(await sessionResponse(session, deps.events, deps.passthroughEnv, deps.sessionContainers));
     } catch (err) {
       writeAudit(deps.audit, c, {
         action: "session.create",
@@ -1035,21 +1072,23 @@ export function buildApp(deps: ServerDeps): Hono {
     }
   });
 
-  app.get("/v1/sessions", (c) => {
+  app.get("/v1/sessions", async (c) => {
     const uid = getUserId(c);
     const all = deps.sessions.list();
     const scoped = uid ? all.filter((s) => s.userId === uid) : all;
-    const sessions = scoped.map((s) => sessionResponse(s, deps.events, deps.sessionContainers));
+    const sessions = await Promise.all(
+      scoped.map((s) => sessionResponse(s, deps.events, deps.passthroughEnv, deps.sessionContainers)),
+    );
     return c.json({ sessions, count: sessions.length });
   });
 
-  app.get("/v1/sessions/:sessionId", (c) => {
+  app.get("/v1/sessions/:sessionId", async (c) => {
     const sessionId = c.req.param("sessionId");
     const session = getScopedSession(c, sessionId);
     if (!session) {
       return c.json({ error: "session_not_found" }, 404);
     }
-    return c.json(sessionResponse(session, deps.events, deps.sessionContainers));
+    return c.json(await sessionResponse(session, deps.events, deps.passthroughEnv, deps.sessionContainers));
   });
 
   app.delete("/v1/sessions/:sessionId", async (c) => {

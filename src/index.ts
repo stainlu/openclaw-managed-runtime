@@ -709,6 +709,7 @@ async function main(): Promise<void> {
       commitSha: process.env.OPENCLAW_COMMIT,
       maxWarmContainers,
       maxActiveContainers,
+      passthroughEnv,
     },
     { port },
   );

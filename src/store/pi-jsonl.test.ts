@@ -137,6 +137,38 @@ describe("PiJsonlEventReader", () => {
     });
   });
 
+  it("normalizes camelCase usage aliases from transcript entries", () => {
+    const f = makeFixture([
+      {
+        type: "message",
+        id: "evt-1",
+        timestamp: "2026-04-24T12:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          provider: "zenmux",
+          model: "deepseek/deepseek-v4-pro",
+          usage: {
+            inputTokens: 222,
+            outputTokens: 33,
+            cost: { total: 0.0017 },
+          },
+        },
+      },
+    ]);
+    fixtures.push(f);
+    const reader = new PiJsonlEventReader(f.root);
+    const events = reader.listBySession(f.agentId, f.sessionId);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "agent.message",
+      tokensIn: 222,
+      tokensOut: 33,
+      costUsd: 0.0017,
+      model: "zenmux/deepseek/deepseek-v4-pro",
+    });
+  });
+
   describe("follow() resume cursor", () => {
     function threeEventFixture(): Fixture {
       return makeFixture([
