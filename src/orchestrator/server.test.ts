@@ -350,7 +350,7 @@ describe("model catalog API", () => {
         return new Response(
           JSON.stringify({
             data: [
-              { id: "anthropic/claude-opus-4.5" },
+              { id: "anthropic/claude-opus-4.7" },
             ],
           }),
           { status: 200, headers: { "content-type": "application/json" } },
@@ -377,7 +377,7 @@ describe("model catalog API", () => {
 
       expect(res.status).toBe(200);
       expect(res.body).toMatchObject({
-        model: "anthropic/claude-opus-4.5",
+        model: "anthropic/claude-opus-4.7",
       });
     } finally {
       globalThis.fetch = originalFetch;
@@ -394,7 +394,7 @@ describe("model catalog API", () => {
         return new Response(
           JSON.stringify({
             data: [
-              { id: "anthropic/claude-opus-4.5" },
+              { id: "anthropic/claude-opus-4.7" },
             ],
           }),
           { status: 200, headers: { "content-type": "application/json" } },

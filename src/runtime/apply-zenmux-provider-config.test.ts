@@ -127,8 +127,8 @@ describe("apply-zenmux-provider-config", () => {
       catalog: {
         data: [
           {
-            id: "anthropic/claude-opus-4.5",
-            display_name: "Anthropic: Claude Opus 4.5",
+            id: "anthropic/claude-opus-4.7",
+            display_name: "Anthropic: Claude Opus 4.7",
             input_modalities: ["text", "image"],
             capabilities: { reasoning: true },
             context_length: 200000,
@@ -148,8 +148,8 @@ describe("apply-zenmux-provider-config", () => {
     expect(provider).toMatchObject({
       models: [
         {
-          id: "anthropic/claude-opus-4.5",
-          name: "Anthropic: Claude Opus 4.5",
+          id: "anthropic/claude-opus-4.7",
+          name: "Anthropic: Claude Opus 4.7",
           reasoning: true,
           input: ["text", "image"],
         },
