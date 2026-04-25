@@ -249,6 +249,27 @@ type ModelCatalogItem = {
   input_modalities?: string[];
 };
 
+const CURATED_MODEL_CATALOG: ModelCatalogItem[] = [
+  { id: "deepseek/deepseek-v4-pro", provider: "deepseek", name: "DeepSeek V4 Pro" },
+  { id: "deepseek/deepseek-v4-flash", provider: "deepseek", name: "DeepSeek V4 Flash" },
+  { id: "openai/gpt-5.5", provider: "openai", name: "GPT-5.5" },
+  { id: "openai/gpt-5.4", provider: "openai", name: "GPT-5.4" },
+  { id: "anthropic/claude-opus-4.7", provider: "anthropic", name: "Claude Opus 4.7" },
+  { id: "anthropic/claude-opus-4.6", provider: "anthropic", name: "Claude Opus 4.6" },
+  { id: "google/gemini-3.1-pro-preview", provider: "google", name: "Gemini 3.1 Pro Preview" },
+  { id: "google/gemini-3.1-flash-lite-preview", provider: "google", name: "Gemini 3.1 Flash Lite Preview" },
+  { id: "qwen/qwen3.6-plus", provider: "qwen", name: "Qwen3.6 Plus" },
+  { id: "qwen/qwen3.5-flash", provider: "qwen", name: "Qwen3.5 Flash" },
+  { id: "z-ai/glm-5.1", provider: "z-ai", name: "GLM 5.1" },
+  { id: "minimax/minimax-m2.7", provider: "minimax", name: "MiniMax M2.7" },
+  { id: "minimax/minimax-m2.7-highspeed", provider: "minimax", name: "MiniMax M2.7 Highspeed" },
+  { id: "moonshotai/kimi-k2.6", provider: "moonshotai", name: "Kimi K2.6" },
+  { id: "stepfun/step-3.5-flash", provider: "stepfun", name: "Step 3.5 Flash" },
+  { id: "tencent/hy3-preview", provider: "tencent", name: "Hy3 Preview" },
+  { id: "xiaomi/mimo-v2.5-pro", provider: "xiaomi", name: "MiMo V2.5 Pro" },
+  { id: "mistralai/mistral-large-2512", provider: "mistralai", name: "Mistral Large 3" },
+];
+
 function recordValue(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
@@ -298,12 +319,21 @@ function normalizeModelCatalog(catalog: unknown): ModelCatalogItem[] {
   return models.sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
 }
 
+function curatedModelCatalog(models: ModelCatalogItem[]): ModelCatalogItem[] {
+  const byId = new Map(models.map((model) => [model.id, model]));
+  return CURATED_MODEL_CATALOG.flatMap((curated) => {
+    const live = byId.get(curated.id);
+    if (!live) return [];
+    return [{
+      ...live,
+      provider: curated.provider,
+      name: live.name ?? curated.name,
+    }];
+  });
+}
+
 function fallbackModelCatalog(): ModelCatalogItem[] {
-  return [
-    "moonshot/kimi-k2.5",
-    "openai/gpt-5.4",
-    "deepseek/deepseek-v4-pro",
-  ].map((id) => ({ id, provider: modelProvider(id) }));
+  return CURATED_MODEL_CATALOG.map((model) => ({ ...model }));
 }
 
 type ModelValidationResult =
@@ -728,7 +758,7 @@ export function buildApp(deps: ServerDeps): Hono {
         apiKey: deps.passthroughEnv.ZENMUX_API_KEY,
         baseUrl: deps.passthroughEnv.ZENMUX_BASE_URL,
       });
-      const models = normalizeModelCatalog(catalog);
+      const models = curatedModelCatalog(normalizeModelCatalog(catalog));
       return c.json({
         source: "zenmux",
         models,

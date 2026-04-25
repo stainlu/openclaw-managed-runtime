@@ -95,8 +95,8 @@ describe("AgentRouter.createSession", () => {
       normalizeModelForRuntime("anthropic/claude-opus-4-7", { ZENMUX_API_KEY: "sk-test" }),
     ).toBe("zenmux/anthropic/claude-opus-4.7");
     expect(
-      normalizeModelForRuntime("claude-sonnet-4-6", { ZENMUX_API_KEY: "sk-test" }),
-    ).toBe("zenmux/anthropic/claude-sonnet-4.6");
+      normalizeModelForRuntime("claude-opus-4-6", { ZENMUX_API_KEY: "sk-test" }),
+    ).toBe("zenmux/anthropic/claude-opus-4.6");
   });
 
   it("creates a session bound to an existing agent", () => {

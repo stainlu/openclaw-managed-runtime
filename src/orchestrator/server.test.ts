@@ -266,15 +266,30 @@ describe("model catalog API", () => {
 
     expect(res.status).toBe(200);
     expect(body.source).toBe("fallback");
-    expect(body.count).toBe(3);
+    expect(body.count).toBe(18);
     expect(body.models?.map((m) => m.id)).toEqual([
-      "moonshot/kimi-k2.5",
-      "openai/gpt-5.4",
       "deepseek/deepseek-v4-pro",
+      "deepseek/deepseek-v4-flash",
+      "openai/gpt-5.5",
+      "openai/gpt-5.4",
+      "anthropic/claude-opus-4.7",
+      "anthropic/claude-opus-4.6",
+      "google/gemini-3.1-pro-preview",
+      "google/gemini-3.1-flash-lite-preview",
+      "qwen/qwen3.6-plus",
+      "qwen/qwen3.5-flash",
+      "z-ai/glm-5.1",
+      "minimax/minimax-m2.7",
+      "minimax/minimax-m2.7-highspeed",
+      "moonshotai/kimi-k2.6",
+      "stepfun/step-3.5-flash",
+      "tencent/hy3-preview",
+      "xiaomi/mimo-v2.5-pro",
+      "mistralai/mistral-large-2512",
     ]);
   });
 
-  it("serves the live ZenMux model catalog when configured", async () => {
+  it("serves only the curated ZenMux model catalog when configured", async () => {
     clearZenMuxCatalogCache();
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
@@ -284,15 +299,21 @@ describe("model catalog API", () => {
           JSON.stringify({
             data: [
               {
-                id: "anthropic/claude-sonnet-live",
-                name: "Claude Sonnet Live",
+                id: "anthropic/claude-opus-4.7",
+                name: "Claude Opus Live",
                 context_length: 200000,
                 input_modalities: ["text", "image"],
               },
               {
-                id: "deepseek/deepseek-live",
+                id: "openai/gpt-5.4",
+                provider: "openai",
+              },
+              {
+                id: "deepseek/deepseek-v4-flash",
                 provider: "deepseek",
               },
+              { id: "moonshotai/kimi-k2.6", provider: "moonshotai" },
+              { id: "anthropic/claude-sonnet-old" },
             ],
           }),
           { status: 200, headers: { "content-type": "application/json" } },
@@ -321,18 +342,29 @@ describe("model catalog API", () => {
 
       expect(res.status).toBe(200);
       expect(body.source).toBe("zenmux");
-      expect(body.count).toBe(2);
+      expect(body.count).toBe(4);
       expect(body.models).toEqual([
         {
-          id: "anthropic/claude-sonnet-live",
+          id: "deepseek/deepseek-v4-flash",
+          provider: "deepseek",
+          name: "DeepSeek V4 Flash",
+        },
+        {
+          id: "openai/gpt-5.4",
+          provider: "openai",
+          name: "GPT-5.4",
+        },
+        {
+          id: "anthropic/claude-opus-4.7",
           provider: "anthropic",
-          name: "Claude Sonnet Live",
+          name: "Claude Opus Live",
           context_length: 200000,
           input_modalities: ["text", "image"],
         },
         {
-          id: "deepseek/deepseek-live",
-          provider: "deepseek",
+          id: "moonshotai/kimi-k2.6",
+          provider: "moonshotai",
+          name: "Kimi K2.6",
         },
       ]);
     } finally {

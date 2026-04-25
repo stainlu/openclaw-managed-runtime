@@ -631,8 +631,8 @@ export const portalHtml = (opts: { authRequired: boolean; version: string }): st
       <div class="modal-body">
         <div class="field">
           <label>Model <span class="muted">— provider/model slug from openclaw</span></label>
-          <input id="fld-model" value="moonshot/kimi-k2.5" />
-          <div class="hint">Examples: <code>anthropic/claude-sonnet-4-6</code>, <code>openai/gpt-5.4</code>, <code>deepseek/deepseek-v4-pro</code>, <code>google/gemini-2.5-pro</code>, <code>moonshot/kimi-k2.5</code>. If <code>ZENMUX_API_KEY</code> is set, the runtime routes all models through ZenMux; otherwise it forwards the matching provider API key from the host env.</div>
+          <input id="fld-model" value="deepseek/deepseek-v4-pro" />
+          <div class="hint">Examples: <code>deepseek/deepseek-v4-pro</code>, <code>openai/gpt-5.5</code>, <code>anthropic/claude-opus-4.7</code>, <code>google/gemini-3.1-pro-preview</code>. If <code>ZENMUX_API_KEY</code> is set, the runtime routes all models through ZenMux; otherwise it forwards the matching provider API key from the host env.</div>
         </div>
         <div class="field">
           <label>Instructions <span class="muted">— system prompt</span></label>
