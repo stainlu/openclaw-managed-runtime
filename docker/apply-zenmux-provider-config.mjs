@@ -8,9 +8,28 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_BASE_URL = "https://zenmux.ai/api/v1";
+const MODEL_ALIASES =
+  readJsonIfExists(new URL("./model-aliases.json", import.meta.url)) ??
+  readJsonIfExists(new URL("../src/model-aliases.json", import.meta.url)) ??
+  {};
+
+function readJsonIfExists(url) {
+  try {
+    return JSON.parse(readFileSync(url, "utf8"));
+  } catch (err) {
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
+      return undefined;
+    }
+    throw err;
+  }
+}
 
 function normalizeBaseUrl(baseUrl) {
   return String(baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+}
+
+function resolveZenMuxModelAlias(modelId) {
+  return MODEL_ALIASES?.zenmux?.[modelId] ?? modelId;
 }
 
 function normalizeInputModalities(modalities) {
@@ -45,10 +64,11 @@ export function buildZenMuxProviderConfig({
   modelId,
   catalog,
 }) {
+  const effectiveModelId = resolveZenMuxModelAlias(modelId);
   const models = Array.isArray(catalog?.data) ? catalog.data : [];
-  const resolved = models.find((model) => model?.id === modelId);
+  const resolved = models.find((model) => model?.id === effectiveModelId);
   if (!resolved) {
-    throw new Error(`ZenMux model not found in /models catalog: ${modelId}`);
+    throw new Error(`ZenMux model not found in /models catalog: ${effectiveModelId}`);
   }
 
   const contextWindow = typeof resolved.context_length === "number"

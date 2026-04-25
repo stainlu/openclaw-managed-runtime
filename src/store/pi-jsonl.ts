@@ -25,6 +25,9 @@ import type { Event } from "../orchestrator/types.js";
 type PiContentBlock = {
   type: string;
   text?: string;
+  thinking?: string;
+  textSignature?: string;
+  phase?: string;
   id?: string;
   name?: string;
   arguments?: Record<string, unknown>;
@@ -32,7 +35,9 @@ type PiContentBlock = {
 
 type PiMessage = {
   role?: "user" | "assistant" | "toolResult";
-  content?: PiContentBlock[];
+  content?: PiContentBlock[] | string;
+  text?: string;
+  phase?: string;
   stopReason?: string;
   errorMessage?: string;
   usage?: {
@@ -419,20 +424,22 @@ function mapLineToEvents(line: PiLine, sessionId: string): Event[] {
 
   if (msg.role === "assistant") {
     const events: Event[] = [];
-    const text = extractText(msg.content);
+    const text = extractAssistantText(msg);
 
     // Emit agent.thinking events for thinking content blocks.
     // These appear when a thinking-capable model (e.g. Claude with
     // extended thinking) is used with thinkingLevel != "off".
-    if (msg.content) {
+    const blocks = contentBlocks(msg.content);
+    if (blocks.length > 0) {
       let thinkingIdx = 0;
-      for (const block of msg.content) {
-        if (block.type === "thinking" && typeof block.text === "string" && block.text.length > 0) {
+      for (const block of blocks) {
+        const thinking = extractThinkingBlockText(block);
+        if (thinking) {
           events.push({
             eventId: `${eventId}:thinking:${String(thinkingIdx)}`,
             sessionId,
             type: "agent.thinking",
-            content: block.text,
+            content: thinking,
             createdAt,
           });
           thinkingIdx++;
@@ -441,9 +448,9 @@ function mapLineToEvents(line: PiLine, sessionId: string): Event[] {
     }
 
     // Emit agent.tool_use events for each toolCall content block.
-    if (msg.content) {
+    if (blocks.length > 0) {
       let toolIdx = 0;
-      for (const block of msg.content) {
+      for (const block of blocks) {
         if (block.type === "toolCall" && block.name) {
           events.push({
             eventId: `${eventId}:tool:${block.id ?? String(toolIdx)}`,
@@ -498,8 +505,14 @@ function mapLineToEvents(line: PiLine, sessionId: string): Event[] {
   return [];
 }
 
-function extractText(blocks: PiContentBlock[] | undefined): string {
-  if (!blocks || blocks.length === 0) return "";
+function contentBlocks(content: PiMessage["content"] | undefined): PiContentBlock[] {
+  return Array.isArray(content) ? content : [];
+}
+
+function extractText(content: PiMessage["content"] | undefined): string {
+  if (typeof content === "string") return content;
+  const blocks = contentBlocks(content);
+  if (blocks.length === 0) return "";
   const parts: string[] = [];
   for (const block of blocks) {
     if (block.type === "text" && typeof block.text === "string") {
@@ -507,6 +520,64 @@ function extractText(blocks: PiContentBlock[] | undefined): string {
     }
   }
   return parts.join("");
+}
+
+function extractAssistantText(msg: PiMessage): string {
+  const blocks = contentBlocks(msg.content);
+  if (blocks.length > 0) {
+    const finalAnswer = extractTextForPhase(blocks, "final_answer");
+    if (finalAnswer.trim()) return finalAnswer;
+
+    const unphased = extractTextForPhase(blocks, undefined);
+    if (unphased.trim()) return unphased;
+
+    // If the runtime gave us text blocks but every block is phase-tagged
+    // with an unrecognized value, surface the raw visible text instead of
+    // turning a completed provider response into an empty orchestrator event.
+    const allText = extractText(msg.content);
+    if (allText.trim()) return allText;
+  }
+
+  if (typeof msg.text === "string") return msg.text;
+  if (typeof msg.content === "string") return msg.content;
+  return "";
+}
+
+function extractTextForPhase(
+  blocks: PiContentBlock[],
+  requestedPhase: "final_answer" | undefined,
+): string {
+  const parts: string[] = [];
+  for (const block of blocks) {
+    if (block.type !== "text" || typeof block.text !== "string") continue;
+    const phase = resolveTextBlockPhase(block);
+    if (requestedPhase === undefined) {
+      if (phase === undefined) parts.push(block.text);
+      continue;
+    }
+    if (phase === requestedPhase) parts.push(block.text);
+  }
+  return parts.join("");
+}
+
+function resolveTextBlockPhase(block: PiContentBlock): string | undefined {
+  if (typeof block.phase === "string" && block.phase) return block.phase;
+  if (typeof block.textSignature !== "string" || block.textSignature.trim() === "") {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(block.textSignature) as { phase?: unknown };
+    return typeof parsed.phase === "string" && parsed.phase ? parsed.phase : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractThinkingBlockText(block: PiContentBlock): string {
+  if (block.type !== "thinking") return "";
+  if (typeof block.thinking === "string") return block.thinking;
+  if (typeof block.text === "string") return block.text;
+  return "";
 }
 
 function isRuntimeNotice(text: string): boolean {

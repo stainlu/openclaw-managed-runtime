@@ -515,6 +515,7 @@ describe("AgentRouter.runEvent — JSONL advancement guarantees", () => {
   }
 
   it("fails the turn when chat.completions returns 200 but no new JSONL events were written", async () => {
+    vi.stubEnv("OPENCLAW_TURN_ADVANCE_WAIT_MS", "0");
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -559,6 +560,47 @@ describe("AgentRouter.runEvent — JSONL advancement guarantees", () => {
     const failed = store.sessions.get(session.sessionId);
     expect(failed?.status).toBe("failed");
     expect(failed?.error).toContain("no new user.message was written to JSONL");
+  });
+
+  it("keeps the turn successful when the user turn is durable and only the assistant outcome lags JSONL", async () => {
+    vi.stubEnv("OPENCLAW_TURN_ADVANCE_WAIT_MS", "0");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "direct completion" } }],
+            usage: { prompt_tokens: 11, completion_tokens: 7 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const fakeEvents = {
+      stateRoot: "/tmp/test-state",
+      countUserTurns: vi.fn().mockReturnValue(1).mockReturnValueOnce(0),
+      latestAgentOutcome: vi.fn().mockReturnValue(undefined),
+      latestAgentMessage: vi.fn().mockReturnValue(undefined),
+    };
+    const { router, store } = makeRouter({
+      poolStub: {
+        acquireForSession: async () =>
+          ({ baseUrl: "http://container.test", token: "tok" }) as any,
+        evictSession: async () => {},
+      },
+      eventReaderStub: fakeEvents as unknown as PiJsonlEventReader,
+    });
+    const agent = seedAgent(store);
+    const session = router.createSession(agent.agentId);
+
+    await router.runEvent({ sessionId: session.sessionId, content: "hi" });
+    await waitForSessionToStopRunning(store, session.sessionId);
+
+    const finished = store.sessions.get(session.sessionId);
+    expect(finished?.status).toBe("idle");
+    expect(finished?.error).toBeNull();
+    expect(finished?.tokensIn).toBe(11);
+    expect(finished?.tokensOut).toBe(7);
   });
 
   it("keeps the turn successful when both user.message and agent.message advance", async () => {

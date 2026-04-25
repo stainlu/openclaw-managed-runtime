@@ -138,6 +138,82 @@ describe("PiJsonlEventReader", () => {
     });
   });
 
+  it("parses assistant text from current OpenClaw message shapes", () => {
+    const f = makeFixture([
+      {
+        type: "message",
+        id: "evt-string-content",
+        message: {
+          role: "assistant",
+          content: "string content",
+        },
+      },
+      {
+        type: "message",
+        id: "evt-message-text",
+        message: {
+          role: "assistant",
+          text: "message text",
+        },
+      },
+      {
+        type: "message",
+        id: "evt-phased",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "commentary",
+              textSignature: "{\"v\":1,\"phase\":\"commentary\"}",
+            },
+            {
+              type: "text",
+              text: "final answer",
+              textSignature: "{\"v\":1,\"phase\":\"final_answer\"}",
+            },
+          ],
+        },
+      },
+    ]);
+    fixtures.push(f);
+    const reader = new PiJsonlEventReader(f.root);
+    const events = reader.listBySession(f.agentId, f.sessionId);
+    expect(events.map((e) => e.content)).toEqual([
+      "string content",
+      "message text",
+      "final answer",
+    ]);
+  });
+
+  it("emits thinking blocks stored under the thinking field", () => {
+    const f = makeFixture([
+      {
+        type: "message",
+        id: "evt-thinking",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "working through it" },
+            { type: "text", text: "done" },
+          ],
+        },
+      },
+    ]);
+    fixtures.push(f);
+    const reader = new PiJsonlEventReader(f.root);
+    const events = reader.listBySession(f.agentId, f.sessionId);
+    expect(events.map((e) => e.type)).toEqual(["agent.thinking", "agent.message"]);
+    expect(events[0]).toMatchObject({
+      eventId: "evt-thinking:thinking:0",
+      content: "working through it",
+    });
+    expect(events[1]).toMatchObject({
+      eventId: "evt-thinking",
+      content: "done",
+    });
+  });
+
   it("normalizes camelCase usage aliases from transcript entries", () => {
     const f = makeFixture([
       {

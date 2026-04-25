@@ -1,5 +1,8 @@
+import rawModelAliases from "../model-aliases.json" with { type: "json" };
+
 const DEFAULT_ZENMUX_BASE_URL = "https://zenmux.ai/api/v1";
 const CATALOG_TTL_MS = 5 * 60_000;
+const modelAliases = rawModelAliases as { zenmux: Record<string, string> };
 
 type ZenMuxPricingEntry = {
   value?: number;
@@ -42,10 +45,11 @@ export function resolveZenMuxCatalogModelId(
   passthroughEnv: Record<string, string>,
 ): string | undefined {
   if (!model) return undefined;
-  if (model.startsWith("zenmux/")) {
-    return model.slice("zenmux/".length);
-  }
-  return passthroughEnv.ZENMUX_API_KEY ? model : undefined;
+  const rawModel = model.startsWith("zenmux/")
+    ? model.slice("zenmux/".length)
+    : model;
+  const effectiveModel = modelAliases.zenmux[rawModel] ?? rawModel;
+  return passthroughEnv.ZENMUX_API_KEY ? effectiveModel : undefined;
 }
 
 export function clearZenMuxCatalogCache(): void {

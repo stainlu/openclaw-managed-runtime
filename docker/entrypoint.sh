@@ -91,6 +91,12 @@ if [[ -n "${ZENMUX_API_KEY:-}" ]]; then
   else
     OPENCLAW_PROVIDER_MODEL="${OPENCLAW_MODEL}"
   fi
+  if [[ -f /opt/openclaw-plugins/model-aliases.json ]]; then
+    OPENCLAW_PROVIDER_MODEL=$(
+      jq -r --arg model "${OPENCLAW_PROVIDER_MODEL}" '.zenmux[$model] // $model' \
+        /opt/openclaw-plugins/model-aliases.json
+    )
+  fi
   OPENCLAW_EFFECTIVE_MODEL="zenmux/${OPENCLAW_PROVIDER_MODEL}"
 elif [[ "${OPENCLAW_MODEL}" == zenmux/* ]]; then
   echo "[entrypoint] ERROR: OPENCLAW_MODEL uses zenmux/ but ZENMUX_API_KEY is unset" >&2

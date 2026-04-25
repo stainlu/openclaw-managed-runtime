@@ -241,6 +241,71 @@ function environmentResponse(env: EnvironmentConfig) {
   };
 }
 
+type ModelCatalogItem = {
+  id: string;
+  provider: string;
+  name?: string;
+  context_length?: number;
+  input_modalities?: string[];
+};
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function stringProp(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function numberProp(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringArrayProp(record: Record<string, unknown>, key: string): string[] | undefined {
+  const value = record[key];
+  if (!Array.isArray(value)) return undefined;
+  const strings = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+  return strings.length > 0 ? strings : undefined;
+}
+
+function modelProvider(id: string): string {
+  const slash = id.indexOf("/");
+  return slash > 0 ? id.slice(0, slash) : "custom";
+}
+
+function normalizeModelCatalog(catalog: unknown): ModelCatalogItem[] {
+  const data = recordValue(catalog)?.data;
+  if (!Array.isArray(data)) return [];
+  const seen = new Set<string>();
+  const models: ModelCatalogItem[] = [];
+  for (const item of data) {
+    const record = recordValue(item);
+    if (!record) continue;
+    const id = stringProp(record, "id");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    models.push({
+      id,
+      provider: stringProp(record, "provider") ?? modelProvider(id),
+      name: stringProp(record, "name") ?? stringProp(record, "display_name"),
+      context_length: numberProp(record, "context_length") ?? numberProp(record, "contextWindow"),
+      input_modalities: stringArrayProp(record, "input_modalities") ?? stringArrayProp(record, "inputModalities"),
+    });
+  }
+  return models.sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+}
+
+function fallbackModelCatalog(): ModelCatalogItem[] {
+  return [
+    "moonshot/kimi-k2.5",
+    "openai/gpt-5.4",
+    "deepseek/deepseek-v4-pro",
+  ].map((id) => ({ id, provider: modelProvider(id) }));
+}
+
 // Session response shape. `output` is a computed convenience: the content of
 // the most recent agent.message in the session, or null if none yet. The
 // event log lives in Pi's JSONL on the host mount — see PiJsonlEventReader.
@@ -575,6 +640,7 @@ export function buildApp(deps: ServerDeps): Hono {
           logs: "GET /v1/sessions/:sessionId/logs?tail=<n>",
         },
         openai_compat: {
+          models: "GET /v1/models",
           chat_completions: "POST /v1/chat/completions",
         },
         audit: {
@@ -603,6 +669,32 @@ export function buildApp(deps: ServerDeps): Hono {
       max_warm: deps.maxWarmContainers,
       max_active: deps.maxActiveContainers,
     });
+  });
+
+  app.get("/v1/models", async (c) => {
+    if (!deps.passthroughEnv?.ZENMUX_API_KEY) {
+      const models = fallbackModelCatalog();
+      return c.json({
+        source: "fallback",
+        models,
+        count: models.length,
+      });
+    }
+    try {
+      const catalog = await fetchZenMuxCatalogCached({
+        apiKey: deps.passthroughEnv.ZENMUX_API_KEY,
+        baseUrl: deps.passthroughEnv.ZENMUX_BASE_URL,
+      });
+      const models = normalizeModelCatalog(catalog);
+      return c.json({
+        source: "zenmux",
+        models,
+        count: models.length,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return c.json({ error: "model_catalog_failed", message }, 503);
+    }
   });
 
   // ---------- Agents (reusable templates) ----------

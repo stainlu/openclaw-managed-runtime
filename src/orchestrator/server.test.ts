@@ -253,6 +253,95 @@ async function req(
   return { status: res.status, body };
 }
 
+describe("model catalog API", () => {
+  it("serves safe fallback examples when ZenMux is not configured", async () => {
+    const { app } = makeApp();
+
+    const res = await req(app, "/v1/models", { token: "admin-secret" });
+    const body = res.body as {
+      source?: string;
+      count?: number;
+      models?: Array<{ id: string; provider: string }>;
+    };
+
+    expect(res.status).toBe(200);
+    expect(body.source).toBe("fallback");
+    expect(body.count).toBe(3);
+    expect(body.models?.map((m) => m.id)).toEqual([
+      "moonshot/kimi-k2.5",
+      "openai/gpt-5.4",
+      "deepseek/deepseek-v4-pro",
+    ]);
+  });
+
+  it("serves the live ZenMux model catalog when configured", async () => {
+    clearZenMuxCatalogCache();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "https://zenmux.ai/api/v1/models") {
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "anthropic/claude-sonnet-live",
+                name: "Claude Sonnet Live",
+                context_length: 200000,
+                input_modalities: ["text", "image"],
+              },
+              {
+                id: "deepseek/deepseek-live",
+                provider: "deepseek",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    try {
+      const { app } = makeApp({
+        passthroughEnv: { ZENMUX_API_KEY: "sk-test" },
+      });
+
+      const res = await req(app, "/v1/models", { token: "admin-secret" });
+      const body = res.body as {
+        source?: string;
+        count?: number;
+        models?: Array<{
+          id: string;
+          provider: string;
+          name?: string;
+          context_length?: number;
+          input_modalities?: string[];
+        }>;
+      };
+
+      expect(res.status).toBe(200);
+      expect(body.source).toBe("zenmux");
+      expect(body.count).toBe(2);
+      expect(body.models).toEqual([
+        {
+          id: "anthropic/claude-sonnet-live",
+          provider: "anthropic",
+          name: "Claude Sonnet Live",
+          context_length: 200000,
+          input_modalities: ["text", "image"],
+        },
+        {
+          id: "deepseek/deepseek-live",
+          provider: "deepseek",
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearZenMuxCatalogCache();
+    }
+  });
+});
+
 describe("session ownership in the HTTP API", () => {
   it("deduplicates POST /events when Idempotency-Key repeats", async () => {
     let calls = 0;

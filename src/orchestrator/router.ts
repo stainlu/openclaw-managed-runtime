@@ -6,6 +6,7 @@ import {
   sessionRunDurationSeconds,
   sessionRunFailuresTotal,
 } from "../metrics.js";
+import rawModelAliases from "../model-aliases.json" with { type: "json" };
 import type {
   Container,
   Mount,
@@ -40,6 +41,7 @@ const log = getLogger("router");
 // directory on the orchestrator's in-process mount view and chown it to
 // this UID. On macOS the chown is a harmless no-op.
 const AGENT_CONTAINER_UID = 999;
+const modelAliases = rawModelAliases as { zenmux: Record<string, string> };
 
 function isSessionInflight(session: Session | undefined): boolean {
   return session?.status === "starting" || session?.status === "running";
@@ -50,7 +52,9 @@ export function normalizeModelForRuntime(
   passthroughEnv: Record<string, string>,
 ): string {
   if (!passthroughEnv.ZENMUX_API_KEY) return model;
-  return model.startsWith("zenmux/") ? model : `zenmux/${model}`;
+  const rawModel = model.startsWith("zenmux/") ? model.slice("zenmux/".length) : model;
+  const effectiveModel = modelAliases.zenmux[rawModel] ?? rawModel;
+  return `zenmux/${effectiveModel}`;
 }
 
 export type RouterConfig = {
@@ -150,6 +154,16 @@ type TurnProgressSnapshot = {
   userTurns: number;
   latestAgentOutcomeId?: string;
 };
+
+type CompletionResult = {
+  output: string;
+  tokensIn: number;
+  tokensOut: number;
+  model?: string;
+};
+
+const DEFAULT_TURN_ADVANCE_WAIT_MS = 2_000;
+const TURN_ADVANCE_POLL_MS = 100;
 
 export class AgentRouter {
   /** Pending tool-confirmation approvals per session. Populated by WS
@@ -781,7 +795,7 @@ export class AgentRouter {
         const current = router.sessions.get(args.sessionId);
         if (!isSessionInflight(current)) return;
         if (outcome.ok) {
-          const latest = router.assertTurnAdvanced(
+          const latest = await router.waitForTurnAdvanced(
             agent.agentId,
             args.sessionId,
             beforeTurn,
@@ -1529,10 +1543,14 @@ export class AgentRouter {
       "chat.completions returned",
     );
 
-    const latestAgent = this.assertTurnAdvanced(
+    const latestAgent = await this.waitForTurnAdvanced(
       agent.agentId,
       sessionId,
       beforeTurn,
+      {
+        ...completion,
+        model: normalizeModelForRuntime(agent.model, this.cfg.passthroughEnv),
+      },
     );
     const tokensIn = latestAgent?.tokensIn ?? completion.tokensIn;
     const tokensOut = latestAgent?.tokensOut ?? completion.tokensOut;
@@ -1760,7 +1778,7 @@ export class AgentRouter {
     before: TurnProgressSnapshot,
   ): Event | undefined {
     const afterUserTurns = this.events.countUserTurns(agentId, sessionId);
-    if (afterUserTurns <= before.userTurns) {
+    if (!Number.isFinite(afterUserTurns) || afterUserTurns <= before.userTurns) {
       throw new RouterError(
         "chat_completions_failed",
         "turn returned but no new user.message was written to JSONL",
@@ -1774,6 +1792,58 @@ export class AgentRouter {
       );
     }
     return this.events.latestAgentMessage(agentId, sessionId);
+  }
+
+  private async waitForTurnAdvanced(
+    agentId: string,
+    sessionId: string,
+    before: TurnProgressSnapshot,
+    completion?: CompletionResult,
+  ): Promise<Event | undefined> {
+    const deadline = Date.now() + turnAdvanceWaitMs();
+    let lastErr: unknown;
+
+    while (true) {
+      try {
+        return this.assertTurnAdvanced(agentId, sessionId, before);
+      } catch (err) {
+        lastErr = err;
+        if (
+          !(err instanceof RouterError) ||
+          err.code !== "chat_completions_failed" ||
+          Date.now() >= deadline
+        ) {
+          break;
+        }
+        await sleep(TURN_ADVANCE_POLL_MS);
+      }
+    }
+
+    const afterUserTurns = this.events.countUserTurns(agentId, sessionId);
+    const userTurnIsDurable =
+      Number.isFinite(afterUserTurns) && afterUserTurns > before.userTurns;
+    if (completion && userTurnIsDurable && !isOpenClawFailureContent(completion.output)) {
+      log.warn(
+        {
+          session_id: sessionId,
+          completion_output_chars: completion.output.length,
+          err: lastErr,
+        },
+        "turn completed but JSONL assistant outcome was not visible yet; using direct completion output for run accounting",
+      );
+      return {
+        eventId: `completion:${sessionId}:${Date.now()}`,
+        sessionId,
+        type: "agent.message",
+        content: completion.output,
+        createdAt: Date.now(),
+        tokensIn: completion.tokensIn,
+        tokensOut: completion.tokensOut,
+        model: completion.model,
+      };
+    }
+
+    throw lastErr;
   }
 
   /**
@@ -1936,7 +2006,7 @@ export class AgentRouter {
     token: string;
     content: string;
     sessionKey: string;
-  }): Promise<{ output: string; tokensIn: number; tokensOut: number }> {
+  }): Promise<CompletionResult> {
     const url = `${args.baseUrl}/v1/chat/completions`;
     // OpenClaw's OpenAI-compatible endpoint validates the `model` field against
     // either the literal "openclaw" or the "openclaw/<agentId>" pattern — it is
@@ -2018,6 +2088,16 @@ function isOpenClawFailureContent(content: string): boolean {
   if (content === "No response from OpenClaw.") return true;
   if (content.startsWith("⚠️")) return true;
   return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function turnAdvanceWaitMs(): number {
+  const configured = Number(process.env.OPENCLAW_TURN_ADVANCE_WAIT_MS);
+  if (Number.isFinite(configured) && configured >= 0) return configured;
+  return DEFAULT_TURN_ADVANCE_WAIT_MS;
 }
 
 type ChatCompletionResponse = {

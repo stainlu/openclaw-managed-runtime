@@ -165,6 +165,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.runtime
+    entrypoint: ["/bin/true"]
     command: ["true"]
     restart: "no"
 

@@ -20,6 +20,14 @@ export type ManagedContainerInfo = {
   running: boolean;
 };
 
+type ContainerStateSnapshot = {
+  running: boolean;
+  status?: string;
+  exitCode?: number;
+  oomKilled?: boolean;
+  error?: string;
+};
+
 /**
  * Docker backend for the managed runtime. Spawns one container per agent/session,
  * attached to a shared Docker network so the orchestrator can reach it by name.
@@ -233,11 +241,46 @@ export class DockerContainerRuntime implements ContainerRuntime {
       } catch (err) {
         lastError = err;
       }
+
+      const state = await this.inspectState(container.id);
+      if (state && !state.running) {
+        const tail = await this.logs(container.id, { tail: 120 }).catch(() => "");
+        throw new Error(
+          [
+            `container ${container.name} exited before ready`,
+            `(status=${state.status ?? "unknown"}`,
+            `exit_code=${state.exitCode ?? "unknown"}`,
+            `oom_killed=${state.oomKilled ?? false}`,
+            state.error ? `docker_error=${state.error}` : undefined,
+            `last_ready_error=${String(lastError)})`,
+            trimLogTail(tail),
+          ].filter(Boolean).join(" "),
+        );
+      }
       await sleep(500);
     }
     throw new Error(
       `container ${container.name} did not become ready within ${timeoutMs}ms: ${String(lastError)}`,
     );
+  }
+
+  private async inspectState(id: string): Promise<ContainerStateSnapshot | undefined> {
+    try {
+      const info = await this.docker.getContainer(id).inspect();
+      const state = info.State;
+      if (!state) return undefined;
+      return {
+        running: Boolean(state.Running),
+        status: typeof state.Status === "string" ? state.Status : undefined,
+        exitCode: typeof state.ExitCode === "number" ? state.ExitCode : undefined,
+        oomKilled: Boolean(state.OOMKilled),
+        error: typeof state.Error === "string" && state.Error.length > 0
+          ? state.Error
+          : undefined,
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -416,6 +459,14 @@ function randomSuffix(): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function trimLogTail(logs: string): string | undefined {
+  const trimmed = logs.trim();
+  if (!trimmed) return undefined;
+  const max = 4000;
+  const tail = trimmed.length > max ? trimmed.slice(trimmed.length - max) : trimmed;
+  return `logs:\n${tail}`;
 }
 
 function isNotRunningError(err: unknown): boolean {

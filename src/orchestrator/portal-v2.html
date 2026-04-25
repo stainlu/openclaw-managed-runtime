@@ -3881,6 +3881,7 @@ function AppProvider({ children }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [createEnvOpen, setCreateEnvOpen] = useState(false);
   const [createVaultOpen, setCreateVaultOpen] = useState(false);
+  const [modelCatalog, setModelCatalog] = useState({ source: 'loading', models: [], count: 0 });
   const pendingEventPostsRef = React.useRef(new Map());
   // agents is a LIVE view — just re-read the global AGENTS each
   // render. pushToast triggers re-renders; the pump's LIVE_BUS
@@ -3894,6 +3895,41 @@ function AppProvider({ children }) {
     return id;
   }, []);
   const dismissToast = (id) => setToasts(ts => ts.filter(x => x.id !== id));
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/v1/models');
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (res.ok && Array.isArray(data.models)) {
+          setModelCatalog({
+            source: data.source || 'unknown',
+            models: data.models.filter((m) => m && typeof m.id === 'string'),
+            count: typeof data.count === 'number' ? data.count : data.models.length,
+          });
+        } else {
+          setModelCatalog({
+            source: 'error',
+            models: [],
+            count: 0,
+            error: data.message || data.error || `HTTP ${res.status}`,
+          });
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setModelCatalog({
+            source: 'error',
+            models: [],
+            count: 0,
+            error: err?.message || 'network error',
+          });
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // --- Real write-operation wiring. All mutations hit /v1/* endpoints.
   //     The toast records the actual HTTP verb, path, status code, and
@@ -4296,6 +4332,7 @@ function AppProvider({ children }) {
     createEnvOpen, setCreateEnvOpen, createEnvironment,
     createVaultOpen, setCreateVaultOpen, createVault,
     agents, createAgent,
+    modelCatalog,
   };
   return <AppCtx.Provider value={value}>{children}</AppCtx.Provider>;
 }
@@ -4359,8 +4396,9 @@ function Toaster() {
 
 function CreateAgentModal() {
   const ctx = useApp();
+  const defaultModel = 'moonshot/kimi-k2.5';
   const [name, setName] = useState('');
-  const [model, setModel] = useState('anthropic/claude-opus-4-7');
+  const [model, setModel] = useState(defaultModel);
   const [instructions, setInstructions] = useState('');
   // Default selection picks the two most-used openclaw built-ins for a
   // fresh agent template: `read` (file read) + `web_search`. Users can
@@ -4373,6 +4411,12 @@ function CreateAgentModal() {
   const [policy, setPolicy] = useState('always_ask');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const firstCatalogModel = ctx?.modelCatalog?.models?.find((m) => m?.id)?.id;
+
+  useEffect(() => {
+    if (!ctx?.createOpen || !firstCatalogModel) return;
+    setModel((current) => current === defaultModel ? firstCatalogModel : current);
+  }, [ctx?.createOpen, firstCatalogModel]);
 
   if (!ctx?.createOpen) return null;
 
@@ -4389,6 +4433,57 @@ function CreateAgentModal() {
   // are stdio-only and need env-based config, so they don't belong
   // in a URL-picker. Deferred to a richer editor.
   const allMcp = ['linear', 'notion', 'github'];
+  const providerLabels = {
+    anthropic: 'Anthropic',
+    openai: 'OpenAI',
+    deepseek: 'DeepSeek',
+    google: 'Google',
+    xai: 'xAI',
+    moonshot: 'Moonshot',
+    qwen: 'Qwen',
+    minimax: 'MiniMax',
+    glm: 'GLM',
+    tencent: 'Tencent',
+    mistral: 'Mistral',
+    openrouter: 'OpenRouter',
+  };
+  const providerOrder = [
+    'anthropic', 'openai', 'deepseek', 'google', 'xai',
+    'moonshot', 'qwen', 'minimax', 'glm', 'tencent', 'mistral', 'openrouter',
+  ];
+  const fallbackGroups = [
+    { label: 'Moonshot', models: ['moonshot/kimi-k2.5'] },
+    { label: 'OpenAI', models: ['openai/gpt-5.4'] },
+    { label: 'DeepSeek', models: ['deepseek/deepseek-v4-pro'] },
+  ];
+  const liveModels = Array.isArray(ctx.modelCatalog?.models)
+    ? ctx.modelCatalog.models.map((m) => m.id).filter(Boolean)
+    : [];
+  const modelsByProvider = new Map();
+  liveModels.forEach((id) => {
+    const provider = id.includes('/') ? id.split('/')[0] : 'custom';
+    const list = modelsByProvider.get(provider) || [];
+    if (!list.includes(id)) list.push(id);
+    modelsByProvider.set(provider, list);
+  });
+  const orderedProviders = [
+    ...providerOrder.filter((p) => modelsByProvider.has(p)),
+    ...Array.from(modelsByProvider.keys()).filter((p) => !providerOrder.includes(p)).sort(),
+  ];
+  const catalogGroups = orderedProviders
+    .map((provider) => ({
+      label: providerLabels[provider] || provider,
+      models: (modelsByProvider.get(provider) || []).slice(0, 8),
+    }))
+    .filter((g) => g.models.length > 0);
+  const modelGroups = catalogGroups.length > 0 ? catalogGroups : fallbackGroups;
+  const catalogMeta = ctx.modelCatalog?.source === 'zenmux'
+    ? `live · ${ctx.modelCatalog.count || liveModels.length}`
+    : ctx.modelCatalog?.source === 'loading'
+      ? 'loading'
+      : ctx.modelCatalog?.source === 'error'
+        ? 'catalog error'
+        : 'examples';
 
   // deny requires a tools list of ≥1. always_ask / always_allow don't.
   // "valid" guards the Create button — keep tools≥1 baseline so every
@@ -4478,18 +4573,8 @@ function CreateAgentModal() {
           <div>
             <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Model</label>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 6 }}>
-              {[
-                { label: 'Anthropic', models: ['anthropic/claude-opus-4-7', 'anthropic/claude-opus-4-6'] },
-                { label: 'OpenAI', models: ['openai/gpt-5.5', 'openai/gpt-5.4'] },
-                { label: 'DeepSeek', models: ['deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-flash'] },
-                { label: 'Google', models: ['google/gemini-3.1-pro-preview', 'google/gemini-3.1-flash-lite-preview'] },
-                { label: 'xAI', models: ['xai/grok-4.2-fast', 'xai/grok-4.1-fast'] },
-                { label: 'Moonshot', models: ['moonshot/kimi-k2.6', 'moonshot/kimi-k2.5'] },
-                { label: 'Qwen', models: ['qwen/qwen-3.6-plus'] },
-                { label: 'MiniMax', models: ['minimax/minimax-m2.7', 'minimax/minimax-m2.5'] },
-                { label: 'GLM', models: ['glm/glm-5.1', 'glm/glm-5'] },
-                { label: 'Tencent', models: ['tencent/hy3-preview'] },
-              ].map(g => (
+              <Mono s={9} c={ctx.modelCatalog?.source === 'error' ? 'var(--danger)' : 'var(--ink-4)'}>{catalogMeta}</Mono>
+              {modelGroups.map(g => (
                 <div key={g.label} style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                   <Mono s={9} c="var(--ink-4)" style={{ width: 52, flexShrink: 0 }}>{g.label}</Mono>
                   {g.models.map(m => (
